@@ -1,0 +1,13 @@
+user = "can"
+jds-sink = "alsa_output.usb-Yoyodyne_Consulting_JDS_Labs_Element_DAC-01.analog-stereo"
+goxlr-serial = "S200805412CQK"
+
+[profile]
+default-sink = "alsa_output.usb-TC-Helicon_GoXLR-00.HiFi__Speaker__sink"
+default-source = "alsa_input.usb-TC-Helicon_GoXLR-00.HiFi__Headset__source"
+monitor-source = "alsa_input.usb-TC-Helicon_GoXLR-00.HiFi__Line4__source"
+
+[obs]
+enable = false
+host = "127.0.0.1"
+port = 4455
