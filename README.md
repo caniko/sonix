@@ -18,8 +18,9 @@ goxlr-nexus apply
 goxlr-nexus profile stream
 goxlr-nexus profile desktop
 goxlr-nexus obs sync --dry-run
+goxlr-nexus obs sync
 ```
 
-OBS websocket source mutation is intentionally gated. The v1 command reports the
-planned sources and fails clearly unless websocket integration is enabled and
-reachable.
+`obs sync` uses obs-websocket v5 to create or update dedicated GoXLR audio
+sources in the active OBS scene. It does not rewrite OBS global Desktop Audio or
+Mic/Aux devices.

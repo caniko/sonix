@@ -8,6 +8,22 @@ default-source = "alsa_input.usb-TC-Helicon_GoXLR-00.HiFi__Headset__source"
 monitor-source = "alsa_input.usb-TC-Helicon_GoXLR-00.HiFi__Line4__source"
 
 [obs]
-enable = false
+enable = true
 host = "127.0.0.1"
 port = 4455
+
+[[obs.sources]]
+name = "GoXLR Mic"
+device-id = "alsa_input.usb-TC-Helicon_GoXLR-00.HiFi__Headset__source"
+
+[[obs.sources]]
+name = "GoXLR Stream Mix"
+device-id = "alsa_input.usb-TC-Helicon_GoXLR-00.HiFi__Line4__source"
+
+[[obs.sources]]
+name = "GoXLR Sampler"
+device-id = "alsa_input.usb-TC-Helicon_GoXLR-00.HiFi__Line5__source"
+
+[[obs.sources]]
+name = "GoXLR Desktop Mix"
+device-id = "alsa_input.usb-TC-Helicon_GoXLR-00.HiFi__Line4__source"

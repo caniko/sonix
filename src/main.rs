@@ -6,9 +6,14 @@ use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use tungstenite::stream::MaybeTlsStream;
+use tungstenite::{Message, WebSocket, connect};
 
 const DEFAULT_JDS_SINK: &str =
     "alsa_output.usb-Yoyodyne_Consulting_JDS_Labs_Element_DAC-01.analog-stereo";
@@ -21,6 +26,7 @@ const GOXLR_SAMPLE: &str = "alsa_output.usb-TC-Helicon_GoXLR-00.HiFi__Line3__sin
 const GOXLR_CHAT_MIC: &str = "alsa_input.usb-TC-Helicon_GoXLR-00.HiFi__Headset__source";
 const GOXLR_STREAM_MIX: &str = "alsa_input.usb-TC-Helicon_GoXLR-00.HiFi__Line4__source";
 const GOXLR_SAMPLER: &str = "alsa_input.usb-TC-Helicon_GoXLR-00.HiFi__Line5__source";
+const OBS_INPUT_KIND: &str = "pulse_input_capture";
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -119,6 +125,7 @@ struct ObsConfig {
     host: String,
     port: u16,
     password_file: Option<PathBuf>,
+    sources: Vec<ObsSourceConfig>,
 }
 
 impl Default for ObsConfig {
@@ -128,8 +135,53 @@ impl Default for ObsConfig {
             host: "127.0.0.1".to_string(),
             port: 4455,
             password_file: None,
+            sources: default_obs_sources(),
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+struct ObsSourceConfig {
+    name: String,
+    device_id: String,
+}
+
+impl Default for ObsSourceConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            device_id: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ObsSourcePlan {
+    name: String,
+    input_kind: String,
+    device_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ObsHello {
+    authentication: Option<ObsAuthentication>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ObsAuthentication {
+    challenge: String,
+    salt: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ObsRequestStatus {
+    result: bool,
+    code: Option<u16>,
+    comment: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -302,41 +354,40 @@ fn obs_sync(config: &Config, dry_run: bool) -> Result<()> {
     if !config.obs.enable {
         bail!("OBS integration is disabled; set programs.goxlr-nexus.obs.enable = true");
     }
-    obs_ready(config)?;
-
-    let password_state = if let Some(path) = &config.obs.password_file {
-        if path.exists() {
-            "password file present"
-        } else {
-            bail!("OBS password file {} is missing", path.display());
-        }
-    } else {
-        "no password file configured"
-    };
-
-    let sources = [
-        ("GoXLR Mic", GOXLR_CHAT_MIC),
-        ("GoXLR Stream Mix", GOXLR_STREAM_MIX),
-        ("GoXLR Sampler", GOXLR_SAMPLER),
-        ("GoXLR Desktop Mix", GOXLR_STREAM_MIX),
-    ];
+    let sources = obs_source_plan(config);
 
     if dry_run {
         println!(
-            "would sync {} OBS sources via {}:{} ({password_state})",
+            "would sync {} OBS sources via {}:{}",
             sources.len(),
             config.obs.host,
             config.obs.port
         );
-        for (label, node) in sources {
-            println!("  {label}: {node}");
+        for source in sources {
+            println!("  {}: {}", source.name, source.device_id);
         }
         return Ok(());
     }
 
-    bail!(
-        "OBS websocket is reachable, but v1 only supports dry-run source planning; run `goxlr-nexus obs sync --dry-run`"
-    );
+    let mut client = ObsClient::connect(config)?;
+    let scene = client.target_scene()?;
+    let existing_inputs = client.input_names()?;
+    let scene_items = client.scene_source_names(&scene)?;
+    for source in sources {
+        if !existing_inputs.iter().any(|name| name == &source.name) {
+            client.create_input(&scene, &source)?;
+            println!("created OBS source {} in scene {scene}", source.name);
+        } else {
+            client.set_input_settings(&source)?;
+            if !scene_items.iter().any(|name| name == &source.name) {
+                client.create_scene_item(&scene, &source.name)?;
+                println!("added existing OBS source {} to scene {scene}", source.name);
+            } else {
+                println!("updated OBS source {}", source.name);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn obs_ready(config: &Config) -> Result<()> {
@@ -348,6 +399,244 @@ fn obs_ready(config: &Config) -> Result<()> {
     TcpStream::connect_timeout(&addr, Duration::from_millis(300))
         .with_context(|| format!("OBS websocket is not reachable at {addr}"))?;
     Ok(())
+}
+
+type ObsSocket = WebSocket<MaybeTlsStream<TcpStream>>;
+
+struct ObsClient {
+    socket: ObsSocket,
+    next_request_id: u64,
+}
+
+impl ObsClient {
+    fn connect(config: &Config) -> Result<Self> {
+        let url = format!("ws://{}:{}", config.obs.host, config.obs.port);
+        let (mut socket, _) = connect(&url)
+            .with_context(|| format!("failed to connect to OBS websocket at {url}"))?;
+        let hello = read_obs_message(&mut socket, 0).context("OBS did not send a Hello message")?;
+        let hello_data: ObsHello = serde_json::from_value(
+            hello
+                .get("d")
+                .cloned()
+                .ok_or_else(|| anyhow!("OBS Hello did not include data"))?,
+        )
+        .context("failed to parse OBS Hello")?;
+
+        let mut identify = json!({"rpcVersion": 1});
+        if let Some(auth) = hello_data.authentication {
+            let password = read_obs_password(config)?;
+            identify["authentication"] =
+                Value::String(obs_authentication(&password, &auth.salt, &auth.challenge));
+        }
+        write_obs_message(&mut socket, 1, identify)?;
+        read_obs_message(&mut socket, 2).context("OBS did not accept Identify")?;
+        Ok(Self {
+            socket,
+            next_request_id: 1,
+        })
+    }
+
+    fn request(&mut self, request_type: &str, request_data: Value) -> Result<Value> {
+        let request_id = self.next_request_id.to_string();
+        self.next_request_id += 1;
+        write_obs_message(
+            &mut self.socket,
+            6,
+            json!({
+                "requestType": request_type,
+                "requestId": request_id,
+                "requestData": request_data,
+            }),
+        )?;
+
+        loop {
+            let response = read_obs_message(&mut self.socket, 7)?;
+            let data = response
+                .get("d")
+                .and_then(Value::as_object)
+                .ok_or_else(|| anyhow!("OBS RequestResponse did not include an object payload"))?;
+            if data.get("requestId").and_then(Value::as_str) != Some(request_id.as_str()) {
+                continue;
+            }
+            let status: ObsRequestStatus = serde_json::from_value(
+                data.get("requestStatus")
+                    .cloned()
+                    .ok_or_else(|| anyhow!("OBS response missing requestStatus"))?,
+            )
+            .context("failed to parse OBS requestStatus")?;
+            if !status.result {
+                bail!(
+                    "OBS request {request_type} failed: code={:?} comment={}",
+                    status.code,
+                    status.comment.unwrap_or_else(|| "none".to_string())
+                );
+            }
+            return Ok(data.get("responseData").cloned().unwrap_or(Value::Null));
+        }
+    }
+
+    fn target_scene(&mut self) -> Result<String> {
+        let response = self.request("GetSceneList", json!({}))?;
+        if let Some(scene) = response
+            .get("currentProgramSceneName")
+            .and_then(Value::as_str)
+        {
+            return Ok(scene.to_string());
+        }
+        response
+            .get("scenes")
+            .and_then(Value::as_array)
+            .and_then(|scenes| scenes.first())
+            .and_then(|scene| scene.get("sceneName"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| anyhow!("OBS returned no scenes to sync into"))
+    }
+
+    fn input_names(&mut self) -> Result<Vec<String>> {
+        let response = self.request("GetInputList", json!({}))?;
+        Ok(response
+            .get("inputs")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|input| input.get("inputName").and_then(Value::as_str))
+            .map(ToOwned::to_owned)
+            .collect())
+    }
+
+    fn scene_source_names(&mut self, scene: &str) -> Result<Vec<String>> {
+        let response = self.request("GetSceneItemList", json!({"sceneName": scene}))?;
+        Ok(response
+            .get("sceneItems")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|item| item.get("sourceName").and_then(Value::as_str))
+            .map(ToOwned::to_owned)
+            .collect())
+    }
+
+    fn create_input(&mut self, scene: &str, source: &ObsSourcePlan) -> Result<()> {
+        self.request(
+            "CreateInput",
+            json!({
+                "sceneName": scene,
+                "inputName": source.name,
+                "inputKind": source.input_kind,
+                "inputSettings": obs_input_settings(source),
+                "sceneItemEnabled": true,
+            }),
+        )?;
+        Ok(())
+    }
+
+    fn set_input_settings(&mut self, source: &ObsSourcePlan) -> Result<()> {
+        self.request(
+            "SetInputSettings",
+            json!({
+                "inputName": source.name,
+                "inputSettings": obs_input_settings(source),
+                "overlay": true,
+            }),
+        )?;
+        Ok(())
+    }
+
+    fn create_scene_item(&mut self, scene: &str, source_name: &str) -> Result<()> {
+        self.request(
+            "CreateSceneItem",
+            json!({
+                "sceneName": scene,
+                "sourceName": source_name,
+                "sceneItemEnabled": true,
+            }),
+        )?;
+        Ok(())
+    }
+}
+
+fn read_obs_message(socket: &mut ObsSocket, expected_op: u64) -> Result<Value> {
+    loop {
+        let message = socket
+            .read()
+            .context("failed to read OBS websocket message")?;
+        let text = match message {
+            Message::Text(text) => text,
+            Message::Binary(bytes) => String::from_utf8(bytes.to_vec())
+                .context("OBS sent non-UTF-8 binary websocket payload")?
+                .into(),
+            Message::Ping(_) | Message::Pong(_) => continue,
+            Message::Close(frame) => {
+                bail!("OBS websocket closed before op {expected_op}: {frame:?}")
+            }
+            Message::Frame(_) => continue,
+        };
+        let value: Value =
+            serde_json::from_str(&text).context("failed to parse OBS websocket JSON")?;
+        if value.get("op").and_then(Value::as_u64) == Some(expected_op) {
+            return Ok(value);
+        }
+    }
+}
+
+fn write_obs_message(socket: &mut ObsSocket, op: u64, data: Value) -> Result<()> {
+    let text = serde_json::to_string(&json!({"op": op, "d": data}))
+        .context("failed to encode OBS websocket message")?;
+    socket
+        .send(Message::Text(text.into()))
+        .context("failed to write OBS websocket message")
+}
+
+fn read_obs_password(config: &Config) -> Result<String> {
+    let Some(path) = &config.obs.password_file else {
+        bail!("OBS websocket requires authentication, but no password-file is configured");
+    };
+    fs::read_to_string(path)
+        .with_context(|| format!("failed to read OBS password file {}", path.display()))
+        .map(|text| text.trim().to_string())
+}
+
+fn obs_authentication(password: &str, salt: &str, challenge: &str) -> String {
+    let secret = sha256_base64(format!("{password}{salt}").as_bytes());
+    sha256_base64(format!("{secret}{challenge}").as_bytes())
+}
+
+fn sha256_base64(bytes: &[u8]) -> String {
+    BASE64.encode(Sha256::digest(bytes))
+}
+
+fn obs_source_plan(config: &Config) -> Vec<ObsSourcePlan> {
+    config
+        .obs
+        .sources
+        .iter()
+        .filter(|source| !source.name.is_empty() && !source.device_id.is_empty())
+        .map(|source| ObsSourcePlan {
+            name: source.name.clone(),
+            input_kind: OBS_INPUT_KIND.to_string(),
+            device_id: source.device_id.clone(),
+        })
+        .collect()
+}
+
+fn obs_input_settings(source: &ObsSourcePlan) -> Value {
+    json!({"device_id": source.device_id})
+}
+
+fn default_obs_sources() -> Vec<ObsSourceConfig> {
+    [
+        ("GoXLR Mic", GOXLR_CHAT_MIC),
+        ("GoXLR Stream Mix", GOXLR_STREAM_MIX),
+        ("GoXLR Sampler", GOXLR_SAMPLER),
+        ("GoXLR Desktop Mix", GOXLR_STREAM_MIX),
+    ]
+    .into_iter()
+    .map(|(name, device_id)| ObsSourceConfig {
+        name: name.to_string(),
+        device_id: device_id.to_string(),
+    })
+    .collect()
 }
 
 fn snapshot() -> Result<Snapshot> {
@@ -535,5 +824,48 @@ mod tests {
         let status: Value = serde_json::json!({"mixers": {}});
         let err = validate_goxlr_status(&Config::default(), &status).unwrap_err();
         assert!(err.to_string().contains("S200805412CQK"));
+    }
+
+    #[test]
+    fn builds_default_obs_source_plan() {
+        let mut config = Config::default();
+        config.obs.enable = true;
+        let plan = obs_source_plan(&config);
+        assert_eq!(plan.len(), 4);
+        assert_eq!(plan[0].name, "GoXLR Mic");
+        assert_eq!(plan[0].input_kind, OBS_INPUT_KIND);
+        assert_eq!(plan[0].device_id, GOXLR_CHAT_MIC);
+        assert_eq!(plan[3].device_id, GOXLR_STREAM_MIX);
+    }
+
+    #[test]
+    fn builds_obs_input_settings() {
+        let source = ObsSourcePlan {
+            name: "GoXLR Mic".to_string(),
+            input_kind: OBS_INPUT_KIND.to_string(),
+            device_id: GOXLR_CHAT_MIC.to_string(),
+        };
+        assert_eq!(
+            obs_input_settings(&source),
+            serde_json::json!({"device_id": GOXLR_CHAT_MIC})
+        );
+    }
+
+    #[test]
+    fn parses_obs_hello_without_authentication() {
+        let hello: ObsHello = serde_json::from_value(serde_json::json!({
+            "obsWebSocketVersion": "5.5.4",
+            "rpcVersion": 1
+        }))
+        .unwrap();
+        assert!(hello.authentication.is_none());
+    }
+
+    #[test]
+    fn computes_obs_authentication_response() {
+        assert_eq!(
+            obs_authentication("password", "salt", "challenge"),
+            "zTM5ki6L2vVvBQiTG9ckH1Lh64AbnCf6XZ226UmnkIA="
+        );
     }
 }
