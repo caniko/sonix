@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -17,6 +18,8 @@ use tungstenite::{Message, WebSocket, connect};
 
 const DEFAULT_JDS_SINK: &str =
     "alsa_output.usb-Yoyodyne_Consulting_JDS_Labs_Element_DAC-01.analog-stereo";
+const DEFAULT_THINKPAD_SINK: &str =
+    "alsa_output.usb-Lenovo_ThinkPad_Thunderbolt_4_Dock_USB_Audio_000000000000-00.analog-stereo";
 const DEFAULT_GOXLR_SERIAL: &str = "S200805412CQK";
 const GOXLR_SYSTEM: &str = "alsa_output.usb-TC-Helicon_GoXLR-00.HiFi__Speaker__sink";
 const GOXLR_CHAT: &str = "alsa_output.usb-TC-Helicon_GoXLR-00.HiFi__Headphones__sink";
@@ -46,6 +49,7 @@ enum CommandKind {
         json: bool,
     },
     Apply(ApplyArgs),
+    Follow,
     Profile {
         profile: Profile,
         #[arg(long)]
@@ -83,6 +87,9 @@ enum ObsCommand {
 struct Config {
     user: String,
     jds_sink: String,
+    fallback_sink: String,
+    thinkpad_sink: String,
+    output_sinks: Vec<String>,
     goxlr_serial: String,
     profile: ProfileConfig,
     obs: ObsConfig,
@@ -93,6 +100,9 @@ impl Default for Config {
         Self {
             user: "can".to_string(),
             jds_sink: DEFAULT_JDS_SINK.to_string(),
+            fallback_sink: DEFAULT_JDS_SINK.to_string(),
+            thinkpad_sink: DEFAULT_THINKPAD_SINK.to_string(),
+            output_sinks: default_output_sinks(),
             goxlr_serial: DEFAULT_GOXLR_SERIAL.to_string(),
             profile: ProfileConfig::default(),
             obs: ObsConfig::default(),
@@ -194,15 +204,20 @@ struct Node {
 #[derive(Debug)]
 struct Snapshot {
     nodes: Vec<Node>,
-    goxlr_status: Value,
+    goxlr_status: Result<Value, String>,
 }
 
 #[derive(Debug)]
 struct RequiredNodes {
-    jds_sink: Node,
-    default_sink: Node,
+    outputs: OutputNodes,
     default_source: Node,
     monitor_source: Node,
+}
+
+#[derive(Debug)]
+struct OutputNodes {
+    output_sinks: Vec<Node>,
+    fallback_sink: Node,
 }
 
 fn main() -> Result<()> {
@@ -213,6 +228,7 @@ fn main() -> Result<()> {
         CommandKind::Doctor => doctor(&config),
         CommandKind::Status { json } => status(&config, json),
         CommandKind::Apply(args) => apply(&config, args.dry_run),
+        CommandKind::Follow => follow(&config),
         CommandKind::Profile { profile, dry_run } => apply_profile(&config, profile, dry_run),
         CommandKind::Obs {
             command: ObsCommand::Sync { dry_run },
@@ -241,10 +257,15 @@ fn load_config(explicit: Option<&Path>) -> Result<Config> {
 fn doctor(config: &Config) -> Result<()> {
     let snapshot = snapshot()?;
     let required = required_nodes(config, &snapshot)?;
-    validate_goxlr_status(config, &snapshot.goxlr_status)?;
+    let status = snapshot
+        .goxlr_status
+        .as_ref()
+        .map_err(|err| anyhow!("{err}"))?;
+    validate_goxlr_status(config, status)?;
 
-    println!("ok: JDS sink {}", required.jds_sink.name);
-    println!("ok: GoXLR default sink {}", required.default_sink.name);
+    for output in &required.outputs.output_sinks {
+        println!("ok: output sink {}", output.name);
+    }
     println!("ok: GoXLR default source {}", required.default_source.name);
     println!("ok: GoXLR monitor source {}", required.monitor_source.name);
     println!("ok: GoXLR serial {}", config.goxlr_serial);
@@ -265,17 +286,43 @@ fn doctor(config: &Config) -> Result<()> {
 fn status(config: &Config, json: bool) -> Result<()> {
     let snapshot = snapshot()?;
     let required = required_nodes(config, &snapshot);
+    let goxlr_status = snapshot
+        .goxlr_status
+        .as_ref()
+        .map_err(|err| anyhow!("{err}"))
+        .and_then(|status| validate_goxlr_status(config, status));
+    let goxlr_ok = goxlr_status.is_ok();
     if json {
         let mut out = BTreeMap::new();
         out.insert("jdsSink", Value::String(config.jds_sink.clone()));
+        out.insert("fallbackSink", Value::String(config.fallback_sink.clone()));
+        out.insert("thinkpadSink", Value::String(config.thinkpad_sink.clone()));
+        out.insert(
+            "outputSinks",
+            Value::Array(
+                config
+                    .output_sinks
+                    .iter()
+                    .cloned()
+                    .map(Value::String)
+                    .collect(),
+            ),
+        );
         out.insert("goxlrSerial", Value::String(config.goxlr_serial.clone()));
-        out.insert("doctorOk", Value::Bool(required.is_ok()));
+        out.insert("doctorOk", Value::Bool(required.is_ok() && goxlr_ok));
+        out.insert("goxlrOk", Value::Bool(goxlr_ok));
         out.insert("obsEnabled", Value::Bool(config.obs.enable));
         println!("{}", serde_json::to_string_pretty(&out)?);
         return Ok(());
     }
 
     println!("JDS sink: {}", config.jds_sink);
+    println!("Fallback sink: {}", config.fallback_sink);
+    println!("ThinkPad TH4 sink: {}", config.thinkpad_sink);
+    println!("Selectable output sinks:");
+    for sink in &config.output_sinks {
+        println!("  {sink}");
+    }
     println!("GoXLR serial: {}", config.goxlr_serial);
     println!("GoXLR channel sinks:");
     for name in [
@@ -292,7 +339,11 @@ fn status(config: &Config, json: bool) -> Result<()> {
         print_node(&snapshot, name);
     }
     match required {
-        Ok(_) => println!("doctor: ok"),
+        Ok(_) if goxlr_ok => println!("doctor: ok"),
+        Ok(_) => match goxlr_status {
+            Ok(()) => println!("doctor: ok"),
+            Err(err) => println!("doctor: failed: {err:#}"),
+        },
         Err(err) => println!("doctor: failed: {err:#}"),
     }
     Ok(())
@@ -311,21 +362,106 @@ fn print_node(snapshot: &Snapshot, name: &str) {
 
 fn apply(config: &Config, dry_run: bool) -> Result<()> {
     let snapshot = snapshot()?;
-    let required = required_nodes(config, &snapshot)?;
-    validate_goxlr_status(config, &snapshot.goxlr_status)?;
+    match usable_goxlr_status(config, &snapshot) {
+        Ok(()) => apply_goxlr_profile(config, &snapshot, dry_run),
+        Err(err) => apply_fallback_profile(config, &snapshot, dry_run, &err),
+    }
+}
 
-    run_or_print(
-        dry_run,
-        "pactl",
-        &["set-default-sink", &required.default_sink.name],
-    )?;
+fn follow(config: &Config) -> Result<()> {
+    apply(config, false).context("initial GoXLR Nexus sync failed")?;
+
+    let mut child = audio_command("pactl")
+        .args(["subscribe"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .context("failed to run pactl subscribe")?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("pactl subscribe did not expose stdout"))?;
+
+    for line in BufReader::new(stdout).lines() {
+        let line = line.context("failed to read pactl subscribe event")?;
+        if line.contains(" on sink ") || line.contains(" on server ") {
+            if let Err(err) = apply(config, false) {
+                eprintln!("warn: GoXLR Nexus sync failed after PulseAudio event: {err:#}");
+            }
+        }
+    }
+
+    let status = child.wait().context("failed to wait for pactl subscribe")?;
+    if !status.success() {
+        bail!("pactl subscribe exited with status {status}");
+    }
+    Ok(())
+}
+
+fn usable_goxlr_status(config: &Config, snapshot: &Snapshot) -> Result<()> {
+    let status = snapshot
+        .goxlr_status
+        .as_ref()
+        .map_err(|err| anyhow!("{err}"))?;
+    validate_goxlr_status(config, status)
+}
+
+fn apply_goxlr_profile(config: &Config, snapshot: &Snapshot, dry_run: bool) -> Result<()> {
+    let required = required_nodes(config, snapshot)?;
+
     run_or_print(
         dry_run,
         "pactl",
         &["set-default-source", &required.default_source.name],
     )?;
-    link_monitor_to_jds(config, &required, dry_run)?;
+    sync_monitor_to_selected_output(&required, dry_run)?;
     Ok(())
+}
+
+fn apply_fallback_profile(
+    config: &Config,
+    snapshot: &Snapshot,
+    dry_run: bool,
+    reason: &anyhow::Error,
+) -> Result<()> {
+    let outputs = output_nodes(config, snapshot)?;
+    eprintln!("warn: GoXLR unavailable, applying output fallback: {reason:#}");
+    sync_default_output(&outputs, dry_run).map(|_| ())
+}
+
+fn sync_monitor_to_selected_output(required: &RequiredNodes, dry_run: bool) -> Result<()> {
+    let selected = sync_default_output(&required.outputs, dry_run)?;
+
+    for output in &required.outputs.output_sinks {
+        disconnect_monitor_from_output(&required.monitor_source, output, dry_run);
+    }
+
+    link_monitor_to_output(&required.monitor_source, &selected, dry_run)
+}
+
+fn sync_default_output(outputs: &OutputNodes, dry_run: bool) -> Result<Node> {
+    let selected_name = current_default_sink()?;
+    if let Some(selected) = selected_output_sink(outputs, &selected_name) {
+        return Ok(selected.clone());
+    }
+
+    let fallback = &outputs.fallback_sink;
+    if selected_name == fallback.name {
+        return Ok(fallback.clone());
+    }
+
+    eprintln!(
+        "warn: default sink {selected_name} is not managed by goxlr-nexus; switching to fallback sink {}",
+        fallback.name
+    );
+    run_or_print(dry_run, "pactl", &["set-default-sink", &fallback.name])?;
+    Ok(fallback.clone())
+}
+
+fn selected_output_sink<'a>(outputs: &'a OutputNodes, selected_name: &str) -> Option<&'a Node> {
+    outputs
+        .output_sinks
+        .iter()
+        .find(|node| node.name == selected_name)
 }
 
 fn apply_profile(config: &Config, profile: Profile, dry_run: bool) -> Result<()> {
@@ -639,10 +775,17 @@ fn default_obs_sources() -> Vec<ObsSourceConfig> {
     .collect()
 }
 
+fn default_output_sinks() -> Vec<String> {
+    [DEFAULT_JDS_SINK, DEFAULT_THINKPAD_SINK]
+        .into_iter()
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
 fn snapshot() -> Result<Snapshot> {
     Ok(Snapshot {
         nodes: pipewire_nodes()?,
-        goxlr_status: goxlr_status()?,
+        goxlr_status: goxlr_status().map_err(|err| format!("{err:#}")),
     })
 }
 
@@ -698,8 +841,9 @@ fn goxlr_status() -> Result<Value> {
         .context("failed to run goxlr-client --status-json")?;
     if !output.status.success() {
         bail!(
-            "goxlr-client --status-json failed with status {}",
-            output.status
+            "goxlr-client --status-json failed with status {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
         );
     }
     serde_json::from_slice(&output.stdout).context("failed to parse goxlr-client JSON")
@@ -728,10 +872,31 @@ fn validate_goxlr_status(config: &Config, status: &Value) -> Result<()> {
 
 fn required_nodes(config: &Config, snapshot: &Snapshot) -> Result<RequiredNodes> {
     Ok(RequiredNodes {
-        jds_sink: find_node(snapshot, &config.jds_sink)?,
-        default_sink: find_node(snapshot, &config.profile.default_sink)?,
+        outputs: output_nodes(config, snapshot)?,
         default_source: find_node(snapshot, &config.profile.default_source)?,
         monitor_source: find_node(snapshot, &config.profile.monitor_source)?,
+    })
+}
+
+fn output_nodes(config: &Config, snapshot: &Snapshot) -> Result<OutputNodes> {
+    let fallback_sink = find_node(snapshot, &config.fallback_sink)?;
+    let mut output_sinks = Vec::new();
+    for name in &config.output_sinks {
+        match find_node(snapshot, name) {
+            Ok(node) => output_sinks.push(node),
+            Err(err) => eprintln!("warn: configured output sink {name} is unavailable: {err:#}"),
+        }
+    }
+    if !output_sinks
+        .iter()
+        .any(|node| node.name == fallback_sink.name)
+    {
+        output_sinks.push(fallback_sink.clone());
+    }
+
+    Ok(OutputNodes {
+        output_sinks,
+        fallback_sink,
     })
 }
 
@@ -745,7 +910,12 @@ fn find_node(snapshot: &Snapshot, name: &str) -> Result<Node> {
             let relevant = snapshot
                 .nodes
                 .iter()
-                .filter(|node| node.name.contains("GoXLR") || node.name.contains("JDS"))
+                .filter(|node| {
+                    node.name.contains("GoXLR")
+                        || node.name.contains("JDS")
+                        || node.name.contains("ThinkPad")
+                        || node.name.contains("Lenovo")
+                })
                 .map(|node| node.name.clone())
                 .collect::<Vec<_>>()
                 .join(", ");
@@ -753,11 +923,33 @@ fn find_node(snapshot: &Snapshot, name: &str) -> Result<Node> {
         })
 }
 
-fn link_monitor_to_jds(config: &Config, required: &RequiredNodes, dry_run: bool) -> Result<()> {
+fn current_default_sink() -> Result<String> {
+    let output = audio_command("pactl")
+        .args(["get-default-sink"])
+        .output()
+        .context("failed to run pactl get-default-sink")?;
+    if !output.status.success() {
+        bail!(
+            "pactl get-default-sink failed with status {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn disconnect_monitor_from_output(monitor_source: &Node, output: &Node, dry_run: bool) {
     for (source_port, sink_port) in [("capture_FL", "playback_FL"), ("capture_FR", "playback_FR")] {
-        let source = format!("{}:{source_port}", required.monitor_source.name);
-        let sink = format!("{}:{sink_port}", config.jds_sink);
+        let source = format!("{}:{source_port}", monitor_source.name);
+        let sink = format!("{}:{sink_port}", output.name);
         run_or_print(dry_run, "pw-link", &["--disconnect", &source, &sink]).ok();
+    }
+}
+
+fn link_monitor_to_output(monitor_source: &Node, output: &Node, dry_run: bool) -> Result<()> {
+    for (source_port, sink_port) in [("capture_FL", "playback_FL"), ("capture_FR", "playback_FR")] {
+        let source = format!("{}:{source_port}", monitor_source.name);
+        let sink = format!("{}:{sink_port}", output.name);
         run_or_print(dry_run, "pw-link", &[&source, &sink])?;
     }
     Ok(())
@@ -827,6 +1019,54 @@ mod tests {
     }
 
     #[test]
+    fn goxlr_status_error_is_not_usable() {
+        let snapshot = Snapshot {
+            nodes: vec![],
+            goxlr_status: Err("goxlr-client --status-json failed".to_string()),
+        };
+        let err = usable_goxlr_status(&Config::default(), &snapshot).unwrap_err();
+        assert!(err.to_string().contains("goxlr-client"));
+    }
+
+    #[test]
+    fn parses_configured_output_sinks() {
+        let config: Config = toml::from_str(
+            r#"
+            output-sinks = [
+              "alsa_output.example_jds",
+              "alsa_output.example_thinkpad",
+            ]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.output_sinks,
+            vec!["alsa_output.example_jds", "alsa_output.example_thinkpad"]
+        );
+    }
+
+    #[test]
+    fn selected_supported_output_tracks_current_default_sink() {
+        let required =
+            output_nodes_for_outputs(["alsa_output.example_jds", "alsa_output.example_thinkpad"]);
+        let selected = selected_output_sink(&required, "alsa_output.example_thinkpad").unwrap();
+        assert_eq!(selected.name, "alsa_output.example_thinkpad");
+    }
+
+    #[test]
+    fn unsupported_output_is_not_selected() {
+        let required =
+            output_nodes_for_outputs(["alsa_output.example_jds", "alsa_output.example_thinkpad"]);
+        assert!(
+            selected_output_sink(
+                &required,
+                "alsa_output.usb-Generic_USB_Audio-00.HiFi__Speaker__sink"
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
     fn builds_default_obs_source_plan() {
         let mut config = Config::default();
         config.obs.enable = true;
@@ -867,5 +1107,20 @@ mod tests {
             obs_authentication("password", "salt", "challenge"),
             "zTM5ki6L2vVvBQiTG9ckH1Lh64AbnCf6XZ226UmnkIA="
         );
+    }
+
+    fn output_nodes_for_outputs<const N: usize>(outputs: [&str; N]) -> OutputNodes {
+        OutputNodes {
+            output_sinks: outputs.into_iter().map(test_node).collect(),
+            fallback_sink: test_node("alsa_output.example_jds"),
+        }
+    }
+
+    fn test_node(name: &str) -> Node {
+        Node {
+            name: name.to_string(),
+            description: None,
+            media_class: Some("Audio/Sink".to_string()),
+        }
     }
 }

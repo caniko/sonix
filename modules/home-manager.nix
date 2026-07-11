@@ -8,6 +8,22 @@
   cfg = config.programs.goxlr-nexus;
   inherit (lib) mkEnableOption mkIf mkOption types;
   package = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+  effectiveOutputSinks =
+    if cfg.outputSinks == null
+    then [cfg.jdsSink cfg.thinkpadSink]
+    else cfg.outputSinks;
+  effectiveFallbackSink =
+    if cfg.fallbackSink == null
+    then cfg.jdsSink
+    else cfg.fallbackSink;
+  outputSinksToml = lib.concatMapStringsSep ", " (sink: "\"${sink}\"") effectiveOutputSinks;
+  goxlrDaemonUnit = "app-goxlr\\x2ddaemon@autostart.service";
+  servicePath = lib.makeBinPath [
+    package
+    pkgs.goxlr-utility
+    pkgs.pipewire
+    pkgs.pulseaudio
+  ];
   obsSourceToml =
     lib.concatMapStrings
     (source: ''
@@ -20,6 +36,9 @@
   configFile = pkgs.writeText "goxlr-nexus-home-config.toml" ''
     user = "${cfg.user}"
     jds-sink = "${cfg.jdsSink}"
+    fallback-sink = "${effectiveFallbackSink}"
+    thinkpad-sink = "${cfg.thinkpadSink}"
+    output-sinks = [${outputSinksToml}]
     goxlr-serial = "${cfg.goxlrSerial}"
 
     [obs]
@@ -43,6 +62,20 @@ in {
     jdsSink = mkOption {
       type = types.str;
       default = "alsa_output.usb-Yoyodyne_Consulting_JDS_Labs_Element_DAC-01.analog-stereo";
+    };
+    fallbackSink = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      description = "PipeWire sink to select when the current desktop output is not managed. Defaults to jdsSink.";
+    };
+    thinkpadSink = mkOption {
+      type = types.str;
+      default = "alsa_output.usb-Lenovo_ThinkPad_Thunderbolt_4_Dock_USB_Audio_000000000000-00.analog-stereo";
+    };
+    outputSinks = mkOption {
+      type = types.nullOr (types.listOf types.str);
+      default = null;
+      description = "Selectable PipeWire output sinks. Defaults to jdsSink and thinkpadSink.";
     };
     goxlrSerial = mkOption {
       type = types.str;
@@ -129,12 +162,13 @@ in {
     systemd.user.services.goxlr-nexus = {
       Unit = {
         Description = "GoXLR Nexus audio routing repair";
-        After = ["pipewire.service" "pipewire-pulse.service" "wireplumber.service"];
-        Wants = ["pipewire.service" "pipewire-pulse.service" "wireplumber.service"];
+        After = ["pipewire.service" "pipewire-pulse.service" "wireplumber.service" goxlrDaemonUnit];
+        Wants = ["pipewire.service" "pipewire-pulse.service" "wireplumber.service" goxlrDaemonUnit];
       };
       Service = {
-        Type = "oneshot";
-        ExecStart = "${package}/bin/goxlr-nexus --config ${configFile} apply";
+        Type = "simple";
+        Environment = "PATH=${servicePath}";
+        ExecStart = "${package}/bin/goxlr-nexus --config ${configFile} follow";
       };
       Install.WantedBy = ["default.target"];
     };
