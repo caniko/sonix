@@ -10,7 +10,7 @@
   package = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
   effectiveOutputSinks =
     if cfg.outputSinks == null
-    then [cfg.jdsSink cfg.thinkpadSink]
+    then lib.filter (sink: sink != null) [cfg.jdsSink cfg.thinkpadSink]
     else cfg.outputSinks;
   effectiveFallbackSink =
     if cfg.fallbackSink == null
@@ -26,11 +26,11 @@
   ];
   configFile = pkgs.writeText "goxlr-nexus-config.toml" ''
     user = "${cfg.user}"
-    jds-sink = "${cfg.jdsSink}"
-    fallback-sink = "${effectiveFallbackSink}"
-    thinkpad-sink = "${cfg.thinkpadSink}"
     output-sinks = [${outputSinksToml}]
-    goxlr-serial = "${cfg.goxlrSerial}"
+    ${lib.optionalString (cfg.jdsSink != null) ''jds-sink = "${cfg.jdsSink}"''}
+    ${lib.optionalString (effectiveFallbackSink != null) ''fallback-sink = "${effectiveFallbackSink}"''}
+    ${lib.optionalString (cfg.thinkpadSink != null) ''thinkpad-sink = "${cfg.thinkpadSink}"''}
+    ${lib.optionalString (cfg.goxlrSerial != null) ''goxlr-serial = "${cfg.goxlrSerial}"''}
 
     [profile]
     default-sink = "${cfg.defaultSink}"
@@ -51,8 +51,8 @@ in {
       default = "can";
     };
     jdsSink = mkOption {
-      type = types.str;
-      default = "alsa_output.usb-Yoyodyne_Consulting_JDS_Labs_Element_DAC-01.analog-stereo";
+      type = types.nullOr types.str;
+      default = null;
     };
     fallbackSink = mkOption {
       type = types.nullOr types.str;
@@ -60,8 +60,8 @@ in {
       description = "PipeWire sink to select when the current desktop output is not managed. Defaults to jdsSink.";
     };
     thinkpadSink = mkOption {
-      type = types.str;
-      default = "alsa_output.usb-Lenovo_ThinkPad_Thunderbolt_4_Dock_USB_Audio_000000000000-00.analog-stereo";
+      type = types.nullOr types.str;
+      default = null;
     };
     outputSinks = mkOption {
       type = types.nullOr (types.listOf types.str);
@@ -69,8 +69,8 @@ in {
       description = "Selectable PipeWire output sinks. Defaults to jdsSink and thinkpadSink.";
     };
     goxlrSerial = mkOption {
-      type = types.str;
-      default = "S200805412CQK";
+      type = types.nullOr types.str;
+      default = null;
     };
     defaultSink = mkOption {
       type = types.str;
@@ -112,6 +112,12 @@ in {
         Type = "simple";
         Environment = "PATH=${servicePath}";
         ExecStart = "${package}/bin/goxlr-nexus --config ${configFile} follow";
+        Restart = "always";
+        RestartSec = 5;
+      };
+      unitConfig = {
+        StartLimitIntervalSec = 300;
+        StartLimitBurst = 20;
       };
     };
   };

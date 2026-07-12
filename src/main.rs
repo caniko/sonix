@@ -16,11 +16,6 @@ use sha2::{Digest, Sha256};
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket, connect};
 
-const DEFAULT_JDS_SINK: &str =
-    "alsa_output.usb-Yoyodyne_Consulting_JDS_Labs_Element_DAC-01.analog-stereo";
-const DEFAULT_THINKPAD_SINK: &str =
-    "alsa_output.usb-Lenovo_ThinkPad_Thunderbolt_4_Dock_USB_Audio_000000000000-00.analog-stereo";
-const DEFAULT_GOXLR_SERIAL: &str = "S200805412CQK";
 const GOXLR_SYSTEM: &str = "alsa_output.usb-TC-Helicon_GoXLR-00.HiFi__Speaker__sink";
 const GOXLR_CHAT: &str = "alsa_output.usb-TC-Helicon_GoXLR-00.HiFi__Headphones__sink";
 const GOXLR_GAME: &str = "alsa_output.usb-TC-Helicon_GoXLR-00.HiFi__Line1__sink";
@@ -86,11 +81,11 @@ enum ObsCommand {
 #[serde(default, rename_all = "kebab-case")]
 struct Config {
     user: String,
-    jds_sink: String,
-    fallback_sink: String,
-    thinkpad_sink: String,
+    jds_sink: Option<String>,
+    fallback_sink: Option<String>,
+    thinkpad_sink: Option<String>,
     output_sinks: Vec<String>,
-    goxlr_serial: String,
+    goxlr_serial: Option<String>,
     profile: ProfileConfig,
     obs: ObsConfig,
 }
@@ -99,11 +94,11 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             user: "can".to_string(),
-            jds_sink: DEFAULT_JDS_SINK.to_string(),
-            fallback_sink: DEFAULT_JDS_SINK.to_string(),
-            thinkpad_sink: DEFAULT_THINKPAD_SINK.to_string(),
-            output_sinks: default_output_sinks(),
-            goxlr_serial: DEFAULT_GOXLR_SERIAL.to_string(),
+            jds_sink: None,
+            fallback_sink: None,
+            thinkpad_sink: None,
+            output_sinks: Vec::new(),
+            goxlr_serial: None,
             profile: ProfileConfig::default(),
             obs: ObsConfig::default(),
         }
@@ -268,7 +263,10 @@ fn doctor(config: &Config) -> Result<()> {
     }
     println!("ok: GoXLR default source {}", required.default_source.name);
     println!("ok: GoXLR monitor source {}", required.monitor_source.name);
-    println!("ok: GoXLR serial {}", config.goxlr_serial);
+    println!(
+        "ok: GoXLR serial {}",
+        config.goxlr_serial.as_deref().unwrap_or("not configured")
+    );
 
     if config.obs.enable {
         match obs_ready(config) {
@@ -294,9 +292,30 @@ fn status(config: &Config, json: bool) -> Result<()> {
     let goxlr_ok = goxlr_status.is_ok();
     if json {
         let mut out = BTreeMap::new();
-        out.insert("jdsSink", Value::String(config.jds_sink.clone()));
-        out.insert("fallbackSink", Value::String(config.fallback_sink.clone()));
-        out.insert("thinkpadSink", Value::String(config.thinkpad_sink.clone()));
+        out.insert(
+            "jdsSink",
+            config
+                .jds_sink
+                .clone()
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+        );
+        out.insert(
+            "fallbackSink",
+            config
+                .fallback_sink
+                .clone()
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+        );
+        out.insert(
+            "thinkpadSink",
+            config
+                .thinkpad_sink
+                .clone()
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+        );
         out.insert(
             "outputSinks",
             Value::Array(
@@ -308,7 +327,14 @@ fn status(config: &Config, json: bool) -> Result<()> {
                     .collect(),
             ),
         );
-        out.insert("goxlrSerial", Value::String(config.goxlr_serial.clone()));
+        out.insert(
+            "goxlrSerial",
+            config
+                .goxlr_serial
+                .clone()
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+        );
         out.insert("doctorOk", Value::Bool(required.is_ok() && goxlr_ok));
         out.insert("goxlrOk", Value::Bool(goxlr_ok));
         out.insert("obsEnabled", Value::Bool(config.obs.enable));
@@ -316,14 +342,26 @@ fn status(config: &Config, json: bool) -> Result<()> {
         return Ok(());
     }
 
-    println!("JDS sink: {}", config.jds_sink);
-    println!("Fallback sink: {}", config.fallback_sink);
-    println!("ThinkPad TH4 sink: {}", config.thinkpad_sink);
+    println!(
+        "JDS sink: {}",
+        config.jds_sink.as_deref().unwrap_or("not configured")
+    );
+    println!(
+        "Fallback sink: {}",
+        config.fallback_sink.as_deref().unwrap_or("not configured")
+    );
+    println!(
+        "ThinkPad TH4 sink: {}",
+        config.thinkpad_sink.as_deref().unwrap_or("not configured")
+    );
     println!("Selectable output sinks:");
     for sink in &config.output_sinks {
         println!("  {sink}");
     }
-    println!("GoXLR serial: {}", config.goxlr_serial);
+    println!(
+        "GoXLR serial: {}",
+        config.goxlr_serial.as_deref().unwrap_or("not configured")
+    );
     println!("GoXLR channel sinks:");
     for name in [
         GOXLR_SYSTEM,
@@ -369,7 +407,18 @@ fn apply(config: &Config, dry_run: bool) -> Result<()> {
 }
 
 fn follow(config: &Config) -> Result<()> {
-    apply(config, false).context("initial GoXLR Nexus sync failed")?;
+    loop {
+        if let Err(err) = follow_once(config) {
+            eprintln!("warn: GoXLR Nexus watcher unavailable: {err:#}; retrying in 5s");
+        }
+        std::thread::sleep(Duration::from_secs(5));
+    }
+}
+
+fn follow_once(config: &Config) -> Result<()> {
+    if let Err(err) = apply(config, false) {
+        eprintln!("warn: initial GoXLR Nexus sync failed: {err:#}");
+    }
 
     let mut child = audio_command("pactl")
         .args(["subscribe"])
@@ -423,7 +472,15 @@ fn apply_fallback_profile(
     dry_run: bool,
     reason: &anyhow::Error,
 ) -> Result<()> {
-    let outputs = output_nodes(config, snapshot)?;
+    let outputs = match output_nodes(config, snapshot) {
+        Ok(outputs) => outputs,
+        Err(err) => {
+            eprintln!(
+                "warn: GoXLR unavailable and no configured fallback output is present: {err:#}"
+            );
+            return Ok(());
+        }
+    };
     eprintln!("warn: GoXLR unavailable, applying output fallback: {reason:#}");
     sync_default_output(&outputs, dry_run).map(|_| ())
 }
@@ -469,7 +526,11 @@ fn apply_profile(config: &Config, profile: Profile, dry_run: bool) -> Result<()>
         Profile::Stream => apply(config, dry_run),
         Profile::Desktop => {
             let snapshot = snapshot()?;
-            let jds = find_node(&snapshot, &config.jds_sink)?;
+            let jds_name = config
+                .jds_sink
+                .as_deref()
+                .ok_or_else(|| anyhow!("no JDS sink is configured"))?;
+            let jds = find_node(&snapshot, jds_name)?;
             run_or_print(dry_run, "pactl", &["set-default-sink", &jds.name])?;
             run_or_print(
                 dry_run,
@@ -480,7 +541,11 @@ fn apply_profile(config: &Config, profile: Profile, dry_run: bool) -> Result<()>
         }
         Profile::Off => {
             let snapshot = snapshot()?;
-            let jds = find_node(&snapshot, &config.jds_sink)?;
+            let jds_name = config
+                .jds_sink
+                .as_deref()
+                .ok_or_else(|| anyhow!("no JDS sink is configured"))?;
+            let jds = find_node(&snapshot, jds_name)?;
             run_or_print(dry_run, "pactl", &["set-default-sink", &jds.name])
         }
     }
@@ -775,13 +840,6 @@ fn default_obs_sources() -> Vec<ObsSourceConfig> {
     .collect()
 }
 
-fn default_output_sinks() -> Vec<String> {
-    [DEFAULT_JDS_SINK, DEFAULT_THINKPAD_SINK]
-        .into_iter()
-        .map(ToOwned::to_owned)
-        .collect()
-}
-
 fn snapshot() -> Result<Snapshot> {
     Ok(Snapshot {
         nodes: pipewire_nodes()?,
@@ -850,14 +908,17 @@ fn goxlr_status() -> Result<Value> {
 }
 
 fn validate_goxlr_status(config: &Config, status: &Value) -> Result<()> {
+    let Some(serial) = config.goxlr_serial.as_deref() else {
+        bail!("no GoXLR serial is configured");
+    };
     let mixers = status
         .get("mixers")
         .and_then(Value::as_object)
         .ok_or_else(|| anyhow!("goxlr-client JSON has no mixers object"))?;
-    let mixer = mixers.get(&config.goxlr_serial).ok_or_else(|| {
+    let mixer = mixers.get(serial).ok_or_else(|| {
         anyhow!(
             "GoXLR serial {} is missing from goxlr-client status; available serials: {}",
-            config.goxlr_serial,
+            serial,
             mixers.keys().cloned().collect::<Vec<_>>().join(", ")
         )
     })?;
@@ -879,7 +940,11 @@ fn required_nodes(config: &Config, snapshot: &Snapshot) -> Result<RequiredNodes>
 }
 
 fn output_nodes(config: &Config, snapshot: &Snapshot) -> Result<OutputNodes> {
-    let fallback_sink = find_node(snapshot, &config.fallback_sink)?;
+    let fallback_name = config
+        .fallback_sink
+        .as_deref()
+        .or(config.jds_sink.as_deref());
+    let configured_fallback = fallback_name.and_then(|name| find_node(snapshot, name).ok());
     let mut output_sinks = Vec::new();
     for name in &config.output_sinks {
         match find_node(snapshot, name) {
@@ -887,12 +952,17 @@ fn output_nodes(config: &Config, snapshot: &Snapshot) -> Result<OutputNodes> {
             Err(err) => eprintln!("warn: configured output sink {name} is unavailable: {err:#}"),
         }
     }
-    if !output_sinks
-        .iter()
-        .any(|node| node.name == fallback_sink.name)
+    if let Some(fallback_sink) = &configured_fallback
+        && !output_sinks
+            .iter()
+            .any(|node| node.name == fallback_sink.name)
     {
         output_sinks.push(fallback_sink.clone());
     }
+
+    let fallback_sink = configured_fallback
+        .or_else(|| output_sinks.first().cloned())
+        .ok_or_else(|| anyhow!("none of the configured output sinks is currently present"))?;
 
     Ok(OutputNodes {
         output_sinks,
@@ -1008,13 +1078,21 @@ mod tests {
                 }
             }
         });
-        validate_goxlr_status(&Config::default(), &status).unwrap();
+        let config = Config {
+            goxlr_serial: Some("S200805412CQK".to_string()),
+            ..Config::default()
+        };
+        validate_goxlr_status(&config, &status).unwrap();
     }
 
     #[test]
     fn rejects_missing_serial() {
         let status: Value = serde_json::json!({"mixers": {}});
-        let err = validate_goxlr_status(&Config::default(), &status).unwrap_err();
+        let config = Config {
+            goxlr_serial: Some("S200805412CQK".to_string()),
+            ..Config::default()
+        };
+        let err = validate_goxlr_status(&config, &status).unwrap_err();
         assert!(err.to_string().contains("S200805412CQK"));
     }
 
