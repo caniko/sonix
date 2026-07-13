@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://codeberg.org/caniko/goxlr-nexus/schemas/observation-v1.schema.json",
+  "title": "GoXLR Nexus observation v1",
+  "type": "object",
+  "required": ["schema", "producer", "capturedAt", "host", "sources", "facts", "factsDigest"],
+  "properties": {
+    "schema": {"const": "goxlr-nexus.observation/v1"},
+    "producer": {
+      "type": "object",
+      "required": ["name", "version"],
+      "properties": {"name": {"const": "goxlr-nexus"}, "version": {"type": "string"}}
+    },
+    "capturedAt": {"type": "integer", "minimum": 0},
+    "host": {"type": "string", "minLength": 1},
+    "sources": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["source", "status"],
+        "properties": {
+          "source": {"type": "string", "minLength": 1},
+          "status": {"enum": ["ok", "partial", "unavailable"]},
+          "diagnostic": {"type": "string"}
+        }
+      }
+    },
+    "facts": {"type": "object"},
+    "factsDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+  },
+  "additionalProperties": false
+}
