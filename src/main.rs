@@ -10,11 +10,17 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket, connect};
+
+mod observation;
+use observation::{
+    Facts, GoxlrFacts, ObsFacts, Observation, PipewireFacts, PipewireNode, Producer, SCHEMA,
+    SourceStatus, facts_digest,
+};
 
 const GOXLR_SYSTEM: &str = "alsa_output.usb-TC-Helicon_GoXLR-00.HiFi__Speaker__sink";
 const GOXLR_CHAT: &str = "alsa_output.usb-TC-Helicon_GoXLR-00.HiFi__Headphones__sink";
@@ -25,6 +31,8 @@ const GOXLR_CHAT_MIC: &str = "alsa_input.usb-TC-Helicon_GoXLR-00.HiFi__Headset__
 const GOXLR_STREAM_MIX: &str = "alsa_input.usb-TC-Helicon_GoXLR-00.HiFi__Line4__source";
 const GOXLR_SAMPLER: &str = "alsa_input.usb-TC-Helicon_GoXLR-00.HiFi__Line5__source";
 const OBS_INPUT_KIND: &str = "pulse_input_capture";
+const PLAN_SCHEMA: &str = "goxlr-nexus.plan/v1";
+const ADOPT_SCHEMA: &str = "goxlr-nexus.adopt/v1";
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -38,7 +46,21 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum CommandKind {
+    Discover {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Suggest a reviewable config from uniquely identified live devices.
+    Adopt {
+        #[arg(long)]
+        json: bool,
+    },
     Doctor,
+    /// Compute a read-only reconciliation plan from the live graph.
+    Plan {
+        #[arg(long)]
+        json: bool,
+    },
     Status {
         #[arg(long)]
         json: bool,
@@ -145,20 +167,11 @@ impl Default for ObsConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
 struct ObsSourceConfig {
     name: String,
     device_id: String,
-}
-
-impl Default for ObsSourceConfig {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            device_id: String::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -194,6 +207,7 @@ struct Node {
     name: String,
     description: Option<String>,
     media_class: Option<String>,
+    properties: BTreeMap<String, Value>,
 }
 
 #[derive(Debug)]
@@ -215,20 +229,698 @@ struct OutputNodes {
     fallback_sink: Node,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReconciliationPlan {
+    schema: &'static str,
+    producer: Producer,
+    read_only: bool,
+    requires_apply: bool,
+    current: PlanCurrent,
+    goxlr_status: String,
+    operations: Vec<PlanOperation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    obs: Option<PlanObs>,
+    diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PlanCurrent {
+    default_sink: String,
+    default_source: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PlanOperation {
+    action: String,
+    target: Option<String>,
+    arguments: Vec<String>,
+    reason: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PlanObs {
+    status: String,
+    scene: Option<String>,
+    choice_status: String,
+    sources: Vec<PlanObsSource>,
+    diagnostic: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PlanObsSource {
+    name: String,
+    device_id: String,
+    action: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AdoptionReport {
+    schema: &'static str,
+    producer: Producer,
+    read_only: bool,
+    config: AdoptConfig,
+    candidates: Vec<AdoptCandidate>,
+    diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AdoptConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    goxlr_serial: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    jds_sink: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fallback_sink: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinkpad_sink: Option<String>,
+    output_sinks: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    monitor_source: Option<String>,
+    obs_sources: Vec<AdoptObsSource>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AdoptCandidate {
+    role: String,
+    runtime_name: String,
+    description: Option<String>,
+    confidence: String,
+    reason: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AdoptObsSource {
+    name: String,
+    device_id: String,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let config = load_config(cli.config.as_deref())?;
-
+    let config_path = cli.config;
     match cli.command {
-        CommandKind::Doctor => doctor(&config),
-        CommandKind::Status { json } => status(&config, json),
-        CommandKind::Apply(args) => apply(&config, args.dry_run),
-        CommandKind::Follow => follow(&config),
-        CommandKind::Profile { profile, dry_run } => apply_profile(&config, profile, dry_run),
-        CommandKind::Obs {
-            command: ObsCommand::Sync { dry_run },
-        } => obs_sync(&config, dry_run),
+        CommandKind::Discover { json } => discover(config_path.as_deref(), json),
+        CommandKind::Adopt { json } => adopt(json),
+        command => {
+            let config = load_config(config_path.as_deref())?;
+            match command {
+                CommandKind::Discover { .. } => unreachable!("discover is handled above"),
+                CommandKind::Adopt { .. } => unreachable!("adopt is handled above"),
+                CommandKind::Doctor => doctor(&config),
+                CommandKind::Plan { json } => plan(&config, json),
+                CommandKind::Status { json } => status(&config, json),
+                CommandKind::Apply(args) => apply(&config, args.dry_run),
+                CommandKind::Follow => follow(&config),
+                CommandKind::Profile { profile, dry_run } => {
+                    apply_profile(&config, profile, dry_run)
+                }
+                CommandKind::Obs {
+                    command: ObsCommand::Sync { dry_run },
+                } => obs_sync(&config, dry_run),
+            }
+        }
     }
+}
+
+fn discover(explicit_config: Option<&Path>, json_output: bool) -> Result<()> {
+    let config = match load_config(explicit_config) {
+        Ok(config) => config,
+        Err(err) if explicit_config.is_none() => {
+            eprintln!("warn: ignoring invalid existing config during discovery: {err:#}");
+            Config::default()
+        }
+        Err(err) => return Err(err),
+    };
+
+    let mut sources = Vec::new();
+    let mut nodes = match pipewire_nodes() {
+        Ok(nodes) => {
+            sources.push(SourceStatus {
+                source: "pw-dump".to_string(),
+                status: "ok".to_string(),
+                diagnostic: None,
+            });
+            nodes
+        }
+        Err(err) => {
+            sources.push(SourceStatus {
+                source: "pw-dump".to_string(),
+                status: "unavailable".to_string(),
+                diagnostic: Some(format!("{err:#}")),
+            });
+            Vec::new()
+        }
+    };
+    nodes.sort_by(|left, right| left.name.cmp(&right.name));
+
+    let default_sink = match current_default_sink() {
+        Ok(value) => {
+            sources.push(SourceStatus {
+                source: "pactl.get-default-sink".to_string(),
+                status: "ok".to_string(),
+                diagnostic: None,
+            });
+            Some(value)
+        }
+        Err(err) => {
+            sources.push(SourceStatus {
+                source: "pactl.get-default-sink".to_string(),
+                status: "unavailable".to_string(),
+                diagnostic: Some(format!("{err:#}")),
+            });
+            None
+        }
+    };
+    let default_source = match current_default_source() {
+        Ok(value) => {
+            sources.push(SourceStatus {
+                source: "pactl.get-default-source".to_string(),
+                status: "ok".to_string(),
+                diagnostic: None,
+            });
+            Some(value)
+        }
+        Err(err) => {
+            sources.push(SourceStatus {
+                source: "pactl.get-default-source".to_string(),
+                status: "unavailable".to_string(),
+                diagnostic: Some(format!("{err:#}")),
+            });
+            None
+        }
+    };
+
+    let (goxlr, goxlr_source) = match goxlr_facts() {
+        Ok(facts) => (
+            facts,
+            SourceStatus {
+                source: "goxlr-client --status-json".to_string(),
+                status: "ok".to_string(),
+                diagnostic: None,
+            },
+        ),
+        Err(err) => (
+            GoxlrFacts {
+                status: "unavailable".to_string(),
+                mixers: BTreeMap::new(),
+                diagnostic: Some(format!("{err:#}")),
+            },
+            SourceStatus {
+                source: "goxlr-client --status-json".to_string(),
+                status: "unavailable".to_string(),
+                diagnostic: Some(format!("{err:#}")),
+            },
+        ),
+    };
+    sources.push(goxlr_source);
+
+    let (obs, obs_source) = match obs_facts(&config) {
+        Ok(facts) => {
+            let status = facts.status.clone();
+            let diagnostic = facts.diagnostic.clone();
+            (
+                facts,
+                SourceStatus {
+                    source: "obs-websocket".to_string(),
+                    status,
+                    diagnostic,
+                },
+            )
+        }
+        Err(err) => (
+            unavailable_obs_facts(format!("{err:#}")),
+            SourceStatus {
+                source: "obs-websocket".to_string(),
+                status: "unavailable".to_string(),
+                diagnostic: Some(format!("{err:#}")),
+            },
+        ),
+    };
+    sources.push(obs_source);
+
+    let facts = Facts {
+        pipewire: PipewireFacts {
+            default_sink,
+            default_source,
+            nodes: nodes.into_iter().map(pipewire_node).collect(),
+        },
+        goxlr,
+        obs,
+    };
+    let observation = Observation {
+        schema: SCHEMA,
+        producer: Producer {
+            name: "goxlr-nexus",
+            version: env!("CARGO_PKG_VERSION"),
+        },
+        captured_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or_default(),
+        host: std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string()),
+        sources,
+        facts_digest: facts_digest(&facts),
+        facts,
+    };
+
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&observation)?);
+    } else {
+        print_observation(&observation);
+    }
+    Ok(())
+}
+
+/// Suggest a human-readable Home Manager fragment from stable live labels.
+/// Ambiguous or missing labels are reported instead of being guessed.
+fn adopt(json_output: bool) -> Result<()> {
+    let nodes = pipewire_nodes()?;
+    let mut candidates = Vec::new();
+    let mut diagnostics = Vec::new();
+    let mut config = AdoptConfig::default();
+
+    let jds = adopt_node(
+        &nodes,
+        "audio.output.desk",
+        "Audio/Sink",
+        |node| {
+            node.description
+                .as_deref()
+                .is_some_and(|value| value.contains("JDS Labs Element"))
+        },
+        "description contains the JDS Labs Element DAC product label",
+        &mut candidates,
+        &mut diagnostics,
+    );
+    let thinkpad = adopt_node(
+        &nodes,
+        "audio.output.dock",
+        "Audio/Sink",
+        |node| {
+            node.description
+                .as_deref()
+                .is_some_and(|value| value.contains("ThinkPad Thunderbolt 4 Dock"))
+        },
+        "description contains the ThinkPad Thunderbolt 4 Dock product label",
+        &mut candidates,
+        &mut diagnostics,
+    );
+    let default_source = adopt_node(
+        &nodes,
+        "audio.source.chat-mic",
+        "Audio/Source",
+        |node| node.description.as_deref() == Some("GoXLR Chat Mic"),
+        "exact GoXLR Chat Mic description",
+        &mut candidates,
+        &mut diagnostics,
+    );
+    let monitor_source = adopt_node(
+        &nodes,
+        "audio.source.stream-mix",
+        "Audio/Source",
+        |node| {
+            node.description
+                .as_deref()
+                .is_some_and(|value| value.starts_with("GoXLR Stream Mix"))
+        },
+        "GoXLR Stream Mix description",
+        &mut candidates,
+        &mut diagnostics,
+    );
+    let sampler = adopt_node(
+        &nodes,
+        "audio.source.sampler",
+        "Audio/Source",
+        |node| node.description.as_deref() == Some("GoXLR Sampler"),
+        "exact GoXLR Sampler description",
+        &mut candidates,
+        &mut diagnostics,
+    );
+
+    if let Some(node) = jds {
+        config.jds_sink = Some(node.name.clone());
+        config.fallback_sink = Some(node.name.clone());
+        config.output_sinks.push(node.name);
+    }
+    if let Some(node) = thinkpad {
+        config.output_sinks.push(node.name.clone());
+        config.thinkpad_sink = Some(node.name);
+    }
+    config.default_source = default_source.as_ref().map(|node| node.name.clone());
+    config.monitor_source = monitor_source.as_ref().map(|node| node.name.clone());
+    if let Some(node) = default_source {
+        config.obs_sources.push(AdoptObsSource {
+            name: "GoXLR Mic".to_string(),
+            device_id: node.name,
+        });
+    }
+    if let Some(node) = monitor_source.as_ref() {
+        config.obs_sources.push(AdoptObsSource {
+            name: "GoXLR Stream Mix".to_string(),
+            device_id: node.name.clone(),
+        });
+        config.obs_sources.push(AdoptObsSource {
+            name: "GoXLR Desktop Mix".to_string(),
+            device_id: node.name.clone(),
+        });
+    }
+    if let Some(node) = sampler {
+        config.obs_sources.push(AdoptObsSource {
+            name: "GoXLR Sampler".to_string(),
+            device_id: node.name,
+        });
+    }
+
+    match goxlr_facts() {
+        Ok(facts) if facts.mixers.len() == 1 => {
+            let (serial, mixer) = facts.mixers.into_iter().next().expect("length checked");
+            let device_type = mixer
+                .pointer("/hardware/device_type")
+                .and_then(Value::as_str);
+            if device_type == Some("Full") {
+                candidates.push(AdoptCandidate {
+                    role: "audio.mixer".to_string(),
+                    runtime_name: serial.clone(),
+                    description: Some("GoXLR Full mixer".to_string()),
+                    confidence: "high".to_string(),
+                    reason: "exactly one full GoXLR is reported by goxlr-client".to_string(),
+                });
+                config.goxlr_serial = Some(serial);
+            } else {
+                diagnostics.push(format!(
+                    "the only GoXLR mixer is not a full device (device_type={device_type:?})"
+                ));
+            }
+        }
+        Ok(facts) if facts.mixers.is_empty() => {
+            diagnostics.push("goxlr-client reported no mixers".to_string());
+        }
+        Ok(facts) => {
+            diagnostics.push(format!(
+                "goxlr-client reported multiple mixers ({}); set goxlr-serial explicitly",
+                facts.mixers.keys().cloned().collect::<Vec<_>>().join(", ")
+            ));
+        }
+        Err(error) => diagnostics.push(format!("GoXLR serial discovery unavailable: {error:#}")),
+    }
+
+    let report = AdoptionReport {
+        schema: ADOPT_SCHEMA,
+        producer: Producer {
+            name: "goxlr-nexus",
+            version: env!("CARGO_PKG_VERSION"),
+        },
+        read_only: true,
+        config,
+        candidates,
+        diagnostics,
+    };
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_adoption(&report);
+    }
+    Ok(())
+}
+
+fn adopt_node<F>(
+    nodes: &[Node],
+    role: &str,
+    media_class: &str,
+    predicate: F,
+    reason: &str,
+    candidates: &mut Vec<AdoptCandidate>,
+    diagnostics: &mut Vec<String>,
+) -> Option<Node>
+where
+    F: Fn(&Node) -> bool,
+{
+    let matches: Vec<Node> = nodes
+        .iter()
+        .filter(|node| node.media_class.as_deref() == Some(media_class) && predicate(node))
+        .cloned()
+        .collect();
+    match matches.as_slice() {
+        [node] => {
+            candidates.push(AdoptCandidate {
+                role: role.to_string(),
+                runtime_name: node.name.clone(),
+                description: node.description.clone(),
+                confidence: "high".to_string(),
+                reason: reason.to_string(),
+            });
+            Some(node.clone())
+        }
+        [] => {
+            diagnostics.push(format!(
+                "no unique candidate for {role}: no {media_class} node matched"
+            ));
+            None
+        }
+        _ => {
+            for node in &matches {
+                candidates.push(AdoptCandidate {
+                    role: role.to_string(),
+                    runtime_name: node.name.clone(),
+                    description: node.description.clone(),
+                    confidence: "ambiguous".to_string(),
+                    reason: reason.to_string(),
+                });
+            }
+            diagnostics.push(format!(
+                "no unique candidate for {role}: {} {media_class} nodes matched",
+                matches.len()
+            ));
+            None
+        }
+    }
+}
+
+fn print_adoption(report: &AdoptionReport) {
+    println!("{} on {}", report.schema, report.producer.name);
+    println!("Review this Home Manager fragment before copying it:");
+    println!("programs.goxlr-nexus = {{");
+    if let Some(value) = &report.config.jds_sink {
+        println!("  jdsSink = \"{}\";", nix_quote(value));
+    }
+    if let Some(value) = &report.config.fallback_sink {
+        println!("  fallbackSink = \"{}\";", nix_quote(value));
+    }
+    if let Some(value) = &report.config.thinkpad_sink {
+        println!("  thinkpadSink = \"{}\";", nix_quote(value));
+    }
+    if !report.config.output_sinks.is_empty() {
+        println!("  outputSinks = [");
+        for value in &report.config.output_sinks {
+            println!("    \"{}\"", nix_quote(value));
+        }
+        println!("  ];");
+    }
+    if let Some(value) = &report.config.goxlr_serial {
+        println!("  goxlrSerial = \"{}\";", nix_quote(value));
+    }
+    if let Some(value) = &report.config.default_source {
+        println!("  defaultSource = \"{}\";", nix_quote(value));
+    }
+    if let Some(value) = &report.config.monitor_source {
+        println!("  monitorSource = \"{}\";", nix_quote(value));
+    }
+    if !report.config.obs_sources.is_empty() {
+        println!("  obs.sources = [");
+        for source in &report.config.obs_sources {
+            println!(
+                "    {{ name = \"{}\"; deviceId = \"{}\"; }}",
+                nix_quote(&source.name),
+                nix_quote(&source.device_id)
+            );
+        }
+        println!("  ];");
+    }
+    println!("}};");
+    for candidate in &report.candidates {
+        println!(
+            "candidate {} [{}]: {} ({})",
+            candidate.role, candidate.confidence, candidate.runtime_name, candidate.reason
+        );
+    }
+    for diagnostic in &report.diagnostics {
+        println!("diagnostic: {diagnostic}");
+    }
+}
+
+fn nix_quote(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn pipewire_node(node: Node) -> PipewireNode {
+    PipewireNode {
+        runtime_name: node.name,
+        description: node.description,
+        media_class: node.media_class,
+        properties: node.properties,
+    }
+}
+
+fn goxlr_facts() -> Result<GoxlrFacts> {
+    let status = goxlr_status()?;
+    let mixers = status
+        .get("mixers")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("goxlr-client JSON has no mixers object"))?
+        .iter()
+        .map(|(serial, mixer)| (serial.clone(), mixer.clone()))
+        .collect();
+    Ok(GoxlrFacts {
+        status: "ok".to_string(),
+        mixers,
+        diagnostic: None,
+    })
+}
+
+fn obs_facts(config: &Config) -> Result<ObsFacts> {
+    let mut client = ObsClient::connect(config)?;
+    let version = client.request("GetVersion", json!({}))?;
+    let scene = client.target_scene().ok();
+    let mut scene_sources = scene
+        .as_deref()
+        .and_then(|name| client.scene_source_names(name).ok());
+    if let Some(sources) = &mut scene_sources {
+        sources.sort();
+    }
+    let input_kind_response = client.request("GetInputKindList", json!({}))?;
+    let input_kinds: Vec<String> = input_kind_response
+        .get("inputKindList")
+        .or_else(|| input_kind_response.get("inputKinds"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    let existing_inputs = client
+        .request("GetInputList", json!({}))?
+        .get("inputs")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let default_settings = client
+        .request(
+            "GetInputDefaultSettings",
+            json!({"inputKind": OBS_INPUT_KIND}),
+        )
+        .ok();
+    let pulse_input = existing_inputs
+        .iter()
+        .filter(|input| input.get("inputKind").and_then(Value::as_str) == Some(OBS_INPUT_KIND))
+        .min_by_key(|input| input.get("inputName").and_then(Value::as_str).unwrap_or(""));
+    let (input_settings, device_choices, choice_status, optional_diagnostic) = match pulse_input {
+        Some(input) => {
+            let input_name = input
+                .get("inputName")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("OBS pulse input has no inputName"))?;
+            let settings = client
+                .request("GetInputSettings", json!({"inputName": input_name}))
+                .ok();
+            match client.request(
+                "GetInputPropertiesListPropertyItems",
+                json!({"inputName": input_name, "propertyName": "device_id"}),
+            ) {
+                Ok(choices) => (settings, Some(choices), "ok".to_string(), None),
+                Err(err) => (
+                    settings,
+                    None,
+                    "unavailable".to_string(),
+                    Some(format!("device_id choices unavailable: {err:#}")),
+                ),
+            }
+        }
+        None => (None, None, "no-reference-input".to_string(), None),
+    };
+
+    let mut input_kinds = input_kinds;
+    input_kinds.sort();
+    let mut existing_inputs = existing_inputs;
+    existing_inputs.sort_by(|left, right| {
+        left.get("inputName")
+            .and_then(Value::as_str)
+            .cmp(&right.get("inputName").and_then(Value::as_str))
+    });
+    Ok(ObsFacts {
+        status: if optional_diagnostic.is_some() {
+            "partial"
+        } else {
+            "ok"
+        }
+        .to_string(),
+        version: Some(version),
+        current_scene: scene,
+        scene_sources,
+        input_kinds,
+        existing_inputs,
+        default_settings,
+        input_settings,
+        device_choices,
+        choice_status,
+        diagnostic: optional_diagnostic,
+    })
+}
+
+fn unavailable_obs_facts(diagnostic: String) -> ObsFacts {
+    ObsFacts {
+        status: "unavailable".to_string(),
+        version: None,
+        current_scene: None,
+        scene_sources: None,
+        input_kinds: Vec::new(),
+        existing_inputs: Vec::new(),
+        default_settings: None,
+        input_settings: None,
+        device_choices: None,
+        choice_status: "unavailable".to_string(),
+        diagnostic: Some(diagnostic),
+    }
+}
+
+fn print_observation(observation: &Observation) {
+    println!("{} on {}", observation.schema, observation.host);
+    for source in &observation.sources {
+        match &source.diagnostic {
+            Some(diagnostic) => println!("{}: {} ({diagnostic})", source.source, source.status),
+            None => println!("{}: {}", source.source, source.status),
+        }
+    }
+    println!("PipeWire nodes: {}", observation.facts.pipewire.nodes.len());
+    for node in &observation.facts.pipewire.nodes {
+        println!(
+            "  {} — {}",
+            node.runtime_name,
+            node.description.as_deref().unwrap_or("unnamed")
+        );
+    }
+    println!("GoXLR mixers: {}", observation.facts.goxlr.mixers.len());
+    println!(
+        "OBS input kinds: {}",
+        observation.facts.obs.input_kinds.len()
+    );
+    println!(
+        "OBS device choices: {}",
+        observation.facts.obs.choice_status
+    );
 }
 
 fn load_config(explicit: Option<&Path>) -> Result<Config> {
@@ -406,6 +1098,225 @@ fn apply(config: &Config, dry_run: bool) -> Result<()> {
     }
 }
 
+/// Compute the exact mutations that `apply` would perform without executing
+/// any of them.  This is intentionally separate from the mutation helpers so
+/// adding a plan cannot accidentally turn a read-only command into a write.
+fn plan(config: &Config, json_output: bool) -> Result<()> {
+    let snapshot = snapshot()?;
+    let current = PlanCurrent {
+        default_sink: current_default_sink()?,
+        default_source: current_default_source()?,
+    };
+    let mut operations = Vec::new();
+    let mut diagnostics = Vec::new();
+
+    let goxlr_status = match usable_goxlr_status(config, &snapshot) {
+        Ok(()) => {
+            let required = required_nodes(config, &snapshot)?;
+            if current.default_source != required.default_source.name {
+                operations.push(PlanOperation {
+                    action: "pactl.set-default-source".to_string(),
+                    target: Some(required.default_source.name.clone()),
+                    arguments: Vec::new(),
+                    reason: "GoXLR profile requires its configured default source".to_string(),
+                });
+            }
+            plan_monitor_sync(&required, &current.default_sink, &mut operations)?;
+            "ready".to_string()
+        }
+        Err(error) => {
+            diagnostics.push(format!("GoXLR profile unavailable: {error:#}"));
+            let outputs = output_nodes(config, &snapshot)?;
+            plan_default_output(&outputs, &current.default_sink, &mut operations);
+            "fallback".to_string()
+        }
+    };
+
+    let obs = if config.obs.enable {
+        match plan_obs(config, &mut operations) {
+            Ok(obs) => Some(obs),
+            Err(error) => {
+                diagnostics.push(format!("OBS plan unavailable: {error:#}"));
+                Some(PlanObs {
+                    status: "unavailable".to_string(),
+                    scene: None,
+                    choice_status: "unavailable".to_string(),
+                    sources: Vec::new(),
+                    diagnostic: Some(format!("{error:#}")),
+                })
+            }
+        }
+    } else {
+        None
+    };
+
+    let plan = ReconciliationPlan {
+        schema: PLAN_SCHEMA,
+        producer: Producer {
+            name: "goxlr-nexus",
+            version: env!("CARGO_PKG_VERSION"),
+        },
+        read_only: true,
+        requires_apply: true,
+        current,
+        goxlr_status,
+        operations,
+        obs,
+        diagnostics,
+    };
+
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&plan)?);
+    } else {
+        print_plan(&plan);
+    }
+    Ok(())
+}
+
+fn plan_monitor_sync(
+    required: &RequiredNodes,
+    current_sink: &str,
+    operations: &mut Vec<PlanOperation>,
+) -> Result<()> {
+    let selected = plan_default_output(&required.outputs, current_sink, operations);
+    for output in &required.outputs.output_sinks {
+        for (source_port, sink_port) in
+            [("capture_FL", "playback_FL"), ("capture_FR", "playback_FR")]
+        {
+            operations.push(PlanOperation {
+                action: "pw-link.disconnect".to_string(),
+                target: Some(format!("{}:{source_port}", required.monitor_source.name)),
+                arguments: vec![format!("{}:{sink_port}", output.name)],
+                reason: "remove stale monitor links before selecting the active output".to_string(),
+            });
+        }
+    }
+    for (source_port, sink_port) in [("capture_FL", "playback_FL"), ("capture_FR", "playback_FR")] {
+        operations.push(PlanOperation {
+            action: "pw-link.connect".to_string(),
+            target: Some(format!("{}:{source_port}", required.monitor_source.name)),
+            arguments: vec![format!("{}:{sink_port}", selected.name)],
+            reason: "route the GoXLR monitor mix to the selected output".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn plan_default_output(
+    outputs: &OutputNodes,
+    current_sink: &str,
+    operations: &mut Vec<PlanOperation>,
+) -> Node {
+    let selected = selected_output_sink(outputs, current_sink)
+        .or_else(|| (current_sink == outputs.fallback_sink.name).then_some(&outputs.fallback_sink))
+        .unwrap_or(&outputs.fallback_sink);
+    if selected.name != current_sink {
+        operations.push(PlanOperation {
+            action: "pactl.set-default-sink".to_string(),
+            target: Some(selected.name.clone()),
+            arguments: Vec::new(),
+            reason: "current default sink is not one of the configured selectable outputs"
+                .to_string(),
+        });
+    }
+    selected.clone()
+}
+
+fn plan_obs(config: &Config, operations: &mut Vec<PlanOperation>) -> Result<PlanObs> {
+    let facts = obs_facts(config)?;
+    let scene = facts
+        .current_scene
+        .as_deref()
+        .ok_or_else(|| anyhow!("OBS did not expose a current scene"))?;
+    let scene_sources = facts
+        .scene_sources
+        .as_ref()
+        .ok_or_else(|| anyhow!("OBS scene items were unavailable for the current scene"))?;
+    let sources = obs_source_plan(config)
+        .into_iter()
+        .map(|source| {
+            let exists = facts.existing_inputs.iter().any(|input| {
+                input.get("inputName").and_then(Value::as_str) == Some(source.name.as_str())
+            });
+            let in_scene = scene_sources.iter().any(|name| name == &source.name);
+            let action = if exists {
+                "obs.set-input-settings"
+            } else {
+                "obs.create-input-and-scene-item"
+            };
+            if exists {
+                operations.push(PlanOperation {
+                    action: action.to_string(),
+                    target: Some(source.name.clone()),
+                    arguments: vec![source.device_id.clone()],
+                    reason: "synchronize the configured OBS source device".to_string(),
+                });
+                if !in_scene {
+                    operations.push(PlanOperation {
+                        action: "obs.create-scene-item".to_string(),
+                        target: Some(source.name.clone()),
+                        arguments: vec![scene.to_string()],
+                        reason: "add the existing configured source to the current scene"
+                            .to_string(),
+                    });
+                }
+            } else {
+                operations.push(PlanOperation {
+                    action: action.to_string(),
+                    target: Some(source.name.clone()),
+                    arguments: vec![
+                        scene.to_string(),
+                        source.input_kind.clone(),
+                        source.device_id.clone(),
+                    ],
+                    reason: "create the configured OBS source in the current scene".to_string(),
+                });
+            }
+            PlanObsSource {
+                name: source.name,
+                device_id: source.device_id,
+                action: action.to_string(),
+            }
+        })
+        .collect();
+    Ok(PlanObs {
+        status: facts.status,
+        scene: facts.current_scene,
+        choice_status: facts.choice_status,
+        sources,
+        diagnostic: facts.diagnostic,
+    })
+}
+
+fn print_plan(plan: &ReconciliationPlan) {
+    println!("{} on {}", plan.schema, plan.producer.name);
+    println!("GoXLR status: {}", plan.goxlr_status);
+    println!(
+        "Current defaults: sink={} source={}",
+        plan.current.default_sink, plan.current.default_source
+    );
+    for operation in &plan.operations {
+        let target = operation.target.as_deref().unwrap_or("-");
+        println!("  {} {} ({})", operation.action, target, operation.reason);
+    }
+    if let Some(obs) = &plan.obs {
+        println!("OBS: {} (choices: {})", obs.status, obs.choice_status);
+        for source in &obs.sources {
+            println!(
+                "  {} {} -> {}",
+                source.action, source.name, source.device_id
+            );
+        }
+    }
+    for diagnostic in &plan.diagnostics {
+        println!("diagnostic: {diagnostic}");
+    }
+    println!(
+        "read-only: {} (apply required: {})",
+        plan.read_only, plan.requires_apply
+    );
+}
+
 fn follow(config: &Config) -> Result<()> {
     loop {
         if let Err(err) = follow_once(config) {
@@ -432,10 +1343,10 @@ fn follow_once(config: &Config) -> Result<()> {
 
     for line in BufReader::new(stdout).lines() {
         let line = line.context("failed to read pactl subscribe event")?;
-        if line.contains(" on sink ") || line.contains(" on server ") {
-            if let Err(err) = apply(config, false) {
-                eprintln!("warn: GoXLR Nexus sync failed after PulseAudio event: {err:#}");
-            }
+        if (line.contains(" on sink ") || line.contains(" on server "))
+            && let Err(err) = apply(config, false)
+        {
+            eprintln!("warn: GoXLR Nexus sync failed after PulseAudio event: {err:#}");
         }
     }
 
@@ -877,6 +1788,10 @@ fn parse_pw_dump(bytes: &[u8]) -> Result<Vec<Node>> {
         let Some(name) = props.get("node.name").and_then(Value::as_str) else {
             continue;
         };
+        let properties = props
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
         nodes.push(Node {
             name: name.to_string(),
             description: props
@@ -887,6 +1802,7 @@ fn parse_pw_dump(bytes: &[u8]) -> Result<Vec<Node>> {
                 .get("media.class")
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned),
+            properties,
         });
     }
     Ok(nodes)
@@ -994,13 +1910,22 @@ fn find_node(snapshot: &Snapshot, name: &str) -> Result<Node> {
 }
 
 fn current_default_sink() -> Result<String> {
+    current_default_audio("sink")
+}
+
+fn current_default_source() -> Result<String> {
+    current_default_audio("source")
+}
+
+fn current_default_audio(kind: &str) -> Result<String> {
+    let action = format!("get-default-{kind}");
     let output = audio_command("pactl")
-        .args(["get-default-sink"])
+        .arg(&action)
         .output()
-        .context("failed to run pactl get-default-sink")?;
+        .with_context(|| format!("failed to run pactl get-default-{kind}"))?;
     if !output.status.success() {
         bail!(
-            "pactl get-default-sink failed with status {}: {}",
+            "pactl get-default-{kind} failed with status {}: {}",
             output.status,
             String::from_utf8_lossy(&output.stderr).trim()
         );
@@ -1065,6 +1990,10 @@ mod tests {
         let nodes = parse_pw_dump(json).unwrap();
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].description.as_deref(), Some("GoXLR System"));
+        assert_eq!(
+            nodes[0].properties.get("node.name").and_then(Value::as_str),
+            Some("alsa_output.usb-TC-Helicon_GoXLR-00.HiFi__Speaker__sink")
+        );
     }
 
     #[test]
@@ -1145,6 +2074,28 @@ mod tests {
     }
 
     #[test]
+    fn plan_keeps_managed_default_without_switching_it() {
+        let outputs =
+            output_nodes_for_outputs(["alsa_output.example_jds", "alsa_output.example_thinkpad"]);
+        let mut operations = Vec::new();
+        let selected =
+            plan_default_output(&outputs, "alsa_output.example_thinkpad", &mut operations);
+        assert_eq!(selected.name, "alsa_output.example_thinkpad");
+        assert!(operations.is_empty());
+    }
+
+    #[test]
+    fn plan_switches_unmanaged_default_to_fallback() {
+        let outputs =
+            output_nodes_for_outputs(["alsa_output.example_jds", "alsa_output.example_thinkpad"]);
+        let mut operations = Vec::new();
+        let selected = plan_default_output(&outputs, "alsa_output.generic", &mut operations);
+        assert_eq!(selected.name, "alsa_output.example_jds");
+        assert_eq!(operations.len(), 1);
+        assert_eq!(operations[0].action, "pactl.set-default-sink");
+    }
+
+    #[test]
     fn builds_default_obs_source_plan() {
         let mut config = Config::default();
         config.obs.enable = true;
@@ -1199,6 +2150,7 @@ mod tests {
             name: name.to_string(),
             description: None,
             media_class: Some("Audio/Sink".to_string()),
+            properties: BTreeMap::new(),
         }
     }
 }

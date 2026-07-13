@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://codeberg.org/caniko/goxlr-nexus/schemas/adopt-v1.schema.json",
+  "title": "GoXLR Nexus adoption report v1",
+  "type": "object",
+  "required": ["schema", "producer", "readOnly", "config", "candidates", "diagnostics"],
+  "properties": {
+    "schema": {"const": "goxlr-nexus.adopt/v1"},
+    "producer": {
+      "type": "object",
+      "required": ["name", "version"],
+      "properties": {
+        "name": {"const": "goxlr-nexus"},
+        "version": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    },
+    "readOnly": {"const": true},
+    "config": {
+      "type": "object",
+      "required": ["outputSinks", "obsSources"],
+      "properties": {
+        "goxlrSerial": {"type": "string", "minLength": 1},
+        "jdsSink": {"type": "string", "minLength": 1},
+        "fallbackSink": {"type": "string", "minLength": 1},
+        "thinkpadSink": {"type": "string", "minLength": 1},
+        "outputSinks": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "defaultSource": {"type": "string", "minLength": 1},
+        "monitorSource": {"type": "string", "minLength": 1},
+        "obsSources": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "deviceId"],
+            "properties": {
+              "name": {"type": "string", "minLength": 1},
+              "deviceId": {"type": "string", "minLength": 1}
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "candidates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["role", "runtimeName", "confidence", "reason"],
+        "properties": {
+          "role": {"type": "string", "minLength": 1},
+          "runtimeName": {"type": "string", "minLength": 1},
+          "description": {"type": ["string", "null"]},
+          "confidence": {"enum": ["high", "ambiguous"]},
+          "reason": {"type": "string", "minLength": 1}
+        },
+        "additionalProperties": false
+      }
+    },
+    "diagnostics": {"type": "array", "items": {"type": "string"}}
+  },
+  "additionalProperties": false
+}

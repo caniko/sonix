@@ -78,6 +78,8 @@ pub struct ObsFacts {
     pub version: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_scene: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scene_sources: Option<Vec<String>>,
     pub input_kinds: Vec<String>,
     pub existing_inputs: Vec<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -98,6 +100,9 @@ pub fn facts_digest(facts: &Facts) -> String {
         .nodes
         .sort_by(|left, right| left.runtime_name.cmp(&right.runtime_name));
     canonical.obs.input_kinds.sort();
+    if let Some(scene_sources) = &mut canonical.obs.scene_sources {
+        scene_sources.sort();
+    }
     canonical.obs.existing_inputs.sort_by_key(|value| {
         value
             .get("inputName")
@@ -140,6 +145,7 @@ mod tests {
                 status: "ok".to_string(),
                 version: None,
                 current_scene: None,
+                scene_sources: None,
                 input_kinds: vec!["z-kind".to_string(), "a-kind".to_string()],
                 existing_inputs: vec![
                     serde_json::json!({"inputName": "Z"}),
