@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://codeberg.org/caniko/goxlr-nexus/schemas/config-manifest-v1.schema.json",
+  "title": "GoXLR Utility native artifact manifest v1",
+  "type": "object",
+  "required": ["version", "module", "files"],
+  "properties": {
+    "version": {"const": 1},
+    "module": {"type": "string", "minLength": 1},
+    "files": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "source", "target"],
+        "properties": {
+          "path": {"type": "string", "pattern": "^(?!/).+"},
+          "source": {"type": "string", "minLength": 1},
+          "target": {"type": "string", "pattern": "^/.+"},
+          "sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+          "kind": {"enum": ["ini", "json", "raw"]},
+          "origin": {"type": "string", "minLength": 1}
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

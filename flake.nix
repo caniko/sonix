@@ -1,5 +1,5 @@
 {
-  description = "GoXLR, JDS Labs DAC, PipeWire, and OBS audio orchestrator";
+  description = "Declarative GoXLR Utility configuration and PipeWire/OBS audio orchestration";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -27,8 +27,19 @@
         };
       };
     in {
-      packages.default = package;
-      apps.default = flake-utils.lib.mkApp {drv = package;};
+      packages = {
+        default = package;
+        goxlr-nexus = package;
+        goxlr-config = package;
+      };
+      apps = {
+        default = flake-utils.lib.mkApp {drv = package;};
+        goxlr-nexus = flake-utils.lib.mkApp {drv = package;};
+        goxlr-config = {
+          type = "app";
+          program = "${package}/bin/goxlr-config";
+        };
+      };
       devShells.default = pkgs.mkShell {
         packages = with pkgs; [
           cargo
@@ -53,14 +64,26 @@
         import ./modules/nixos.nix {
           inherit config lib pkgs self;
         };
-      homeModules.default = {
-        config,
-        lib,
-        pkgs,
-        ...
-      }:
-        import ./modules/home-manager.nix {
-          inherit config lib pkgs self;
-        };
+      homeModules = {
+        default = {
+          config,
+          lib,
+          pkgs,
+          ...
+        }:
+          import ./modules/home-manager.nix {
+            inherit config lib pkgs self;
+          };
+        goxlr-utility = {
+          config,
+          lib,
+          pkgs,
+          ...
+        }:
+          import ./modules/home-manager/goxlr-utility.nix {
+            inherit config lib pkgs self;
+          };
+      };
+      homeManagerModules = self.homeModules;
     };
 }

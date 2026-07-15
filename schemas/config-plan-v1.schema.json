@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://codeberg.org/caniko/goxlr-nexus/schemas/config-plan-v1.schema.json",
+  "title": "GoXLR Utility native artifact plan v1",
+  "type": "object",
+  "required": ["schema", "module", "manifestVersion", "requiresApply", "files"],
+  "properties": {
+    "schema": {"const": "goxlr-config.plan/v1"},
+    "module": {"type": "string", "minLength": 1},
+    "manifestVersion": {"const": 1},
+    "requiresApply": {"type": "boolean"},
+    "files": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "source", "target", "status"],
+        "properties": {
+          "path": {"type": "string", "minLength": 1},
+          "source": {"type": "string", "minLength": 1},
+          "target": {"type": "string", "minLength": 1},
+          "status": {"enum": ["same", "missing", "changed"]},
+          "sourceSha256": {"type": ["string", "null"]},
+          "targetSha256": {"type": ["string", "null"]}
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

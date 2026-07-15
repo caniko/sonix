@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://codeberg.org/caniko/goxlr-nexus/schemas/config-observation-v1.schema.json",
+  "title": "GoXLR Utility client observation v1",
+  "type": "object",
+  "required": ["schema", "status"],
+  "properties": {
+    "schema": {"const": "goxlr-config.observation/v1"},
+    "device": {"type": ["string", "null"]},
+    "status": {"type": "object"}
+  },
+  "additionalProperties": false
+}

@@ -40,6 +40,8 @@
     ${lib.optionalString (effectiveFallbackSink != null) ''fallback-sink = "${effectiveFallbackSink}"''}
     ${lib.optionalString (cfg.thinkpadSink != null) ''thinkpad-sink = "${cfg.thinkpadSink}"''}
     ${lib.optionalString (cfg.goxlrSerial != null) ''goxlr-serial = "${cfg.goxlrSerial}"''}
+    ${lib.optionalString (cfg.maxMonitorSinkVolume != null) ''max-monitor-sink-volume = ${toString cfg.maxMonitorSinkVolume}''}
+    observe-only = ${if cfg.observeOnly then "true" else "false"}
 
     [obs]
     enable = ${
@@ -80,6 +82,26 @@ in {
     goxlrSerial = mkOption {
       type = types.nullOr types.str;
       default = null;
+    };
+    goxlrCard = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      description = "Pulse/PipeWire card to reselect before starting the routing controller.";
+    };
+    goxlrProfile = mkOption {
+      type = types.str;
+      default = "HiFi";
+      description = "GoXLR ALSA card profile to activate before starting the routing controller.";
+    };
+    maxMonitorSinkVolume = mkOption {
+      type = types.nullOr types.float;
+      default = null;
+      description = "Maximum selected monitor sink volume as a normalized value between 0 and 1.";
+    };
+    observeOnly = mkOption {
+      type = types.bool;
+      default = false;
+      description = "Observe and report routing drift without applying audio mutations.";
     };
     obs = {
       enable = mkEnableOption "OBS websocket synchronization";
@@ -164,15 +186,31 @@ in {
         Description = "GoXLR Nexus audio routing repair";
         After = ["pipewire.service" "pipewire-pulse.service" "wireplumber.service" goxlrDaemonUnit];
         Wants = ["pipewire.service" "pipewire-pulse.service" "wireplumber.service" goxlrDaemonUnit];
+        PartOf = ["pipewire.service" "pipewire-pulse.service" "wireplumber.service"];
         StartLimitIntervalSec = 300;
         StartLimitBurst = 20;
       };
       Service = {
         Type = "simple";
         Environment = "PATH=${servicePath}";
+        # WirePlumber 0.5 can report the requested profile while retaining
+        # only the hidden raw ALSA nodes after a restart.  A real profile
+        # transition (off -> HiFi) makes ACP recreate the Pulse-visible
+        # named source/sink nodes that desktop selectors consume.
+        ExecStartPre = lib.optionals (cfg.goxlrCard != null) [
+          "-${pkgs.pulseaudio}/bin/pactl set-card-profile ${lib.escapeShellArg cfg.goxlrCard} off"
+          "-${pkgs.pulseaudio}/bin/pactl set-card-profile ${lib.escapeShellArg cfg.goxlrCard} ${lib.escapeShellArg cfg.goxlrProfile}"
+        ];
         ExecStart = "${package}/bin/goxlr-nexus --config ${configFile} follow";
-        Restart = "always";
+        Restart = "on-failure";
         RestartSec = 5;
+        CPUQuota = "10%";
+        MemoryHigh = "64M";
+        MemoryMax = "128M";
+        TasksMax = 32;
+        TimeoutStopSec = 10;
+        LogRateLimitIntervalSec = 30;
+        LogRateLimitBurst = 100;
       };
       Install.WantedBy = ["default.target"];
     };

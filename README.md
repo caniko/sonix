@@ -42,10 +42,43 @@ reported as diagnostics. `adopt --json` emits the versioned
 `plan --json` evaluates the current defaults, GoXLR/fallback path, PipeWire
 links, and (when enabled) OBS source mutations. It is strictly read-only;
 `apply` remains the only command that executes the proposed mutations. The
-versioned `goxlr-nexus.plan/v1` document is described by
-`schemas/plan-v1.schema.json`, so a human or another tool can review the same
-operations before activation.
+versioned `goxlr-nexus.plan/v2` document is described by
+`schemas/plan-v2.schema.json`; `requiresApply` is false when the live graph is
+already converged.
+
+`follow` coalesces PipeWire events and periodically resynchronizes the graph.
+It applies only observed deltas, verifies the graph through the next
+observation, and accepts `--observe-only` for a non-mutating canary.
+The Home Manager module can force a real ALSA profile transition before the
+controller starts (`goxlrCard` + `goxlrProfile`); this repairs WirePlumber
+restarts that leave only hidden raw nodes while still reporting the requested
+profile.
 
 `obs sync` uses obs-websocket v5 to create or update dedicated GoXLR audio
 sources in the active OBS scene. It does not rewrite OBS global Desktop Audio or
 Mic/Aux devices.
+
+## Declarative GoXLR Utility artifacts
+
+The `goxlr-config` companion binary and `homeModules.goxlr-utility` module keep
+the Utility-owned files lossless by treating native settings, profiles,
+presets, samples, and icons as content-addressed artifacts:
+
+```nix
+inputs.goxlr-nexus.homeModules.goxlr-utility
+
+programs.goxlr-utility = {
+  enable = true;
+  applyOnActivation = true;
+  settingsFile = ./goxlr/settings.json;
+  profileFiles = { "HiFi.goxlr" = ./goxlr/profiles/HiFi.goxlr; };
+  micProfileFiles = { "Default.goxlrMicProfile" = ./goxlr/mic-profiles/Default.goxlrMicProfile; };
+  presetFiles = { "Broadcast.preset" = ./goxlr/presets/Broadcast.preset; };
+};
+```
+
+`goxlr-config plan` is read-only; `apply` and `reconcile --apply` are the only
+mutating operations. Every write is staged atomically and followed by a hash
+verification. The manifest format is intentionally opaque so new Utility
+fields remain reproducible before a typed schema is available. The machine
+contracts are checked in under `schemas/config-*-v1.schema.json`.

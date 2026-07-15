@@ -4,7 +4,9 @@ use std::io::{BufRead, BufReader};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
@@ -31,7 +33,7 @@ const GOXLR_CHAT_MIC: &str = "alsa_input.usb-TC-Helicon_GoXLR-00.HiFi__Headset__
 const GOXLR_STREAM_MIX: &str = "alsa_input.usb-TC-Helicon_GoXLR-00.HiFi__Line4__source";
 const GOXLR_SAMPLER: &str = "alsa_input.usb-TC-Helicon_GoXLR-00.HiFi__Line5__source";
 const OBS_INPUT_KIND: &str = "pulse_input_capture";
-const PLAN_SCHEMA: &str = "goxlr-nexus.plan/v1";
+const PLAN_SCHEMA: &str = "goxlr-nexus.plan/v2";
 const ADOPT_SCHEMA: &str = "goxlr-nexus.adopt/v1";
 
 #[derive(Parser)]
@@ -66,7 +68,10 @@ enum CommandKind {
         json: bool,
     },
     Apply(ApplyArgs),
-    Follow,
+    Follow {
+        #[arg(long)]
+        observe_only: bool,
+    },
     Profile {
         profile: Profile,
         #[arg(long)]
@@ -108,6 +113,8 @@ struct Config {
     thinkpad_sink: Option<String>,
     output_sinks: Vec<String>,
     goxlr_serial: Option<String>,
+    max_monitor_sink_volume: Option<f64>,
+    observe_only: bool,
     profile: ProfileConfig,
     obs: ObsConfig,
 }
@@ -121,6 +128,8 @@ impl Default for Config {
             thinkpad_sink: None,
             output_sinks: Vec::new(),
             goxlr_serial: None,
+            max_monitor_sink_volume: None,
+            observe_only: false,
             profile: ProfileConfig::default(),
             obs: ObsConfig::default(),
         }
@@ -204,16 +213,67 @@ struct ObsRequestStatus {
 
 #[derive(Debug, Clone)]
 struct Node {
+    id: u32,
     name: String,
     description: Option<String>,
     media_class: Option<String>,
     properties: BTreeMap<String, Value>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Port {
+    id: u32,
+    node_id: u32,
+    direction: String,
+    name: String,
+    channel: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Link {
+    id: u32,
+    output_node_id: u32,
+    output_port_id: u32,
+    input_node_id: u32,
+    input_port_id: u32,
+    state: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct PipewireGraph {
+    nodes: Vec<Node>,
+    ports: Vec<Port>,
+    links: Vec<Link>,
+}
+
 #[derive(Debug)]
 struct Snapshot {
     nodes: Vec<Node>,
+    ports: Vec<Port>,
+    links: Vec<Link>,
     goxlr_status: Result<Value, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AudioOperation {
+    SetDefaultSink(String),
+    SetDefaultSource(String),
+    SetSinkVolume {
+        sink: String,
+        percent: u32,
+    },
+    Connect {
+        source_node: String,
+        source_port: String,
+        sink_node: String,
+        sink_port: String,
+    },
+    Disconnect {
+        source_node: String,
+        source_port: String,
+        sink_node: String,
+        sink_port: String,
+    },
 }
 
 #[derive(Debug)]
@@ -340,7 +400,7 @@ fn main() -> Result<()> {
                 CommandKind::Plan { json } => plan(&config, json),
                 CommandKind::Status { json } => status(&config, json),
                 CommandKind::Apply(args) => apply(&config, args.dry_run),
-                CommandKind::Follow => follow(&config),
+                CommandKind::Follow { observe_only } => follow(&config, observe_only),
                 CommandKind::Profile { profile, dry_run } => {
                     apply_profile(&config, profile, dry_run)
                 }
@@ -1092,10 +1152,11 @@ fn print_node(snapshot: &Snapshot, name: &str) {
 
 fn apply(config: &Config, dry_run: bool) -> Result<()> {
     let snapshot = snapshot()?;
-    match usable_goxlr_status(config, &snapshot) {
-        Ok(()) => apply_goxlr_profile(config, &snapshot, dry_run),
-        Err(err) => apply_fallback_profile(config, &snapshot, dry_run, &err),
-    }
+    let current_sink = current_default_sink()?;
+    let current_source = current_default_source()?;
+    let (operations, _, _) =
+        reconcile_operations(config, &snapshot, &current_sink, &current_source)?;
+    execute_audio_operations(&operations, dry_run)
 }
 
 /// Compute the exact mutations that `apply` would perform without executing
@@ -1110,27 +1171,14 @@ fn plan(config: &Config, json_output: bool) -> Result<()> {
     let mut operations = Vec::new();
     let mut diagnostics = Vec::new();
 
-    let goxlr_status = match usable_goxlr_status(config, &snapshot) {
-        Ok(()) => {
-            let required = required_nodes(config, &snapshot)?;
-            if current.default_source != required.default_source.name {
-                operations.push(PlanOperation {
-                    action: "pactl.set-default-source".to_string(),
-                    target: Some(required.default_source.name.clone()),
-                    arguments: Vec::new(),
-                    reason: "GoXLR profile requires its configured default source".to_string(),
-                });
-            }
-            plan_monitor_sync(&required, &current.default_sink, &mut operations)?;
-            "ready".to_string()
-        }
-        Err(error) => {
-            diagnostics.push(format!("GoXLR profile unavailable: {error:#}"));
-            let outputs = output_nodes(config, &snapshot)?;
-            plan_default_output(&outputs, &current.default_sink, &mut operations);
-            "fallback".to_string()
-        }
-    };
+    let (audio_operations, goxlr_status, audio_diagnostics) = reconcile_operations(
+        config,
+        &snapshot,
+        &current.default_sink,
+        &current.default_source,
+    )?;
+    diagnostics.extend(audio_diagnostics);
+    operations.extend(audio_operations.iter().map(audio_operation_plan));
 
     let obs = if config.obs.enable {
         match plan_obs(config, &mut operations) {
@@ -1157,7 +1205,7 @@ fn plan(config: &Config, json_output: bool) -> Result<()> {
             version: env!("CARGO_PKG_VERSION"),
         },
         read_only: true,
-        requires_apply: true,
+        requires_apply: !operations.is_empty(),
         current,
         goxlr_status,
         operations,
@@ -1173,53 +1221,269 @@ fn plan(config: &Config, json_output: bool) -> Result<()> {
     Ok(())
 }
 
-fn plan_monitor_sync(
-    required: &RequiredNodes,
+fn reconcile_operations(
+    config: &Config,
+    snapshot: &Snapshot,
     current_sink: &str,
-    operations: &mut Vec<PlanOperation>,
-) -> Result<()> {
-    let selected = plan_default_output(&required.outputs, current_sink, operations);
-    for output in &required.outputs.output_sinks {
-        for (source_port, sink_port) in
-            [("capture_FL", "playback_FL"), ("capture_FR", "playback_FR")]
-        {
-            operations.push(PlanOperation {
-                action: "pw-link.disconnect".to_string(),
-                target: Some(format!("{}:{source_port}", required.monitor_source.name)),
-                arguments: vec![format!("{}:{sink_port}", output.name)],
-                reason: "remove stale monitor links before selecting the active output".to_string(),
+    current_source: &str,
+) -> Result<(Vec<AudioOperation>, String, Vec<String>)> {
+    match usable_goxlr_status(config, snapshot) {
+        Ok(()) => Ok((
+            ready_audio_operations(config, snapshot, current_sink, current_source)?,
+            "ready".to_string(),
+            Vec::new(),
+        )),
+        Err(error) => {
+            let diagnostic = format!("GoXLR profile unavailable: {error:#}");
+            let outputs = output_nodes(config, snapshot)?;
+            let selected =
+                selected_output_sink(&outputs, current_sink).unwrap_or(&outputs.fallback_sink);
+            let operations = if selected.name != current_sink {
+                vec![AudioOperation::SetDefaultSink(selected.name.clone())]
+            } else {
+                Vec::new()
+            };
+            Ok((operations, "fallback".to_string(), vec![diagnostic]))
+        }
+    }
+}
+
+fn ready_audio_operations(
+    config: &Config,
+    snapshot: &Snapshot,
+    current_sink: &str,
+    current_source: &str,
+) -> Result<Vec<AudioOperation>> {
+    let required = required_nodes(config, snapshot)?;
+    let selected = selected_output_sink(&required.outputs, current_sink)
+        .unwrap_or(&required.outputs.fallback_sink);
+    let mut operations = Vec::new();
+
+    if selected.name != current_sink {
+        operations.push(AudioOperation::SetDefaultSink(selected.name.clone()));
+    }
+    if current_source != required.default_source.name {
+        operations.push(AudioOperation::SetDefaultSource(
+            required.default_source.name.clone(),
+        ));
+    }
+    if let Some(maximum) = config.max_monitor_sink_volume {
+        if !maximum.is_finite() || !(0.0..=1.0).contains(&maximum) {
+            bail!("max-monitor-sink-volume must be finite and between 0 and 1");
+        }
+        if let Some(percent) = sink_volume_percent(&selected.name)? {
+            let limit = (maximum * 100.0).round() as u32;
+            if percent > limit {
+                operations.push(AudioOperation::SetSinkVolume {
+                    sink: selected.name.clone(),
+                    percent: limit,
+                });
+            }
+        }
+    }
+
+    let (connect, disconnect) = monitor_link_operations(snapshot, &required, selected)?;
+    operations.extend(connect);
+    operations.extend(disconnect);
+    Ok(operations)
+}
+
+fn monitor_link_operations(
+    snapshot: &Snapshot,
+    required: &RequiredNodes,
+    selected: &Node,
+) -> Result<(Vec<AudioOperation>, Vec<AudioOperation>)> {
+    let mut desired = Vec::new();
+    for channel in ["FL", "FR"] {
+        let source = find_port(snapshot, &required.monitor_source, "output", channel)?;
+        let sink = find_port(snapshot, selected, "input", channel)?;
+        desired.push((source, sink));
+    }
+
+    let mut connects = Vec::new();
+    for (source, sink) in &desired {
+        let present = snapshot.links.iter().any(|link| {
+            link.output_node_id == source.node_id
+                && link.output_port_id == source.id
+                && link.input_node_id == sink.node_id
+                && link.input_port_id == sink.id
+                && link.state.as_deref() != Some("error")
+        });
+        if !present {
+            connects.push(AudioOperation::Connect {
+                source_node: required.monitor_source.name.clone(),
+                source_port: source.name.clone(),
+                sink_node: selected.name.clone(),
+                sink_port: sink.name.clone(),
             });
         }
     }
-    for (source_port, sink_port) in [("capture_FL", "playback_FL"), ("capture_FR", "playback_FR")] {
-        operations.push(PlanOperation {
-            action: "pw-link.connect".to_string(),
-            target: Some(format!("{}:{source_port}", required.monitor_source.name)),
-            arguments: vec![format!("{}:{sink_port}", selected.name)],
-            reason: "route the GoXLR monitor mix to the selected output".to_string(),
+
+    let managed_outputs = required
+        .outputs
+        .output_sinks
+        .iter()
+        .map(|node| (node.id, ()))
+        .collect::<BTreeMap<_, _>>();
+    let mut disconnects = Vec::new();
+    let mut seen = BTreeMap::new();
+    for link in &snapshot.links {
+        if link.output_node_id != required.monitor_source.id
+            || !managed_outputs.contains_key(&link.input_node_id)
+        {
+            continue;
+        }
+        let Some(source_port) = snapshot
+            .ports
+            .iter()
+            .find(|port| port.id == link.output_port_id)
+        else {
+            continue;
+        };
+        let Some(sink_port) = snapshot
+            .ports
+            .iter()
+            .find(|port| port.id == link.input_port_id)
+        else {
+            continue;
+        };
+        let is_desired = desired.iter().any(|(source, sink)| {
+            source.id == link.output_port_id
+                && sink.id == link.input_port_id
+                && sink.node_id == link.input_node_id
         });
+        if !is_desired {
+            let key = (
+                required.monitor_source.name.clone(),
+                source_port.name.clone(),
+                snapshot
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == link.input_node_id)
+                    .map(|node| node.name.clone())
+                    .unwrap_or_default(),
+                sink_port.name.clone(),
+            );
+            if seen.insert(key.clone(), ()).is_none() {
+                disconnects.push(AudioOperation::Disconnect {
+                    source_node: key.0,
+                    source_port: key.1,
+                    sink_node: key.2,
+                    sink_port: key.3,
+                });
+            }
+        }
     }
-    Ok(())
+    Ok((connects, disconnects))
 }
 
-fn plan_default_output(
-    outputs: &OutputNodes,
-    current_sink: &str,
-    operations: &mut Vec<PlanOperation>,
-) -> Node {
-    let selected = selected_output_sink(outputs, current_sink)
-        .or_else(|| (current_sink == outputs.fallback_sink.name).then_some(&outputs.fallback_sink))
-        .unwrap_or(&outputs.fallback_sink);
-    if selected.name != current_sink {
-        operations.push(PlanOperation {
+fn find_port(snapshot: &Snapshot, node: &Node, direction: &str, channel: &str) -> Result<Port> {
+    let matches = snapshot
+        .ports
+        .iter()
+        .filter(|port| {
+            port.node_id == node.id
+                && port.direction == direction
+                && (port.channel.as_deref() == Some(channel)
+                    || port.name.to_ascii_uppercase().contains(channel))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [port] => Ok(port.clone()),
+        [] => bail!(
+            "no unique {direction} {channel} port for PipeWire node {}",
+            node.name
+        ),
+        _ => bail!(
+            "ambiguous {direction} {channel} ports for PipeWire node {}",
+            node.name
+        ),
+    }
+}
+
+fn audio_operation_plan(operation: &AudioOperation) -> PlanOperation {
+    match operation {
+        AudioOperation::SetDefaultSink(sink) => PlanOperation {
             action: "pactl.set-default-sink".to_string(),
-            target: Some(selected.name.clone()),
+            target: Some(sink.clone()),
             arguments: Vec::new(),
             reason: "current default sink is not one of the configured selectable outputs"
                 .to_string(),
-        });
+        },
+        AudioOperation::SetDefaultSource(source) => PlanOperation {
+            action: "pactl.set-default-source".to_string(),
+            target: Some(source.clone()),
+            arguments: Vec::new(),
+            reason: "GoXLR profile requires its configured default source".to_string(),
+        },
+        AudioOperation::SetSinkVolume { sink, percent } => PlanOperation {
+            action: "pactl.set-sink-volume".to_string(),
+            target: Some(sink.clone()),
+            arguments: vec![format!("{percent}%")],
+            reason: "selected monitor sink exceeds the configured volume ceiling".to_string(),
+        },
+        AudioOperation::Connect {
+            source_node,
+            source_port,
+            sink_node,
+            sink_port,
+        } => PlanOperation {
+            action: "pw-link.connect".to_string(),
+            target: Some(format!("{source_node}:{source_port}")),
+            arguments: vec![format!("{sink_node}:{sink_port}")],
+            reason: "route the GoXLR monitor mix to the selected output".to_string(),
+        },
+        AudioOperation::Disconnect {
+            source_node,
+            source_port,
+            sink_node,
+            sink_port,
+        } => PlanOperation {
+            action: "pw-link.disconnect".to_string(),
+            target: Some(format!("{source_node}:{source_port}")),
+            arguments: vec![format!("{sink_node}:{sink_port}")],
+            reason: "remove an observed stale monitor link".to_string(),
+        },
     }
-    selected.clone()
+}
+
+fn execute_audio_operations(operations: &[AudioOperation], dry_run: bool) -> Result<()> {
+    for operation in operations {
+        match operation {
+            AudioOperation::SetDefaultSink(sink) => {
+                run_or_print(dry_run, "pactl", &["set-default-sink", sink])?;
+            }
+            AudioOperation::SetDefaultSource(source) => {
+                run_or_print(dry_run, "pactl", &["set-default-source", source])?;
+            }
+            AudioOperation::SetSinkVolume { sink, percent } => {
+                let volume = format!("{percent}%");
+                run_or_print(dry_run, "pactl", &["set-sink-volume", sink, &volume])?;
+            }
+            AudioOperation::Connect {
+                source_node,
+                source_port,
+                sink_node,
+                sink_port,
+            } => {
+                let source = format!("{source_node}:{source_port}");
+                let sink = format!("{sink_node}:{sink_port}");
+                run_or_print(dry_run, "pw-link", &[&source, &sink])?;
+            }
+            AudioOperation::Disconnect {
+                source_node,
+                source_port,
+                sink_node,
+                sink_port,
+            } => {
+                let source = format!("{source_node}:{source_port}");
+                let sink = format!("{sink_node}:{sink_port}");
+                run_or_print(dry_run, "pw-link", &["--disconnect", &source, &sink])?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn plan_obs(config: &Config, operations: &mut Vec<PlanOperation>) -> Result<PlanObs> {
@@ -1317,17 +1581,18 @@ fn print_plan(plan: &ReconciliationPlan) {
     );
 }
 
-fn follow(config: &Config) -> Result<()> {
+fn follow(config: &Config, observe_only: bool) -> Result<()> {
+    let observe_only = observe_only || config.observe_only;
     loop {
-        if let Err(err) = follow_once(config) {
+        if let Err(err) = follow_once(config, observe_only) {
             eprintln!("warn: GoXLR Nexus watcher unavailable: {err:#}; retrying in 5s");
         }
         std::thread::sleep(Duration::from_secs(5));
     }
 }
 
-fn follow_once(config: &Config) -> Result<()> {
-    if let Err(err) = apply(config, false) {
+fn follow_once(config: &Config, observe_only: bool) -> Result<()> {
+    if let Err(err) = reconcile_for_follow(config, observe_only) {
         eprintln!("warn: initial GoXLR Nexus sync failed: {err:#}");
     }
 
@@ -1341,12 +1606,55 @@ fn follow_once(config: &Config) -> Result<()> {
         .take()
         .ok_or_else(|| anyhow!("pactl subscribe did not expose stdout"))?;
 
-    for line in BufReader::new(stdout).lines() {
-        let line = line.context("failed to read pactl subscribe event")?;
-        if (line.contains(" on sink ") || line.contains(" on server "))
-            && let Err(err) = apply(config, false)
-        {
-            eprintln!("warn: GoXLR Nexus sync failed after PulseAudio event: {err:#}");
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || read_subscription_events(stdout, sender));
+
+    let debounce = Duration::from_millis(250);
+    let maximum_batch = Duration::from_secs(1);
+    let periodic_resync = Duration::from_secs(30);
+    let mut pending_since: Option<Instant> = None;
+    let mut last_event: Option<Instant> = None;
+    let mut next_resync = Instant::now() + periodic_resync;
+
+    loop {
+        let now = Instant::now();
+        let mut timeout = next_resync.saturating_duration_since(now);
+        if let Some(started) = pending_since {
+            let trailing = last_event
+                .unwrap_or(started)
+                .checked_add(debounce)
+                .unwrap_or(now)
+                .saturating_duration_since(now);
+            let maximum = started
+                .checked_add(maximum_batch)
+                .unwrap_or(now)
+                .saturating_duration_since(now);
+            timeout = timeout.min(trailing).min(maximum);
+        }
+
+        match receiver.recv_timeout(timeout) {
+            Ok(_) => {
+                let now = Instant::now();
+                pending_since.get_or_insert(now);
+                last_event = Some(now);
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                let now = Instant::now();
+                let batch_due = pending_since.is_some_and(|started| {
+                    now.duration_since(last_event.unwrap_or(started)) >= debounce
+                        || now.duration_since(started) >= maximum_batch
+                });
+                let periodic_due = now >= next_resync;
+                if batch_due || periodic_due {
+                    if let Err(err) = reconcile_for_follow(config, observe_only) {
+                        eprintln!("warn: GoXLR Nexus sync failed after coalesced event: {err:#}");
+                    }
+                    pending_since = None;
+                    last_event = None;
+                    next_resync = now + periodic_resync;
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
         }
     }
 
@@ -1357,72 +1665,111 @@ fn follow_once(config: &Config) -> Result<()> {
     Ok(())
 }
 
+fn reconcile_for_follow(config: &Config, observe_only: bool) -> Result<()> {
+    let snapshot = snapshot()?;
+    let current_sink = current_default_sink()?;
+    let current_source = current_default_source()?;
+    let (operations, status, diagnostics) =
+        reconcile_operations(config, &snapshot, &current_sink, &current_source)?;
+    if let Err(error) = write_runtime_status(
+        if observe_only {
+            "observe-only"
+        } else {
+            "active"
+        },
+        &status,
+        operations.len(),
+        &diagnostics,
+    ) {
+        eprintln!("warn: failed to write GoXLR Nexus runtime status: {error:#}");
+    }
+    for diagnostic in &diagnostics {
+        eprintln!("warn: {diagnostic}");
+    }
+    if observe_only {
+        if !operations.is_empty() {
+            eprintln!(
+                "observe-only: {status} routing drift has {} proposed operation(s)",
+                operations.len()
+            );
+        }
+        return Ok(());
+    }
+    execute_audio_operations(&operations, false)
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeStatus {
+    schema: &'static str,
+    mode: &'static str,
+    profile: String,
+    proposed_operations: usize,
+    diagnostics: Vec<String>,
+    updated_at: u64,
+}
+
+fn write_runtime_status(
+    mode: &'static str,
+    profile: &str,
+    proposed_operations: usize,
+    diagnostics: &[String],
+) -> Result<()> {
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/run/user/1000"));
+    let directory = runtime_dir.join("goxlr-nexus");
+    fs::create_dir_all(&directory)
+        .with_context(|| format!("create runtime status directory {}", directory.display()))?;
+    let status = RuntimeStatus {
+        schema: "goxlr-nexus.runtime/v1",
+        mode,
+        profile: profile.to_string(),
+        proposed_operations,
+        diagnostics: diagnostics.to_vec(),
+        updated_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or_default(),
+    };
+    let temporary = directory.join("status.json.tmp");
+    fs::write(&temporary, serde_json::to_vec_pretty(&status)?)
+        .with_context(|| format!("write runtime status {}", temporary.display()))?;
+    fs::rename(&temporary, directory.join("status.json"))
+        .context("atomically publish GoXLR Nexus runtime status")?;
+    Ok(())
+}
+
+fn read_subscription_events(
+    stdout: impl std::io::Read + Send + 'static,
+    sender: SyncSender<String>,
+) {
+    for line in BufReader::new(stdout).lines() {
+        match line {
+            Ok(line) if relevant_subscription_event(&line) => {
+                let _ = sender.try_send(line);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                eprintln!("warn: failed to read pactl subscribe event: {error}");
+                break;
+            }
+        }
+    }
+}
+
+fn relevant_subscription_event(line: &str) -> bool {
+    [" on sink ", " on source ", " on server ", " on card "]
+        .iter()
+        .any(|marker| line.contains(marker))
+}
+
 fn usable_goxlr_status(config: &Config, snapshot: &Snapshot) -> Result<()> {
     let status = snapshot
         .goxlr_status
         .as_ref()
         .map_err(|err| anyhow!("{err}"))?;
     validate_goxlr_status(config, status)
-}
-
-fn apply_goxlr_profile(config: &Config, snapshot: &Snapshot, dry_run: bool) -> Result<()> {
-    let required = required_nodes(config, snapshot)?;
-
-    run_or_print(
-        dry_run,
-        "pactl",
-        &["set-default-source", &required.default_source.name],
-    )?;
-    sync_monitor_to_selected_output(&required, dry_run)?;
-    Ok(())
-}
-
-fn apply_fallback_profile(
-    config: &Config,
-    snapshot: &Snapshot,
-    dry_run: bool,
-    reason: &anyhow::Error,
-) -> Result<()> {
-    let outputs = match output_nodes(config, snapshot) {
-        Ok(outputs) => outputs,
-        Err(err) => {
-            eprintln!(
-                "warn: GoXLR unavailable and no configured fallback output is present: {err:#}"
-            );
-            return Ok(());
-        }
-    };
-    eprintln!("warn: GoXLR unavailable, applying output fallback: {reason:#}");
-    sync_default_output(&outputs, dry_run).map(|_| ())
-}
-
-fn sync_monitor_to_selected_output(required: &RequiredNodes, dry_run: bool) -> Result<()> {
-    let selected = sync_default_output(&required.outputs, dry_run)?;
-
-    for output in &required.outputs.output_sinks {
-        disconnect_monitor_from_output(&required.monitor_source, output, dry_run);
-    }
-
-    link_monitor_to_output(&required.monitor_source, &selected, dry_run)
-}
-
-fn sync_default_output(outputs: &OutputNodes, dry_run: bool) -> Result<Node> {
-    let selected_name = current_default_sink()?;
-    if let Some(selected) = selected_output_sink(outputs, &selected_name) {
-        return Ok(selected.clone());
-    }
-
-    let fallback = &outputs.fallback_sink;
-    if selected_name == fallback.name {
-        return Ok(fallback.clone());
-    }
-
-    eprintln!(
-        "warn: default sink {selected_name} is not managed by goxlr-nexus; switching to fallback sink {}",
-        fallback.name
-    );
-    run_or_print(dry_run, "pactl", &["set-default-sink", &fallback.name])?;
-    Ok(fallback.clone())
 }
 
 fn selected_output_sink<'a>(outputs: &'a OutputNodes, selected_name: &str) -> Option<&'a Node> {
@@ -1752,13 +2099,20 @@ fn default_obs_sources() -> Vec<ObsSourceConfig> {
 }
 
 fn snapshot() -> Result<Snapshot> {
+    let graph = pipewire_graph()?;
     Ok(Snapshot {
-        nodes: pipewire_nodes()?,
+        nodes: graph.nodes,
+        ports: graph.ports,
+        links: graph.links,
         goxlr_status: goxlr_status().map_err(|err| format!("{err:#}")),
     })
 }
 
 fn pipewire_nodes() -> Result<Vec<Node>> {
+    Ok(pipewire_graph()?.nodes)
+}
+
+fn pipewire_graph() -> Result<PipewireGraph> {
     let output = audio_command("pw-dump")
         .output()
         .context("failed to run pw-dump")?;
@@ -1769,43 +2123,110 @@ fn pipewire_nodes() -> Result<Vec<Node>> {
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    parse_pw_dump(&output.stdout)
+    parse_pw_graph(&output.stdout)
 }
 
-fn parse_pw_dump(bytes: &[u8]) -> Result<Vec<Node>> {
+fn parse_pw_graph(bytes: &[u8]) -> Result<PipewireGraph> {
     let value: Value = serde_json::from_slice(bytes).context("failed to parse pw-dump JSON")?;
     let array = value
         .as_array()
         .ok_or_else(|| anyhow!("pw-dump JSON root was not an array"))?;
-    let mut nodes = Vec::new();
+    let mut graph = PipewireGraph::default();
     for item in array {
-        if item.get("type").and_then(Value::as_str) != Some("PipeWire:Interface:Node") {
-            continue;
+        let object_type = item.get("type").and_then(Value::as_str);
+        match object_type {
+            Some("PipeWire:Interface:Node") => {
+                let Some(props) = item.pointer("/info/props").and_then(Value::as_object) else {
+                    continue;
+                };
+                let Some(name) = props.get("node.name").and_then(Value::as_str) else {
+                    continue;
+                };
+                let properties = props
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect();
+                graph.nodes.push(Node {
+                    id: item.get("id").and_then(Value::as_u64).unwrap_or_default() as u32,
+                    name: name.to_string(),
+                    description: props
+                        .get("node.description")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                    media_class: props
+                        .get("media.class")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                    properties,
+                });
+            }
+            Some("PipeWire:Interface:Port") => {
+                let Some(info) = item.get("info") else {
+                    continue;
+                };
+                let Some(props) = info.get("props").and_then(Value::as_object) else {
+                    continue;
+                };
+                let Some(node_id) = props.get("node.id").and_then(Value::as_u64) else {
+                    continue;
+                };
+                let Some(name) = props
+                    .get("port.name")
+                    .or_else(|| props.get("port.alias"))
+                    .and_then(Value::as_str)
+                else {
+                    continue;
+                };
+                graph.ports.push(Port {
+                    id: item.get("id").and_then(Value::as_u64).unwrap_or_default() as u32,
+                    node_id: node_id as u32,
+                    direction: info
+                        .get("direction")
+                        .and_then(Value::as_str)
+                        .or_else(|| props.get("port.direction").and_then(Value::as_str))
+                        .unwrap_or_default()
+                        .to_string(),
+                    name: name.to_string(),
+                    channel: props
+                        .get("audio.channel")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                });
+            }
+            Some("PipeWire:Interface:Link") => {
+                let Some(info) = item.get("info") else {
+                    continue;
+                };
+                let Some(output_node_id) = info.get("output-node-id").and_then(Value::as_u64)
+                else {
+                    continue;
+                };
+                let Some(output_port_id) = info.get("output-port-id").and_then(Value::as_u64)
+                else {
+                    continue;
+                };
+                let Some(input_node_id) = info.get("input-node-id").and_then(Value::as_u64) else {
+                    continue;
+                };
+                let Some(input_port_id) = info.get("input-port-id").and_then(Value::as_u64) else {
+                    continue;
+                };
+                graph.links.push(Link {
+                    id: item.get("id").and_then(Value::as_u64).unwrap_or_default() as u32,
+                    output_node_id: output_node_id as u32,
+                    output_port_id: output_port_id as u32,
+                    input_node_id: input_node_id as u32,
+                    input_port_id: input_port_id as u32,
+                    state: info
+                        .get("state")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                });
+            }
+            _ => {}
         }
-        let Some(props) = item.pointer("/info/props").and_then(Value::as_object) else {
-            continue;
-        };
-        let Some(name) = props.get("node.name").and_then(Value::as_str) else {
-            continue;
-        };
-        let properties = props
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect();
-        nodes.push(Node {
-            name: name.to_string(),
-            description: props
-                .get("node.description")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned),
-            media_class: props
-                .get("media.class")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned),
-            properties,
-        });
     }
-    Ok(nodes)
+    Ok(graph)
 }
 
 fn goxlr_status() -> Result<Value> {
@@ -1933,21 +2354,36 @@ fn current_default_audio(kind: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-fn disconnect_monitor_from_output(monitor_source: &Node, output: &Node, dry_run: bool) {
-    for (source_port, sink_port) in [("capture_FL", "playback_FL"), ("capture_FR", "playback_FR")] {
-        let source = format!("{}:{source_port}", monitor_source.name);
-        let sink = format!("{}:{sink_port}", output.name);
-        run_or_print(dry_run, "pw-link", &["--disconnect", &source, &sink]).ok();
+fn sink_volume_percent(name: &str) -> Result<Option<u32>> {
+    let output = audio_command("pactl")
+        .args(["--format=json", "list", "sinks"])
+        .output()
+        .context("failed to inspect sink volumes")?;
+    if !output.status.success() {
+        bail!(
+            "pactl list sinks failed with status {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
-}
-
-fn link_monitor_to_output(monitor_source: &Node, output: &Node, dry_run: bool) -> Result<()> {
-    for (source_port, sink_port) in [("capture_FL", "playback_FL"), ("capture_FR", "playback_FR")] {
-        let source = format!("{}:{source_port}", monitor_source.name);
-        let sink = format!("{}:{sink_port}", output.name);
-        run_or_print(dry_run, "pw-link", &[&source, &sink])?;
-    }
-    Ok(())
+    let sinks: Value =
+        serde_json::from_slice(&output.stdout).context("failed to parse pactl JSON sink list")?;
+    let Some(sink) = sinks.as_array().and_then(|items| {
+        items
+            .iter()
+            .find(|item| item.get("name").and_then(Value::as_str) == Some(name))
+    }) else {
+        return Ok(None);
+    };
+    let Some(volumes) = sink.get("volume").and_then(Value::as_object) else {
+        return Ok(None);
+    };
+    let percent = volumes
+        .values()
+        .filter_map(|volume| volume.get("value_percent").and_then(Value::as_str))
+        .filter_map(|value| value.trim_end_matches('%').parse::<u32>().ok())
+        .max();
+    Ok(percent)
 }
 
 fn run_or_print(dry_run: bool, program: &str, args: &[&str]) -> Result<()> {
@@ -1987,13 +2423,30 @@ mod tests {
           }}},
           {"type":"PipeWire:Interface:Client","info":{"props":{"node.name":"ignored"}}}
         ]"#;
-        let nodes = parse_pw_dump(json).unwrap();
+        let nodes = parse_pw_graph(json).unwrap().nodes;
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].description.as_deref(), Some("GoXLR System"));
         assert_eq!(
             nodes[0].properties.get("node.name").and_then(Value::as_str),
             Some("alsa_output.usb-TC-Helicon_GoXLR-00.HiFi__Speaker__sink")
         );
+    }
+
+    #[test]
+    fn parses_pipewire_ports_and_links() {
+        let json = br#"[
+          {"id": 10, "type":"PipeWire:Interface:Node","info":{"props":{"node.name":"source","media.class":"Audio/Source"}}},
+          {"id": 20, "type":"PipeWire:Interface:Node","info":{"props":{"node.name":"sink","media.class":"Audio/Sink"}}},
+          {"id": 11, "type":"PipeWire:Interface:Port","info":{"direction":"output","props":{"node.id":10,"port.name":"capture_FL","audio.channel":"FL"}}},
+          {"id": 21, "type":"PipeWire:Interface:Port","info":{"direction":"input","props":{"node.id":20,"port.name":"playback_FL","audio.channel":"FL"}}},
+          {"id": 30, "type":"PipeWire:Interface:Link","info":{"output-node-id":10,"output-port-id":11,"input-node-id":20,"input-port-id":21,"state":"active"}}
+        ]"#;
+        let graph = parse_pw_graph(json).unwrap();
+        assert_eq!(graph.nodes.len(), 2);
+        assert_eq!(graph.ports.len(), 2);
+        assert_eq!(graph.ports[0].channel.as_deref(), Some("FL"));
+        assert_eq!(graph.links.len(), 1);
+        assert_eq!(graph.links[0].output_port_id, 11);
     }
 
     #[test]
@@ -2029,6 +2482,8 @@ mod tests {
     fn goxlr_status_error_is_not_usable() {
         let snapshot = Snapshot {
             nodes: vec![],
+            ports: vec![],
+            links: vec![],
             goxlr_status: Err("goxlr-client --status-json failed".to_string()),
         };
         let err = usable_goxlr_status(&Config::default(), &snapshot).unwrap_err();
@@ -2074,25 +2529,96 @@ mod tests {
     }
 
     #[test]
-    fn plan_keeps_managed_default_without_switching_it() {
-        let outputs =
-            output_nodes_for_outputs(["alsa_output.example_jds", "alsa_output.example_thinkpad"]);
-        let mut operations = Vec::new();
-        let selected =
-            plan_default_output(&outputs, "alsa_output.example_thinkpad", &mut operations);
-        assert_eq!(selected.name, "alsa_output.example_thinkpad");
-        assert!(operations.is_empty());
+    fn subscription_events_are_relevant_without_reconciling_inline() {
+        assert!(relevant_subscription_event("Event 'change' on sink #4"));
+        assert!(relevant_subscription_event("Event 'new' on server #0"));
+        assert!(relevant_subscription_event("Event 'remove' on card #2"));
+        assert!(!relevant_subscription_event("Event 'change' on client #4"));
     }
 
     #[test]
-    fn plan_switches_unmanaged_default_to_fallback() {
-        let outputs =
-            output_nodes_for_outputs(["alsa_output.example_jds", "alsa_output.example_thinkpad"]);
-        let mut operations = Vec::new();
-        let selected = plan_default_output(&outputs, "alsa_output.generic", &mut operations);
-        assert_eq!(selected.name, "alsa_output.example_jds");
-        assert_eq!(operations.len(), 1);
-        assert_eq!(operations[0].action, "pactl.set-default-sink");
+    fn settled_monitor_graph_produces_no_link_operations() {
+        let source = test_node_with_id(1, GOXLR_STREAM_MIX, "Audio/Source");
+        let output = test_node_with_id(2, "alsa_output.example_thinkpad", "Audio/Sink");
+        let required = RequiredNodes {
+            outputs: OutputNodes {
+                output_sinks: vec![output.clone()],
+                fallback_sink: output.clone(),
+            },
+            default_source: test_node_with_id(3, GOXLR_CHAT_MIC, "Audio/Source"),
+            monitor_source: source.clone(),
+        };
+        let snapshot = Snapshot {
+            nodes: vec![source.clone(), output.clone()],
+            ports: vec![
+                test_port(11, 1, "output", "capture_FL", "FL"),
+                test_port(12, 1, "output", "capture_FR", "FR"),
+                test_port(21, 2, "input", "playback_FL", "FL"),
+                test_port(22, 2, "input", "playback_FR", "FR"),
+            ],
+            links: vec![
+                Link {
+                    id: 31,
+                    output_node_id: 1,
+                    output_port_id: 11,
+                    input_node_id: 2,
+                    input_port_id: 21,
+                    state: Some("active".to_string()),
+                },
+                Link {
+                    id: 32,
+                    output_node_id: 1,
+                    output_port_id: 12,
+                    input_node_id: 2,
+                    input_port_id: 22,
+                    state: Some("active".to_string()),
+                },
+            ],
+            goxlr_status: Ok(Value::Null),
+        };
+        let (connect, disconnect) = monitor_link_operations(&snapshot, &required, &output).unwrap();
+        assert!(connect.is_empty());
+        assert!(disconnect.is_empty());
+    }
+
+    #[test]
+    fn missing_monitor_channel_connects_only_that_channel() {
+        let source = test_node_with_id(1, GOXLR_STREAM_MIX, "Audio/Source");
+        let output = test_node_with_id(2, "alsa_output.example_thinkpad", "Audio/Sink");
+        let required = RequiredNodes {
+            outputs: OutputNodes {
+                output_sinks: vec![output.clone()],
+                fallback_sink: output.clone(),
+            },
+            default_source: test_node_with_id(3, GOXLR_CHAT_MIC, "Audio/Source"),
+            monitor_source: source.clone(),
+        };
+        let snapshot = Snapshot {
+            nodes: vec![source.clone(), output.clone()],
+            ports: vec![
+                test_port(11, 1, "output", "capture_FL", "FL"),
+                test_port(12, 1, "output", "capture_FR", "FR"),
+                test_port(21, 2, "input", "playback_FL", "FL"),
+                test_port(22, 2, "input", "playback_FR", "FR"),
+            ],
+            links: vec![Link {
+                id: 31,
+                output_node_id: 1,
+                output_port_id: 11,
+                input_node_id: 2,
+                input_port_id: 21,
+                state: Some("active".to_string()),
+            }],
+            goxlr_status: Ok(Value::Null),
+        };
+        let (connect, disconnect) = monitor_link_operations(&snapshot, &required, &output).unwrap();
+        assert_eq!(connect.len(), 1);
+        assert!(matches!(
+            &connect[0],
+            AudioOperation::Connect { source_port, sink_port, .. }
+                if source_port == "capture_FR" && sink_port == "playback_FR"
+        ));
+        assert!(disconnect.is_empty());
     }
 
     #[test]
@@ -2146,11 +2672,26 @@ mod tests {
     }
 
     fn test_node(name: &str) -> Node {
+        test_node_with_id(0, name, "Audio/Sink")
+    }
+
+    fn test_node_with_id(id: u32, name: &str, media_class: &str) -> Node {
         Node {
+            id,
             name: name.to_string(),
             description: None,
-            media_class: Some("Audio/Sink".to_string()),
+            media_class: Some(media_class.to_string()),
             properties: BTreeMap::new(),
+        }
+    }
+
+    fn test_port(id: u32, node_id: u32, direction: &str, name: &str, channel: &str) -> Port {
+        Port {
+            id,
+            node_id,
+            direction: direction.to_string(),
+            name: name.to_string(),
+            channel: Some(channel.to_string()),
         }
     }
 }

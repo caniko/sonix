@@ -6,6 +6,10 @@ license = "MIT OR Apache-2.0"
 repository = "https://codeberg.org/caniko/goxlr-nexus"
 description = "GoXLR, JDS Labs DAC, PipeWire, and OBS audio orchestrator"
 
+[[bin]]
+name = "goxlr-config"
+path = "src/bin/goxlr-config.rs"
+
 [dependencies]
 anyhow = "1.0"
 base64 = "0.22"
