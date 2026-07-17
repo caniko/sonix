@@ -2,19 +2,33 @@
   description = "Declarative GoXLR Utility configuration and PipeWire/OBS audio orchestration";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    rs-harbor.url = "git+https://codeberg.org/caniko/rs-harbor.git?ref=trunk&rev=9bfa8bdb0ecb22d7bc11448665f7fbaebae7a759";
+    nixpkgs.follows = "rs-harbor/nixpkgs";
+    rust-overlay.follows = "rs-harbor/rust-overlay";
+    crane.follows = "rs-harbor/crane";
     flake-utils.url = "github:numtide/flake-utils";
   };
 
   outputs = {
     self,
+    rs-harbor,
     nixpkgs,
     flake-utils,
+    ...
   }:
     flake-utils.lib.eachDefaultSystem (system: let
       pkgs = nixpkgs.legacyPackages.${system};
       manifest = (pkgs.lib.importTOML ./Cargo.toml).package;
-      package = pkgs.rustPlatform.buildRustPackage {
+      buildCache = rs-harbor.lib.mkBuildCachePolicy {
+        inherit pkgs;
+        buildPackageSet = pkgs.buildPackages;
+        sccachePackage = pkgs.buildPackages.sccache;
+        cacheRoot = null;
+        namespaceScope = "canix-rust";
+        namespaceGeneration = 5;
+      };
+      package = buildCache.withRustCache {
+        package = pkgs.rustPlatform.buildRustPackage {
         pname = manifest.name;
         inherit (manifest) version;
         src = ./.;
@@ -24,6 +38,7 @@
           description = manifest.description;
           homepage = "https://codeberg.org/caniko/goxlr-nexus";
           mainProgram = "goxlr-nexus";
+        };
         };
       };
     in {
