@@ -2,6 +2,8 @@
 
 ## 0.1.0 - Unreleased
 
+- Hardened runtime configuration, DSP frame validation, state persistence, and
+  control error handling.
 - Use validated `rkyv` v2 frames for private control IPC while retaining a v1
   JSON compatibility path.
 - Initial publish-ready release with Sonora DSP, persistent controls, and the

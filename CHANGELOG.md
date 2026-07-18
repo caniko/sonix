@@ -2,6 +2,8 @@
 
 ## 0.1.0 - Unreleased
 
+- Hardened follow reconciliation, OBS password handling, and runtime error
+  paths against blocking work, secret retention, and panic-prone failures.
 - Added the reusable `nexus-audio-processing` crate with Sonora noise
   suppression, WebRTC AEC3 echo cancellation, persistent toggles, and an
   optional PipeWire virtual-source runtime.
