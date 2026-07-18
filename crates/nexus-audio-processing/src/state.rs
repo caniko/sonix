@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -20,6 +20,7 @@ pub enum Toggle {
 
 /// Errors returned by persistent processor state.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum StateError {
     /// The state file could not be read.
     #[error("cannot read state file {path}: {source}")]
@@ -185,7 +186,10 @@ impl StateStore {
                 source,
             })?;
         }
-        let bytes = serde_json::to_vec_pretty(state).expect("persisted state is serializable");
+        let bytes = serde_json::to_vec_pretty(state).map_err(|source| StateError::Write {
+            path: self.path.clone(),
+            source: io::Error::other(source),
+        })?;
         let temporary = self.path.with_file_name(format!(
             ".{}.tmp-{}",
             file_name(&self.path),
@@ -280,10 +284,14 @@ impl LockFile {
         loop {
             match OpenOptions::new().create_new(true).write(true).open(path) {
                 Ok(file) => {
-                    set_private_file(&file).map_err(|source| StateError::Write {
-                        path: path.to_path_buf(),
-                        source,
-                    })?;
+                    if let Err(source) = set_private_file(&file) {
+                        drop(file);
+                        let _ = fs::remove_file(path);
+                        return Err(StateError::Write {
+                            path: path.to_path_buf(),
+                            source,
+                        });
+                    }
                     return Ok(Self {
                         path: path.to_path_buf(),
                     });
@@ -361,5 +369,25 @@ mod tests {
         store.set(Toggle::Echo, false, &defaults).unwrap();
         assert!(!store.load(&defaults).unwrap().echo_cancellation);
         assert!(store.reset(&defaults).unwrap().echo_cancellation);
+    }
+
+    #[test]
+    fn rejects_newer_state_versions() {
+        let (_directory, store) = store();
+        fs::write(store.path(), br#"{"version":2}"#).unwrap();
+        assert!(matches!(
+            store.load(&ProcessingConfig::default()),
+            Err(StateError::UnsupportedVersion(2))
+        ));
+    }
+
+    #[test]
+    fn rejects_corrupt_state() {
+        let (_directory, store) = store();
+        fs::write(store.path(), b"not-json").unwrap();
+        assert!(matches!(
+            store.load(&ProcessingConfig::default()),
+            Err(StateError::Parse { .. })
+        ));
     }
 }

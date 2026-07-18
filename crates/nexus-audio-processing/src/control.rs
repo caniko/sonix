@@ -1,6 +1,9 @@
-use std::io::{self, Cursor, Read, Write};
+use std::io::{self, Read, Write};
 use std::path::Path;
 use std::time::Duration;
+
+#[cfg(any(feature = "pipewire-runtime", test))]
+use std::io::Cursor;
 
 use rkyv::util::AlignedVec;
 use serde::{Deserialize, Serialize};
@@ -122,7 +125,7 @@ pub(crate) struct WireResponse {
     error: Option<String>,
 }
 
-#[allow(dead_code)]
+#[cfg(any(feature = "pipewire-runtime", test))]
 impl ArchivedWireRequest {
     pub(crate) fn request_id_native(&self) -> u128 {
         self.request_id.to_native()
@@ -135,6 +138,7 @@ impl ArchivedWireRequest {
 
 /// Errors returned by the local control client.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ControlError {
     /// Unix-domain sockets are only available on Unix hosts.
     #[error("control IPC is only supported on Unix")]
@@ -410,7 +414,7 @@ pub(crate) fn read_legacy_message<R: Read>(reader: &mut R) -> Result<Vec<u8>, Co
     Ok(bytes)
 }
 
-#[allow(dead_code)]
+#[cfg(any(feature = "pipewire-runtime", test))]
 pub(crate) fn read_legacy_request<R: Read>(
     reader: &mut R,
     prefix: [u8; 4],
@@ -420,7 +424,7 @@ pub(crate) fn read_legacy_request<R: Read>(
     Ok(serde_json::from_slice(&bytes)?)
 }
 
-#[allow(dead_code)]
+#[cfg(any(feature = "pipewire-runtime", test))]
 pub(crate) fn access_request(payload: &[u8]) -> Result<&ArchivedWireRequest, ControlError> {
     rkyv::access::<ArchivedWireRequest, rkyv::rancor::Error>(payload)
         .map_err(|error| ControlError::Archive(error.to_string()))
@@ -431,7 +435,7 @@ pub(crate) fn access_response(payload: &[u8]) -> Result<&ArchivedWireResponse, C
         .map_err(|error| ControlError::Archive(error.to_string()))
 }
 
-#[allow(dead_code)]
+#[cfg(any(feature = "pipewire-runtime", test))]
 pub(crate) fn write_v2_response<W: Write>(
     writer: &mut W,
     request_id: u128,

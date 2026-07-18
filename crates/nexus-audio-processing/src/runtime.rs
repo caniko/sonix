@@ -25,10 +25,11 @@ const QUEUE_CAPACITY: usize = 8;
 
 /// Errors returned by the PipeWire runtime.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum RuntimeError {
     /// Runtime configuration is invalid.
     #[error("invalid processing runtime configuration: {0}")]
-    Config(#[from] crate::config::FormatError),
+    Config(#[from] crate::config::ConfigError),
     /// PipeWire rejected an operation.
     #[error("PipeWire error: {0}")]
     PipeWire(#[from] pw::Error),
@@ -47,6 +48,9 @@ pub enum RuntimeError {
     /// The binary control protocol could not be decoded.
     #[error("invalid binary control request: {0}")]
     Control(#[from] ControlError),
+    /// The runtime configuration lock was poisoned by a failed worker.
+    #[error("processing runtime configuration lock is poisoned")]
+    ConfigLockPoisoned,
 }
 
 #[derive(Debug)]
@@ -95,7 +99,7 @@ impl ProcessingRuntime {
             self.config
                 .state_path
                 .clone()
-                .expect("state path populated by new"),
+                .unwrap_or_else(default_state_path),
         );
         let defaults = self.config.processing.clone();
         let state = state_store.load(&defaults).unwrap_or_else(|error| {
@@ -145,17 +149,6 @@ impl ProcessingRuntime {
             worker: OnceLock::new(),
             status: Mutex::new(status),
         });
-
-        let socket_path = self
-            .config
-            .control_socket
-            .expect("socket path populated by new");
-        let server_socket_path = socket_path.clone();
-        let server_shared = Arc::clone(&shared);
-        let server = thread::Builder::new()
-            .name("nexus-processing-control".into())
-            .spawn(move || control_server(&server_socket_path, server_shared))
-            .map_err(RuntimeError::Io)?;
 
         pw::init();
         let main_loop = pw::main_loop::MainLoopRc::new(None)?;
@@ -212,6 +205,17 @@ impl ProcessingRuntime {
             &params,
         )?;
 
+        let socket_path = self
+            .config
+            .control_socket
+            .unwrap_or_else(default_control_socket);
+        let server_socket_path = socket_path.clone();
+        let server_shared = Arc::clone(&shared);
+        let server = thread::Builder::new()
+            .name("nexus-processing-control".into())
+            .spawn(move || control_server(&server_socket_path, server_shared))
+            .map_err(RuntimeError::Io)?;
+
         let worker_shared = Arc::clone(&shared);
         let worker_format = self.config.format;
         let worker = thread::Builder::new()
@@ -244,6 +248,7 @@ impl ProcessingRuntime {
 fn frame_pool(format: crate::StreamFormat) -> ArrayQueue<AudioFrame> {
     let pool = ArrayQueue::new(QUEUE_CAPACITY);
     for _ in 0..QUEUE_CAPACITY {
+        // The queue starts empty and this loop runs exactly to its capacity.
         pool.push(AudioFrame::silence(format))
             .expect("new frame pool has capacity");
     }
@@ -456,6 +461,8 @@ struct AudioParams {
 
 impl AudioParams {
     fn pod_refs(&self) -> Vec<&Pod> {
+        // `bytes` is produced by `audio_params`; only an internal invariant
+        // violation can make the serialized PipeWire pod invalid here.
         vec![Pod::from_bytes(&self.bytes).expect("serialized audio params")]
     }
 }
@@ -482,11 +489,13 @@ fn audio_params(format: crate::StreamFormat) -> Result<AudioParams, RuntimeError
 
 fn processing_worker(shared: Arc<SharedRuntime>, format: crate::StreamFormat) {
     let _ = shared.worker.set(thread::current());
-    let mut config = shared
-        .config
-        .lock()
-        .map(|value| value.clone())
-        .unwrap_or_default();
+    let mut config = match shared.config.lock() {
+        Ok(value) => value.clone(),
+        Err(_) => {
+            mark_unhealthy(&shared, RuntimeError::ConfigLockPoisoned.to_string());
+            return;
+        }
+    };
     let mut config_revision = shared.config_revision.load(Ordering::Acquire);
     let mut processor = match DuplexProcessor::new(format, config.clone()) {
         Ok(processor) => processor,
@@ -500,11 +509,13 @@ fn processing_worker(shared: Arc<SharedRuntime>, format: crate::StreamFormat) {
     while !shared.stop.load(Ordering::Acquire) {
         let current_revision = shared.config_revision.load(Ordering::Acquire);
         if current_revision != config_revision {
-            let updated = shared
-                .config
-                .lock()
-                .map(|value| value.clone())
-                .unwrap_or_else(|_| config.clone());
+            let updated = match shared.config.lock() {
+                Ok(value) => value.clone(),
+                Err(_) => {
+                    mark_unhealthy(&shared, RuntimeError::ConfigLockPoisoned.to_string());
+                    return;
+                }
+            };
             config_revision = current_revision;
             config = updated.clone();
             if let Err(error) = processor.set_config(updated) {
@@ -702,7 +713,10 @@ fn apply_command(
             let state = shared
                 .state_store
                 .set(Toggle::Noise, *enabled, &shared.defaults)?;
-            *shared.config.lock().expect("runtime config lock") =
+            *shared
+                .config
+                .lock()
+                .map_err(|_| RuntimeError::ConfigLockPoisoned)? =
                 state.processing(&shared.defaults);
             shared.config_revision.fetch_add(1, Ordering::Release);
             wake_worker(shared);
@@ -712,7 +726,10 @@ fn apply_command(
             let state = shared
                 .state_store
                 .set(Toggle::Echo, *enabled, &shared.defaults)?;
-            *shared.config.lock().expect("runtime config lock") =
+            *shared
+                .config
+                .lock()
+                .map_err(|_| RuntimeError::ConfigLockPoisoned)? =
                 state.processing(&shared.defaults);
             shared.config_revision.fetch_add(1, Ordering::Release);
             wake_worker(shared);
@@ -720,7 +737,10 @@ fn apply_command(
         }
         ControlCommand::Reset => {
             let state = shared.state_store.reset(&shared.defaults)?;
-            *shared.config.lock().expect("runtime config lock") =
+            *shared
+                .config
+                .lock()
+                .map_err(|_| RuntimeError::ConfigLockPoisoned)? =
                 state.processing(&shared.defaults);
             shared.config_revision.fetch_add(1, Ordering::Release);
             wake_worker(shared);

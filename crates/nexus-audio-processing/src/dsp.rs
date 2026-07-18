@@ -7,6 +7,7 @@ use thiserror::Error;
 
 /// Errors returned by the portable DSP layer.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum DspError {
     /// The configured stream format is invalid.
     #[error("invalid stream format: {0}")]
@@ -55,8 +56,11 @@ impl AudioFrame {
     pub fn copy_from_interleaved(&mut self, samples: &[f32]) -> Result<(), DspError> {
         let channels = self.channels.len();
         let frames = self.channels.first().map_or(0, Vec::len);
-        let expected = frames * channels;
-        if samples.len() != expected {
+        let expected = frames.saturating_mul(channels);
+        if channels == 0
+            || self.channels.iter().any(|channel| channel.len() != frames)
+            || samples.len() != expected
+        {
             return Err(DspError::FrameLength {
                 actual: samples.len(),
                 expected,
@@ -74,8 +78,11 @@ impl AudioFrame {
     pub fn write_interleaved(&self, output: &mut [f32]) -> Result<(), DspError> {
         let channels = self.channels.len();
         let frames = self.channels.first().map_or(0, Vec::len);
-        let expected = channels * frames;
-        if output.len() != expected || self.channels.iter().any(|channel| channel.len() != frames) {
+        let expected = channels.saturating_mul(frames);
+        if channels == 0
+            || output.len() != expected
+            || self.channels.iter().any(|channel| channel.len() != frames)
+        {
             return Err(DspError::FrameLength {
                 actual: output.len(),
                 expected,
@@ -306,6 +313,27 @@ mod tests {
         let mut output = vec![0.0; input.len()];
         frame.write_interleaved(&mut output).unwrap();
         assert_eq!(input, output);
+    }
+
+    #[test]
+    fn malformed_frame_shape_is_rejected_without_panicking() {
+        let mut empty = AudioFrame { channels: vec![] };
+        assert!(matches!(
+            empty.copy_from_interleaved(&[]),
+            Err(DspError::FrameLength { .. })
+        ));
+        assert!(matches!(
+            empty.write_interleaved(&mut []),
+            Err(DspError::FrameLength { .. })
+        ));
+
+        let mut ragged = AudioFrame {
+            channels: vec![vec![0.0], vec![]],
+        };
+        assert!(matches!(
+            ragged.copy_from_interleaved(&[0.0, 1.0]),
+            Err(DspError::FrameLength { .. })
+        ));
     }
 
     #[test]

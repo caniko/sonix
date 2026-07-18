@@ -6,6 +6,7 @@ pub const SCHEMA_VERSION: u32 = 1;
 
 /// Errors returned while validating an audio stream format.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum FormatError {
     /// The sample rate is outside Sonora's supported range.
     #[error("sample rate must be between 8,000 and 384,000 Hz, got {0}")]
@@ -16,6 +17,21 @@ pub enum FormatError {
     /// The sample rate cannot be divided into ten-millisecond frames.
     #[error("sample rate {0} Hz does not produce an integral 10 ms frame")]
     FrameSize(u32),
+}
+
+/// Errors returned while validating a PipeWire runtime configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
+pub enum ConfigError {
+    /// The configured audio stream format is invalid.
+    #[error("invalid audio stream format: {0}")]
+    Format(#[from] FormatError),
+    /// A PipeWire node identity is empty.
+    #[error("{field} must not be empty")]
+    EmptyNodeName {
+        /// Configuration field containing the empty node identity.
+        field: &'static str,
+    },
 }
 
 /// A PCM stream format accepted by the processing core.
@@ -182,14 +198,48 @@ pub struct RuntimeConfig {
 
 impl RuntimeConfig {
     /// Validates the configured stream and node identities.
-    pub fn validate(&self) -> Result<(), FormatError> {
+    pub fn validate(&self) -> Result<(), ConfigError> {
         let _ = StreamFormat::new(self.format.sample_rate_hz, self.format.channels)?;
-        if self.source.capture_source.trim().is_empty()
-            || self.source.render_target.trim().is_empty()
-            || self.source.source_name.trim().is_empty()
-        {
-            return Err(FormatError::Channels);
+        for (field, value) in [
+            ("capture source", &self.source.capture_source),
+            ("render target", &self.source.render_target),
+            ("source name", &self.source.source_name),
+        ] {
+            if value.trim().is_empty() {
+                return Err(ConfigError::EmptyNodeName { field });
+            }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reports_invalid_stream_formats() {
+        assert_eq!(
+            StreamFormat::new(44_101, 2),
+            Err(FormatError::FrameSize(44_101))
+        );
+        assert_eq!(StreamFormat::new(48_000, 0), Err(FormatError::Channels));
+    }
+
+    #[test]
+    fn reports_empty_runtime_node_names() {
+        let mut config = RuntimeConfig::default();
+        config.source.capture_source.clear();
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::EmptyNodeName {
+                field: "capture source"
+            })
+        );
+    }
+
+    #[test]
+    fn clamps_fixed_echo_delay_to_supported_range() {
+        assert_eq!(EchoDelay::Fixed(700).fixed_ms(), Some(500));
     }
 }

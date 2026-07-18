@@ -12,8 +12,8 @@ mod state;
 mod runtime;
 
 pub use config::{
-    EchoDelay, FormatError, NoiseSuppressionLevel, ProcessingConfig, RuntimeConfig, SCHEMA_VERSION,
-    StreamFormat, VirtualSourceConfig,
+    ConfigError, EchoDelay, FormatError, NoiseSuppressionLevel, ProcessingConfig, RuntimeConfig,
+    SCHEMA_VERSION, StreamFormat, VirtualSourceConfig,
 };
 pub use control::{
     CONTROL_PROTOCOL, ControlClient, ControlCommand, ControlError, ControlRequest, ControlResponse,

@@ -23,6 +23,7 @@ use tokio::process::Command as TokioCommand;
 use tokio::time::{Instant, sleep, sleep_until};
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket, connect};
+use zeroize::Zeroizing;
 
 mod observation;
 use observation::{
@@ -747,23 +748,24 @@ fn adopt(json_output: bool) -> Result<()> {
 
     match goxlr_facts() {
         Ok(facts) if facts.mixers.len() == 1 => {
-            let (serial, mixer) = facts.mixers.into_iter().next().expect("length checked");
-            let device_type = mixer
-                .pointer("/hardware/device_type")
-                .and_then(Value::as_str);
-            if device_type == Some("Full") {
-                candidates.push(AdoptCandidate {
-                    role: "audio.mixer".to_string(),
-                    runtime_name: serial.clone(),
-                    description: Some("GoXLR Full mixer".to_string()),
-                    confidence: "high".to_string(),
-                    reason: "exactly one full GoXLR is reported by goxlr-client".to_string(),
-                });
-                config.goxlr_serial = Some(serial);
-            } else {
-                diagnostics.push(format!(
-                    "the only GoXLR mixer is not a full device (device_type={device_type:?})"
-                ));
+            if let Some((serial, mixer)) = facts.mixers.into_iter().next() {
+                let device_type = mixer
+                    .pointer("/hardware/device_type")
+                    .and_then(Value::as_str);
+                if device_type == Some("Full") {
+                    candidates.push(AdoptCandidate {
+                        role: "audio.mixer".to_string(),
+                        runtime_name: serial.clone(),
+                        description: Some("GoXLR Full mixer".to_string()),
+                        confidence: "high".to_string(),
+                        reason: "exactly one full GoXLR is reported by goxlr-client".to_string(),
+                    });
+                    config.goxlr_serial = Some(serial);
+                } else {
+                    diagnostics.push(format!(
+                        "the only GoXLR mixer is not a full device (device_type={device_type:?})"
+                    ));
+                }
             }
         }
         Ok(facts) if facts.mixers.is_empty() => {
@@ -1379,10 +1381,7 @@ fn status(config: &Config, json: bool) -> Result<()> {
                 ))
             });
         if let Some(processing) = processing {
-            out.insert(
-                "processing",
-                serde_json::to_value(processing).expect("processing status is serializable"),
-            );
+            out.insert("processing", serde_json::to_value(processing)?);
         }
         println!("{}", serde_json::to_string_pretty(&out)?);
         return Ok(());
@@ -1891,7 +1890,7 @@ async fn follow(config: &Config, observe_only: bool) -> Result<()> {
 
 async fn follow_once(config: &Config, observe_only: bool) -> Result<()> {
     let mut goxlr_cache = None;
-    if let Err(err) = reconcile_for_follow(config, observe_only, &mut goxlr_cache) {
+    if let Err(err) = reconcile_for_follow_async(config, observe_only, &mut goxlr_cache).await {
         eprintln!("warn: initial GoXLR Nexus sync failed: {err:#}");
     }
 
@@ -1927,13 +1926,14 @@ async fn follow_once(config: &Config, observe_only: bool) -> Result<()> {
 
         tokio::select! {
             result = lines.next_line() => match result? {
-                Some(line) if let Some(kind) = subscription_event_kind(&line) => {
-                    let now = Instant::now();
-                    pending_since.get_or_insert(now);
-                    last_event = Some(now);
-                    refresh_goxlr |= kind == SubscriptionEventKind::ServerOrCard;
+                Some(line) => {
+                    if let Some(kind) = subscription_event_kind(&line) {
+                        let now = Instant::now();
+                        pending_since.get_or_insert(now);
+                        last_event = Some(now);
+                        refresh_goxlr |= kind == SubscriptionEventKind::ServerOrCard;
+                    }
                 }
-                Some(_) => {}
                 None => break,
             },
             _ = sleep_until(deadline) => {
@@ -1948,7 +1948,7 @@ async fn follow_once(config: &Config, observe_only: bool) -> Result<()> {
                         goxlr_cache = None;
                     }
                     if let Err(err) =
-                        reconcile_for_follow(config, observe_only, &mut goxlr_cache)
+                        reconcile_for_follow_async(config, observe_only, &mut goxlr_cache).await
                     {
                         eprintln!("warn: GoXLR Nexus sync failed after coalesced event: {err:#}");
                     }
@@ -1974,6 +1974,24 @@ async fn follow_once(config: &Config, observe_only: bool) -> Result<()> {
         bail!("pactl subscribe exited with status {status}");
     }
     Ok(())
+}
+
+async fn reconcile_for_follow_async(
+    config: &Config,
+    observe_only: bool,
+    goxlr_cache: &mut Option<(Instant, Result<Arc<Value>, String>)>,
+) -> Result<()> {
+    let config = config.clone();
+    let cached_status = goxlr_cache.take();
+    let (cached_status, result) = tokio::task::spawn_blocking(move || {
+        let mut goxlr_cache = cached_status;
+        let result = reconcile_for_follow(&config, observe_only, &mut goxlr_cache);
+        (goxlr_cache, result)
+    })
+    .await
+    .context("follow reconciliation task failed")?;
+    *goxlr_cache = cached_status;
+    result
 }
 
 async fn watch_shutdown_signal() -> Result<()> {
@@ -2389,18 +2407,23 @@ fn write_obs_message(socket: &mut ObsSocket, op: u64, data: Value) -> Result<()>
         .context("failed to write OBS websocket message")
 }
 
-fn read_obs_password(config: &Config) -> Result<String> {
+fn read_obs_password(config: &Config) -> Result<Zeroizing<String>> {
     let Some(path) = &config.obs.password_file else {
         bail!("OBS websocket requires authentication, but no password-file is configured");
     };
-    fs::read_to_string(path)
-        .with_context(|| format!("failed to read OBS password file {}", path.display()))
-        .map(|text| text.trim().to_string())
+    let bytes = Zeroizing::new(
+        fs::read(path)
+            .with_context(|| format!("failed to read OBS password file {}", path.display()))?,
+    );
+    let text = std::str::from_utf8(&bytes).context("OBS password file is not valid UTF-8")?;
+    Ok(Zeroizing::new(text.trim().to_string()))
 }
 
 fn obs_authentication(password: &str, salt: &str, challenge: &str) -> String {
-    let secret = sha256_base64(format!("{password}{salt}").as_bytes());
-    sha256_base64(format!("{secret}{challenge}").as_bytes())
+    let secret_input = Zeroizing::new(format!("{password}{salt}"));
+    let secret = Zeroizing::new(sha256_base64(secret_input.as_bytes()));
+    let response_input = Zeroizing::new(format!("{}{challenge}", secret.as_str()));
+    sha256_base64(response_input.as_bytes())
 }
 
 fn sha256_base64(bytes: &[u8]) -> String {
