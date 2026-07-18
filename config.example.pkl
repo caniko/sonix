@@ -1,0 +1,51 @@
+user = "can"
+jdsSink = "alsa_output.usb-Yoyodyne_Consulting_JDS_Labs_Element_DAC-01.analog-stereo"
+fallbackSink = "alsa_output.usb-Yoyodyne_Consulting_JDS_Labs_Element_DAC-01.analog-stereo"
+thinkpadSink = "alsa_output.usb-Lenovo_ThinkPad_Thunderbolt_4_Dock_USB_Audio_000000000000-00.analog-stereo"
+outputSinks = new Listing {
+  "alsa_output.usb-Yoyodyne_Consulting_JDS_Labs_Element_DAC-01.analog-stereo"
+  "alsa_output.usb-Lenovo_ThinkPad_Thunderbolt_4_Dock_USB_Audio_000000000000-00.analog-stereo"
+}
+goxlrSerial = "S200805412CQK"
+
+profile = new {
+  defaultSink = "alsa_output.usb-TC-Helicon_GoXLR-00.HiFi__Speaker__sink"
+  defaultSource = "alsa_input.usb-TC-Helicon_GoXLR-00.HiFi__Headset__source"
+  monitorSource = "alsa_input.usb-TC-Helicon_GoXLR-00.HiFi__Line4__source"
+}
+
+processing = new {
+  // The processor is a separate user service. Both stages are fail-open and
+  // off by default; use `goxlr-nexus processing noise on` or `echo on` to enable one.
+  enable = true
+  sourceName = "goxlr_nexus.processed_mic"
+  sourceDescription = "GoXLR Nexus processed microphone"
+  noiseSuppression = false
+  echoCancellation = false
+  noiseLevel = "high"
+  // echoDelay = new { mode = "fixed"; milliseconds = 80 }
+}
+
+obs = new {
+  enable = true
+  host = "127.0.0.1"
+  port = 4455
+  sources = new Listing {
+    new {
+      name = "GoXLR Mic"
+      deviceId = "alsa_input.usb-TC-Helicon_GoXLR-00.HiFi__Headset__source"
+    }
+    new {
+      name = "GoXLR Stream Mix"
+      deviceId = "alsa_input.usb-TC-Helicon_GoXLR-00.HiFi__Line4__source"
+    }
+    new {
+      name = "GoXLR Sampler"
+      deviceId = "alsa_input.usb-TC-Helicon_GoXLR-00.HiFi__Line5__source"
+    }
+    new {
+      name = "GoXLR Desktop Mix"
+      deviceId = "alsa_input.usb-TC-Helicon_GoXLR-00.HiFi__Line4__source"
+    }
+  }
+}

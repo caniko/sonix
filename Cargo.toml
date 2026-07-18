@@ -10,7 +10,7 @@ readme = "README.md"
 documentation = "https://docs.rs/goxlr-nexus"
 keywords = ["audio", "pipewire", "goxlr"]
 categories = ["multimedia::audio"]
-include = ["src/**", "crates/**", "README.md", "CHANGELOG.md", "LICENSE*", "config.example.toml", "schemas/**", "Cargo.lock"]
+include = ["src/**", "crates/**", "README.md", "CHANGELOG.md", "LICENSE*", "config.example.pkl", "schemas/**", "Cargo.lock"]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -32,5 +32,13 @@ dirs = "6.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
-toml = "0.9"
+pklr = { version = "1.2.0", default-features = false, features = ["native-io"] }
+tokio = { version = "1.0", default-features = false, features = [
+  "io-util",
+  "macros",
+  "process",
+  "rt",
+  "signal",
+  "time",
+] }
 tungstenite = "0.27"

@@ -27,6 +27,13 @@ processor starts or recovers.
 The `pipewire-runtime` feature adds [`ProcessingRuntime`]. It fixes the graph
 contract at 48 kHz stereo, publishes a virtual source, persists independent
 noise/echo overrides, and serves the versioned Unix-socket control protocol.
+Control v2 uses a bounded, validated `rkyv` binary frame and reads archived
+commands without allocating; v1 JSON is accepted for compatibility with an
+older daemon during the 0.1 release line.
+The PipeWire callbacks use preallocated frame pools and pending buffers, while
+the worker processes into caller-owned frames and sleeps until input arrives.
+Use `process_render_into` and `process_capture_into` when a caller owns a frame
+pool; the allocating methods remain available for simpler integrations.
 The runtime is Linux/PipeWire integration; the frame and control modules stay
 portable for other consumers.
 
@@ -49,6 +56,10 @@ cargo publish -p nexus-audio-processing --dry-run
 
 - `sonora` (default): the portable DSP processor.
 - `pipewire-runtime`: Linux PipeWire streams, runtime state, and control IPC.
+
+The persisted processor state remains the small, human-inspectable
+`processing-v1.json` file. JSON is also retained for external CLI, OBS, GoXLR,
+and PipeWire interfaces whose schemas are outside this crate.
 
 ## License
 

@@ -32,6 +32,18 @@ goxlr-nexus processing echo off
 goxlr-nexus processing reset
 ```
 
+## Pkl configuration
+
+The runtime configuration is Pkl and is loaded with the native `pklr` crate.
+By default, `goxlr-nexus` reads `${XDG_CONFIG_HOME}/goxlr-nexus/config.pkl`,
+or `~/.config/goxlr-nexus/config.pkl` when `XDG_CONFIG_HOME` is unset. Use
+`--config` or `GOXLR_NEXUS_CONFIG` to select another Pkl file. A complete
+starting point is [`config.example.pkl`](config.example.pkl).
+
+The NixOS and Home Manager modules generate this same Pkl format directly.
+Existing default-path `config.toml` files are rejected with a migration
+message rather than being silently ignored.
+
 `discover` is the human- and tooling-facing observation command. It reads the
 PipeWire graph, current defaults, GoXLR status, and the OBS input/device
 catalog without creating, linking, or changing anything. `--json` emits the
@@ -54,7 +66,10 @@ already converged.
 
 `follow` coalesces PipeWire events and periodically resynchronizes the graph.
 It applies only observed deltas, verifies the graph through the next
-observation, and accepts `--observe-only` for a non-mutating canary.
+observation, and accepts `--observe-only` for a non-mutating canary. Its
+watcher keeps stable GoXLR device status in an `Arc`-backed cache, refreshing
+it for mixer/card changes and the periodic resync instead of launching a
+status probe for every sink/source event.
 The Home Manager module can force a real ALSA profile transition before the
 controller starts (`goxlrCard` + `goxlrProfile`); this repairs WirePlumber
 restarts that leave only hidden raw nodes while still reporting the requested

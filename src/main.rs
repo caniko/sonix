@@ -1,12 +1,10 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{BufRead, BufReader};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
@@ -20,6 +18,9 @@ use nexus_audio_processing::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use tokio::io::{AsyncBufReadExt, BufReader as AsyncBufReader};
+use tokio::process::Command as TokioCommand;
+use tokio::time::{Instant, sleep, sleep_until};
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket, connect};
 
@@ -142,7 +143,7 @@ enum ProcessingState {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default, rename_all = "kebab-case")]
+#[serde(default, rename_all = "camelCase")]
 struct Config {
     user: String,
     jds_sink: Option<String>,
@@ -176,7 +177,7 @@ impl Default for Config {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default, rename_all = "kebab-case")]
+#[serde(default, rename_all = "camelCase")]
 struct ProcessingSettings {
     enable: bool,
     source_name: String,
@@ -202,7 +203,7 @@ impl Default for ProcessingSettings {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default, rename_all = "kebab-case")]
+#[serde(default, rename_all = "camelCase")]
 struct ProfileConfig {
     default_sink: String,
     default_source: String,
@@ -220,7 +221,7 @@ impl Default for ProfileConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default, rename_all = "kebab-case")]
+#[serde(default, rename_all = "camelCase")]
 struct ObsConfig {
     enable: bool,
     host: String,
@@ -242,7 +243,7 @@ impl Default for ObsConfig {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default, rename_all = "kebab-case")]
+#[serde(default, rename_all = "camelCase")]
 struct ObsSourceConfig {
     name: String,
     device_id: String,
@@ -316,7 +317,7 @@ struct Snapshot {
     nodes: Vec<Node>,
     ports: Vec<Port>,
     links: Vec<Link>,
-    goxlr_status: Result<Value, String>,
+    goxlr_status: Result<Arc<Value>, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -451,43 +452,70 @@ struct AdoptObsSource {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to create command runtime")?;
+    let outcome = runtime.block_on(run_cli(Cli::parse()))?;
+    drop(runtime);
+
+    if let Some(config) = outcome {
+        ProcessingRuntime::new(config)
+            .map_err(|error| anyhow!(error))?
+            .run()
+            .map_err(|error| anyhow!(error))?;
+    }
+    Ok(())
+}
+
+async fn run_cli(cli: Cli) -> Result<Option<RuntimeConfig>> {
     let config_path = cli.config;
     match cli.command {
-        CommandKind::Discover { json } => discover(config_path.as_deref(), json),
-        CommandKind::Adopt { json } => adopt(json),
+        CommandKind::Discover { json } => {
+            let config = match load_config(config_path.as_deref()).await {
+                Ok(config) => config,
+                Err(err) if config_path.is_none() => {
+                    eprintln!("warn: ignoring invalid existing config during discovery: {err:#}");
+                    Config::default()
+                }
+                Err(err) => return Err(err),
+            };
+            discover(config, json)?;
+        }
+        CommandKind::Adopt { json } => adopt(json)?,
         command => {
-            let config = load_config(config_path.as_deref())?;
+            let config = load_config(config_path.as_deref()).await?;
             match command {
-                CommandKind::Discover { .. } => unreachable!("discover is handled above"),
-                CommandKind::Adopt { .. } => unreachable!("adopt is handled above"),
-                CommandKind::Doctor => doctor(&config),
-                CommandKind::Plan { json } => plan(&config, json),
-                CommandKind::Status { json } => status(&config, json),
-                CommandKind::Apply(args) => apply(&config, args.dry_run),
-                CommandKind::Follow { observe_only } => follow(&config, observe_only),
+                CommandKind::Discover { .. } | CommandKind::Adopt { .. } => {
+                    unreachable!("handled before configuration loading")
+                }
+                CommandKind::Doctor => doctor(&config)?,
+                CommandKind::Plan { json } => plan(&config, json)?,
+                CommandKind::Status { json } => status(&config, json)?,
+                CommandKind::Apply(args) => apply(&config, args.dry_run)?,
+                CommandKind::Follow { observe_only } => follow(&config, observe_only).await?,
                 CommandKind::Profile { profile, dry_run } => {
-                    apply_profile(&config, profile, dry_run)
+                    apply_profile(&config, profile, dry_run)?
                 }
                 CommandKind::Obs {
                     command: ObsCommand::Sync { dry_run },
-                } => obs_sync(&config, dry_run),
-                CommandKind::Processing { command } => processing_command(&config, command),
+                } => obs_sync(&config, dry_run)?,
+                CommandKind::Processing {
+                    command: ProcessingCommand::Daemon,
+                } => {
+                    if !config.processing.enable {
+                        bail!("processing runtime is disabled in the GoXLR Nexus configuration")
+                    }
+                    return Ok(Some(processing_runtime_config(&config)));
+                }
+                CommandKind::Processing { command } => processing_command(&config, command)?,
             }
         }
     }
+    Ok(None)
 }
 
-fn discover(explicit_config: Option<&Path>, json_output: bool) -> Result<()> {
-    let config = match load_config(explicit_config) {
-        Ok(config) => config,
-        Err(err) if explicit_config.is_none() => {
-            eprintln!("warn: ignoring invalid existing config during discovery: {err:#}");
-            Config::default()
-        }
-        Err(err) => return Err(err),
-    };
-
+fn discover(config: Config, json_output: bool) -> Result<()> {
     let mut sources = Vec::new();
     let mut nodes = match pipewire_nodes() {
         Ok(nodes) => {
@@ -509,40 +537,30 @@ fn discover(explicit_config: Option<&Path>, json_output: bool) -> Result<()> {
     };
     nodes.sort_by(|left, right| left.name.cmp(&right.name));
 
-    let default_sink = match current_default_sink() {
-        Ok(value) => {
-            sources.push(SourceStatus {
-                source: "pactl.get-default-sink".to_string(),
-                status: "ok".to_string(),
-                diagnostic: None,
-            });
-            Some(value)
+    let (default_sink, default_source) = match current_defaults() {
+        Ok((sink, source)) => {
+            for source_name in ["pactl.get-default-sink", "pactl.get-default-source"] {
+                sources.push(SourceStatus {
+                    source: source_name.to_string(),
+                    status: "ok".to_string(),
+                    diagnostic: None,
+                });
+            }
+            (Some(sink), Some(source))
         }
         Err(err) => {
+            let diagnostic = Some(format!("{err:#}"));
             sources.push(SourceStatus {
                 source: "pactl.get-default-sink".to_string(),
                 status: "unavailable".to_string(),
-                diagnostic: Some(format!("{err:#}")),
+                diagnostic: diagnostic.clone(),
             });
-            None
-        }
-    };
-    let default_source = match current_default_source() {
-        Ok(value) => {
-            sources.push(SourceStatus {
-                source: "pactl.get-default-source".to_string(),
-                status: "ok".to_string(),
-                diagnostic: None,
-            });
-            Some(value)
-        }
-        Err(err) => {
             sources.push(SourceStatus {
                 source: "pactl.get-default-source".to_string(),
                 status: "unavailable".to_string(),
-                diagnostic: Some(format!("{err:#}")),
+                diagnostic,
             });
-            None
+            (None, None)
         }
     };
 
@@ -1049,22 +1067,41 @@ fn print_observation(observation: &Observation) {
     );
 }
 
-fn load_config(explicit: Option<&Path>) -> Result<Config> {
-    let path = explicit
+async fn load_config(explicit: Option<&Path>) -> Result<Config> {
+    let configured_path = explicit
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("GOXLR_NEXUS_CONFIG").map(PathBuf::from))
-        .or_else(|| dirs::config_dir().map(|p| p.join("goxlr-nexus/config.toml")));
+        .or_else(|| std::env::var_os("GOXLR_NEXUS_CONFIG").map(PathBuf::from));
+    let config_dir = dirs::config_dir();
+    let path = configured_path.clone().or_else(|| {
+        config_dir
+            .as_ref()
+            .map(|directory| directory.join("goxlr-nexus/config.pkl"))
+    });
 
     let Some(path) = path else {
         return Ok(Config::default());
     };
     if !path.exists() {
+        if configured_path.is_none()
+            && let Some(config_dir) = config_dir
+        {
+            let legacy_path = config_dir.join("goxlr-nexus/config.toml");
+            if legacy_path.exists() {
+                bail!(
+                    "found legacy TOML configuration at {}; migrate it to {}",
+                    legacy_path.display(),
+                    path.display()
+                );
+            }
+        }
         return Ok(Config::default());
     }
 
-    let text = fs::read_to_string(&path)
-        .with_context(|| format!("failed to read config {}", path.display()))?;
-    toml::from_str(&text).with_context(|| format!("failed to parse config {}", path.display()))
+    let value = pklr::eval_to_json(&path)
+        .await
+        .map_err(|error| anyhow!("failed to evaluate Pkl config {}: {error}", path.display()))?;
+    serde_json::from_value(value)
+        .with_context(|| format!("failed to decode Pkl config {}", path.display()))
 }
 
 fn processing_runtime_config(config: &Config) -> RuntimeConfig {
@@ -1413,8 +1450,7 @@ fn print_node(snapshot: &Snapshot, name: &str) {
 
 fn apply(config: &Config, dry_run: bool) -> Result<()> {
     let snapshot = snapshot()?;
-    let current_sink = current_default_sink()?;
-    let current_source = current_default_source()?;
+    let (current_sink, current_source) = current_defaults()?;
     let (operations, _, _) =
         reconcile_operations(config, &snapshot, &current_sink, &current_source)?;
     execute_audio_operations(&operations, dry_run)
@@ -1425,9 +1461,10 @@ fn apply(config: &Config, dry_run: bool) -> Result<()> {
 /// adding a plan cannot accidentally turn a read-only command into a write.
 fn plan(config: &Config, json_output: bool) -> Result<()> {
     let snapshot = snapshot()?;
+    let (default_sink, default_source) = current_defaults()?;
     let current = PlanCurrent {
-        default_sink: current_default_sink()?,
-        default_source: current_default_source()?,
+        default_sink,
+        default_source,
     };
     let mut operations = Vec::new();
     let mut diagnostics = Vec::new();
@@ -1842,64 +1879,64 @@ fn print_plan(plan: &ReconciliationPlan) {
     );
 }
 
-fn follow(config: &Config, observe_only: bool) -> Result<()> {
+async fn follow(config: &Config, observe_only: bool) -> Result<()> {
     let observe_only = observe_only || config.observe_only;
     loop {
-        if let Err(err) = follow_once(config, observe_only) {
+        if let Err(err) = follow_once(config, observe_only).await {
             eprintln!("warn: GoXLR Nexus watcher unavailable: {err:#}; retrying in 5s");
         }
-        std::thread::sleep(Duration::from_secs(5));
+        sleep(Duration::from_secs(5)).await;
     }
 }
 
-fn follow_once(config: &Config, observe_only: bool) -> Result<()> {
-    if let Err(err) = reconcile_for_follow(config, observe_only) {
+async fn follow_once(config: &Config, observe_only: bool) -> Result<()> {
+    let mut goxlr_cache = None;
+    if let Err(err) = reconcile_for_follow(config, observe_only, &mut goxlr_cache) {
         eprintln!("warn: initial GoXLR Nexus sync failed: {err:#}");
     }
 
-    let mut child = audio_command("pactl")
+    let mut child = tokio_audio_command("pactl")
         .args(["subscribe"])
         .stdout(Stdio::piped())
+        .kill_on_drop(true)
         .spawn()
         .context("failed to run pactl subscribe")?;
     let stdout = child
         .stdout
         .take()
         .ok_or_else(|| anyhow!("pactl subscribe did not expose stdout"))?;
-
-    let (sender, receiver) = mpsc::sync_channel(1);
-    thread::spawn(move || read_subscription_events(stdout, sender));
+    let mut lines = AsyncBufReader::new(stdout).lines();
+    let mut shutdown = Box::pin(watch_shutdown_signal());
 
     let debounce = Duration::from_millis(250);
     let maximum_batch = Duration::from_secs(1);
     let periodic_resync = Duration::from_secs(30);
     let mut pending_since: Option<Instant> = None;
     let mut last_event: Option<Instant> = None;
+    let mut refresh_goxlr = false;
     let mut next_resync = Instant::now() + periodic_resync;
 
     loop {
-        let now = Instant::now();
-        let mut timeout = next_resync.saturating_duration_since(now);
-        if let Some(started) = pending_since {
-            let trailing = last_event
-                .unwrap_or(started)
-                .checked_add(debounce)
-                .unwrap_or(now)
-                .saturating_duration_since(now);
-            let maximum = started
-                .checked_add(maximum_batch)
-                .unwrap_or(now)
-                .saturating_duration_since(now);
-            timeout = timeout.min(trailing).min(maximum);
-        }
+        let deadline = if let Some(started) = pending_since {
+            let trailing = last_event.unwrap_or(started) + debounce;
+            let maximum = started + maximum_batch;
+            next_resync.min(trailing).min(maximum)
+        } else {
+            next_resync
+        };
 
-        match receiver.recv_timeout(timeout) {
-            Ok(_) => {
-                let now = Instant::now();
-                pending_since.get_or_insert(now);
-                last_event = Some(now);
-            }
-            Err(RecvTimeoutError::Timeout) => {
+        tokio::select! {
+            result = lines.next_line() => match result? {
+                Some(line) if let Some(kind) = subscription_event_kind(&line) => {
+                    let now = Instant::now();
+                    pending_since.get_or_insert(now);
+                    last_event = Some(now);
+                    refresh_goxlr |= kind == SubscriptionEventKind::ServerOrCard;
+                }
+                Some(_) => {}
+                None => break,
+            },
+            _ = sleep_until(deadline) => {
                 let now = Instant::now();
                 let batch_due = pending_since.is_some_and(|started| {
                     now.duration_since(last_event.unwrap_or(started)) >= debounce
@@ -1907,29 +1944,79 @@ fn follow_once(config: &Config, observe_only: bool) -> Result<()> {
                 });
                 let periodic_due = now >= next_resync;
                 if batch_due || periodic_due {
-                    if let Err(err) = reconcile_for_follow(config, observe_only) {
+                    if refresh_goxlr {
+                        goxlr_cache = None;
+                    }
+                    if let Err(err) =
+                        reconcile_for_follow(config, observe_only, &mut goxlr_cache)
+                    {
                         eprintln!("warn: GoXLR Nexus sync failed after coalesced event: {err:#}");
                     }
                     pending_since = None;
                     last_event = None;
+                    refresh_goxlr = false;
                     next_resync = now + periodic_resync;
                 }
             }
-            Err(RecvTimeoutError::Disconnected) => break,
+            result = &mut shutdown => {
+                result?;
+                let _ = child.kill().await;
+                return Ok(());
+            }
         }
     }
 
-    let status = child.wait().context("failed to wait for pactl subscribe")?;
+    let status = child
+        .wait()
+        .await
+        .context("failed to wait for pactl subscribe")?;
     if !status.success() {
         bail!("pactl subscribe exited with status {status}");
     }
     Ok(())
 }
 
-fn reconcile_for_follow(config: &Config, observe_only: bool) -> Result<()> {
-    let snapshot = snapshot()?;
-    let current_sink = current_default_sink()?;
-    let current_source = current_default_source()?;
+async fn watch_shutdown_signal() -> Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let mut terminate =
+            signal(SignalKind::terminate()).context("failed to install SIGTERM handler")?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                result.context("failed to install or receive Ctrl-C handler")
+            }
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c()
+            .await
+            .context("failed to install or receive Ctrl-C handler")
+    }
+}
+
+fn reconcile_for_follow(
+    config: &Config,
+    observe_only: bool,
+    goxlr_cache: &mut Option<(Instant, Result<Arc<Value>, String>)>,
+) -> Result<()> {
+    let now = Instant::now();
+    if goxlr_cache
+        .as_ref()
+        .is_none_or(|(updated, _)| now.duration_since(*updated) >= Duration::from_secs(30))
+    {
+        *goxlr_cache = Some((
+            now,
+            goxlr_status()
+                .map(Arc::new)
+                .map_err(|error| format!("{error:#}")),
+        ));
+    }
+    let snapshot = snapshot_with_goxlr_status(goxlr_cache.as_ref().map(|(_, status)| status))?;
+    let (current_sink, current_source) = current_defaults()?;
     let (operations, status, diagnostics) =
         reconcile_operations(config, &snapshot, &current_sink, &current_source)?;
     if let Err(error) = write_runtime_status(
@@ -2001,28 +2088,25 @@ fn write_runtime_status(
     Ok(())
 }
 
-fn read_subscription_events(
-    stdout: impl std::io::Read + Send + 'static,
-    sender: SyncSender<String>,
-) {
-    for line in BufReader::new(stdout).lines() {
-        match line {
-            Ok(line) if relevant_subscription_event(&line) => {
-                let _ = sender.try_send(line);
-            }
-            Ok(_) => {}
-            Err(error) => {
-                eprintln!("warn: failed to read pactl subscribe event: {error}");
-                break;
-            }
-        }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubscriptionEventKind {
+    Audio,
+    ServerOrCard,
+}
+
+fn subscription_event_kind(line: &str) -> Option<SubscriptionEventKind> {
+    if line.contains(" on server ") || line.contains(" on card ") {
+        Some(SubscriptionEventKind::ServerOrCard)
+    } else if line.contains(" on sink ") || line.contains(" on source ") {
+        Some(SubscriptionEventKind::Audio)
+    } else {
+        None
     }
 }
 
+#[cfg(test)]
 fn relevant_subscription_event(line: &str) -> bool {
-    [" on sink ", " on source ", " on server ", " on card "]
-        .iter()
-        .any(|marker| line.contains(marker))
+    subscription_event_kind(line).is_some()
 }
 
 fn usable_goxlr_status(config: &Config, snapshot: &Snapshot) -> Result<()> {
@@ -2361,20 +2445,30 @@ fn default_obs_sources() -> Vec<ObsSourceConfig> {
 }
 
 fn snapshot() -> Result<Snapshot> {
-    let graph = pipewire_graph()?;
+    snapshot_with_goxlr_status(None)
+}
+
+fn snapshot_with_goxlr_status(
+    cached_status: Option<&Result<Arc<Value>, String>>,
+) -> Result<Snapshot> {
+    let graph = pipewire_graph(false)?;
     Ok(Snapshot {
         nodes: graph.nodes,
         ports: graph.ports,
         links: graph.links,
-        goxlr_status: goxlr_status().map_err(|err| format!("{err:#}")),
+        goxlr_status: cached_status.cloned().unwrap_or_else(|| {
+            goxlr_status()
+                .map(Arc::new)
+                .map_err(|err| format!("{err:#}"))
+        }),
     })
 }
 
 fn pipewire_nodes() -> Result<Vec<Node>> {
-    Ok(pipewire_graph()?.nodes)
+    Ok(pipewire_graph(true)?.nodes)
 }
 
-fn pipewire_graph() -> Result<PipewireGraph> {
+fn pipewire_graph(include_properties: bool) -> Result<PipewireGraph> {
     let output = audio_command("pw-dump")
         .output()
         .context("failed to run pw-dump")?;
@@ -2385,10 +2479,15 @@ fn pipewire_graph() -> Result<PipewireGraph> {
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    parse_pw_graph(&output.stdout)
+    parse_pw_graph_with_properties(&output.stdout, include_properties)
 }
 
+#[cfg(test)]
 fn parse_pw_graph(bytes: &[u8]) -> Result<PipewireGraph> {
+    parse_pw_graph_with_properties(bytes, true)
+}
+
+fn parse_pw_graph_with_properties(bytes: &[u8], include_properties: bool) -> Result<PipewireGraph> {
     let value: Value = serde_json::from_slice(bytes).context("failed to parse pw-dump JSON")?;
     let array = value
         .as_array()
@@ -2404,10 +2503,14 @@ fn parse_pw_graph(bytes: &[u8]) -> Result<PipewireGraph> {
                 let Some(name) = props.get("node.name").and_then(Value::as_str) else {
                     continue;
                 };
-                let properties = props
-                    .iter()
-                    .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect();
+                let properties = if include_properties {
+                    props
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect()
+                } else {
+                    BTreeMap::new()
+                };
                 graph.nodes.push(Node {
                     id: item.get("id").and_then(Value::as_u64).unwrap_or_default() as u32,
                     name: name.to_string(),
@@ -2615,60 +2718,50 @@ fn find_node(snapshot: &Snapshot, name: &str) -> Result<Node> {
         })
 }
 
-fn current_default_sink() -> Result<String> {
-    current_default_audio("sink")
-}
-
-fn current_default_source() -> Result<String> {
-    current_default_audio("source")
-}
-
-fn current_default_audio(kind: &str) -> Result<String> {
-    let action = format!("get-default-{kind}");
+fn current_defaults() -> Result<(String, String)> {
     let output = audio_command("pactl")
-        .arg(&action)
+        .args(["--format=json", "info"])
         .output()
-        .with_context(|| format!("failed to run pactl get-default-{kind}"))?;
+        .context("failed to inspect PipeWire default audio nodes")?;
     if !output.status.success() {
         bail!(
-            "pactl get-default-{kind} failed with status {}: {}",
+            "pactl info failed with status {}: {}",
             output.status,
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    let info: Value = serde_json::from_slice(&output.stdout)
+        .context("failed to parse pactl default-audio JSON")?;
+    let sink = info
+        .get("default_sink_name")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("pactl info did not report default_sink_name"))?;
+    let source = info
+        .get("default_source_name")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("pactl info did not report default_source_name"))?;
+    Ok((sink.to_string(), source.to_string()))
 }
 
 fn sink_volume_percent(name: &str) -> Result<Option<u32>> {
     let output = audio_command("pactl")
-        .args(["--format=json", "list", "sinks"])
+        .args(["get-sink-volume", name])
         .output()
         .context("failed to inspect sink volumes")?;
     if !output.status.success() {
         bail!(
-            "pactl list sinks failed with status {}: {}",
+            "pactl get-sink-volume {name} failed with status {}: {}",
             output.status,
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    let sinks: Value =
-        serde_json::from_slice(&output.stdout).context("failed to parse pactl JSON sink list")?;
-    let Some(sink) = sinks.as_array().and_then(|items| {
-        items
-            .iter()
-            .find(|item| item.get("name").and_then(Value::as_str) == Some(name))
-    }) else {
-        return Ok(None);
-    };
-    let Some(volumes) = sink.get("volume").and_then(Value::as_object) else {
-        return Ok(None);
-    };
-    let percent = volumes
-        .values()
-        .filter_map(|volume| volume.get("value_percent").and_then(Value::as_str))
-        .filter_map(|value| value.trim_end_matches('%').parse::<u32>().ok())
-        .max();
-    Ok(percent)
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .filter_map(|value| value.strip_suffix('%'))
+        .filter_map(|value| value.parse::<u32>().ok())
+        .max())
 }
 
 fn run_or_print(dry_run: bool, program: &str, args: &[&str]) -> Result<()> {
@@ -2688,6 +2781,14 @@ fn run_or_print(dry_run: bool, program: &str, args: &[&str]) -> Result<()> {
 
 fn audio_command(program: &str) -> Command {
     let mut command = Command::new(program);
+    if std::env::var_os("XDG_RUNTIME_DIR").is_none() && Path::new("/run/user/1000").exists() {
+        command.env("XDG_RUNTIME_DIR", "/run/user/1000");
+    }
+    command
+}
+
+fn tokio_audio_command(program: &str) -> TokioCommand {
+    let mut command = TokioCommand::new(program);
     if std::env::var_os("XDG_RUNTIME_DIR").is_none() && Path::new("/run/user/1000").exists() {
         command.env("XDG_RUNTIME_DIR", "/run/user/1000");
     }
@@ -2777,19 +2878,32 @@ mod tests {
 
     #[test]
     fn parses_configured_output_sinks() {
-        let config: Config = toml::from_str(
-            r#"
-            output-sinks = [
-              "alsa_output.example_jds",
-              "alsa_output.example_thinkpad",
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "outputSinks": [
+                "alsa_output.example_jds",
+                "alsa_output.example_thinkpad"
             ]
-            "#,
-        )
+        }))
         .unwrap();
         assert_eq!(
             config.output_sinks,
             vec!["alsa_output.example_jds", "alsa_output.example_thinkpad"]
         );
+    }
+
+    #[test]
+    fn evaluates_checked_in_pkl_config() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config.example.pkl");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let config = runtime.block_on(load_config(Some(&path))).unwrap();
+
+        assert_eq!(config.user, "can");
+        assert_eq!(config.goxlr_serial.as_deref(), Some("S200805412CQK"));
+        assert_eq!(config.output_sinks.len(), 2);
+        assert_eq!(config.obs.sources.len(), 4);
     }
 
     #[test]
@@ -2859,7 +2973,7 @@ mod tests {
                     state: Some("active".to_string()),
                 },
             ],
-            goxlr_status: Ok(Value::Null),
+            goxlr_status: Ok(Arc::new(Value::Null)),
         };
         let (connect, disconnect) = monitor_link_operations(&snapshot, &required, &output).unwrap();
         assert!(connect.is_empty());
@@ -2894,7 +3008,7 @@ mod tests {
                 input_port_id: 21,
                 state: Some("active".to_string()),
             }],
-            goxlr_status: Ok(Value::Null),
+            goxlr_status: Ok(Arc::new(Value::Null)),
         };
         let (connect, disconnect) = monitor_link_operations(&snapshot, &required, &output).unwrap();
         assert_eq!(connect.len(), 1);

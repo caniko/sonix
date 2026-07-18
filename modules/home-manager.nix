@@ -16,7 +16,8 @@
     if cfg.fallbackSink == null
     then cfg.jdsSink
     else cfg.fallbackSink;
-  outputSinksToml = lib.concatMapStringsSep ", " (sink: "\"${sink}\"") effectiveOutputSinks;
+  pklString = value: builtins.toJSON value;
+  outputSinksPkl = lib.concatMapStringsSep "\n" (sink: "    ${pklString sink}") effectiveOutputSinks;
   goxlrDaemonUnit = "app-goxlr\\x2ddaemon@autostart.service";
   servicePath = lib.makeBinPath [
     package
@@ -24,60 +25,67 @@
     pkgs.pipewire
     pkgs.pulseaudio
   ];
-  obsSourceToml =
-    lib.concatMapStrings
+  obsSourcesPkl =
+    lib.concatMapStringsSep
+    "\n"
     (source: ''
-
-      [[obs.sources]]
-      name = "${source.name}"
-      device-id = "${source.deviceId}"
+      new {
+        name = ${pklString source.name}
+        deviceId = ${pklString source.deviceId}
+      }
     '')
     cfg.obs.sources;
-  configFile = pkgs.writeText "goxlr-nexus-home-config.toml" ''
-    user = "${cfg.user}"
-    output-sinks = [${outputSinksToml}]
-    ${lib.optionalString (cfg.jdsSink != null) ''jds-sink = "${cfg.jdsSink}"''}
-    ${lib.optionalString (effectiveFallbackSink != null) ''fallback-sink = "${effectiveFallbackSink}"''}
-    ${lib.optionalString (cfg.thinkpadSink != null) ''thinkpad-sink = "${cfg.thinkpadSink}"''}
-    ${lib.optionalString (cfg.goxlrSerial != null) ''goxlr-serial = "${cfg.goxlrSerial}"''}
-    ${lib.optionalString (cfg.maxMonitorSinkVolume != null) ''max-monitor-sink-volume = ${toString cfg.maxMonitorSinkVolume}''}
-    observe-only = ${
+  configFile = pkgs.writeText "goxlr-nexus-home-config.pkl" ''
+        user = ${pklString cfg.user}
+        outputSinks = new Listing {
+    ${outputSinksPkl}
+        }
+        ${lib.optionalString (cfg.jdsSink != null) ''jdsSink = ${pklString cfg.jdsSink}''}
+        ${lib.optionalString (effectiveFallbackSink != null) ''fallbackSink = ${pklString effectiveFallbackSink}''}
+        ${lib.optionalString (cfg.thinkpadSink != null) ''thinkpadSink = ${pklString cfg.thinkpadSink}''}
+        ${lib.optionalString (cfg.goxlrSerial != null) ''goxlrSerial = ${pklString cfg.goxlrSerial}''}
+        ${lib.optionalString (cfg.maxMonitorSinkVolume != null) ''maxMonitorSinkVolume = ${toString cfg.maxMonitorSinkVolume}''}
+        observeOnly = ${
       if cfg.observeOnly
       then "true"
       else "false"
     }
 
-    [obs]
-    enable = ${
+        obs = new {
+        enable = ${
       if cfg.obs.enable
       then "true"
       else "false"
     }
-    host = "${cfg.obs.host}"
-    port = ${toString cfg.obs.port}
-    ${lib.optionalString (cfg.obs.passwordFile != null) "password-file = \"${cfg.obs.passwordFile}\""}
-    ${obsSourceToml}
+        host = ${pklString cfg.obs.host}
+        port = ${toString cfg.obs.port}
+        ${lib.optionalString (cfg.obs.passwordFile != null) "passwordFile = ${pklString cfg.obs.passwordFile}"}
+        sources = new Listing {
+    ${obsSourcesPkl}
+        }
+        }
 
-    [processing]
-    enable = ${
+        processing = new {
+        enable = ${
       if cfg.processing.enable
       then "true"
       else "false"
     }
-    source-name = "${cfg.processing.sourceName}"
-    source-description = "${cfg.processing.sourceDescription}"
-    noise-suppression = ${
+        sourceName = ${pklString cfg.processing.sourceName}
+        sourceDescription = ${pklString cfg.processing.sourceDescription}
+        noiseSuppression = ${
       if cfg.processing.noiseSuppression
       then "true"
       else "false"
     }
-    echo-cancellation = ${
+        echoCancellation = ${
       if cfg.processing.echoCancellation
       then "true"
       else "false"
     }
-    noise-level = "${cfg.processing.noiseLevel}"
-    ${lib.optionalString (cfg.processing.echoDelayMs != null) ''echo-delay = { mode = "fixed", milliseconds = ${toString cfg.processing.echoDelayMs} }''}
+        noiseLevel = ${pklString cfg.processing.noiseLevel}
+        ${lib.optionalString (cfg.processing.echoDelayMs != null) ''echoDelay = new { mode = "fixed"; milliseconds = ${toString cfg.processing.echoDelayMs} }''}
+        }
   '';
 in {
   options.programs.goxlr-nexus = {

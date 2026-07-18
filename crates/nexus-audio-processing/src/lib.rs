@@ -17,7 +17,7 @@ pub use config::{
 };
 pub use control::{
     CONTROL_PROTOCOL, ControlClient, ControlCommand, ControlError, ControlRequest, ControlResponse,
-    RuntimeStatus, offline_status,
+    LEGACY_CONTROL_PROTOCOL, RuntimeStatus, offline_status,
 };
 #[cfg(feature = "sonora")]
 pub use dsp::DuplexProcessor;

@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// The schema version used by persisted processor state and control IPC.
+/// The schema version used by persisted processor state and runtime status.
 pub const SCHEMA_VERSION: u32 = 1;
 
 /// Errors returned while validating an audio stream format.
@@ -19,7 +19,18 @@ pub enum FormatError {
 }
 
 /// A PCM stream format accepted by the processing core.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub struct StreamFormat {
     /// Samples per second.
     pub sample_rate_hz: u32,
