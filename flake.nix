@@ -14,36 +14,30 @@
     rs-harbor,
     nixpkgs,
     flake-utils,
+    crane,
+    rust-overlay,
     ...
   }:
     flake-utils.lib.eachDefaultSystem (system: let
-      pkgs = nixpkgs.legacyPackages.${system};
-      manifest = (pkgs.lib.importTOML ./Cargo.toml).package;
-      buildCache = rs-harbor.lib.mkBuildCachePolicy {
-        inherit pkgs;
-        buildPackageSet = pkgs.buildPackages;
-        sccachePackage = pkgs.buildPackages.sccache;
-        cacheRoot = null;
-        namespaceScope = "canix-rust";
-        namespaceGeneration = 5;
+      pkgs = import nixpkgs {
+        inherit system;
+        overlays = [(import rust-overlay)];
       };
-      package = buildCache.withRustCache {
-        package = pkgs.rustPlatform.buildRustPackage {
-          pname = manifest.name;
-          inherit (manifest) version;
-          src = ./.;
-          cargoLock.lockFile = ./Cargo.lock;
-          nativeBuildInputs = [pkgs.pkg-config pkgs.llvmPackages.libclang];
-          buildInputs = [pkgs.pipewire];
-          LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
-          BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.glibc.dev}/include";
-          meta = {
-            description = manifest.description;
-            homepage = "https://codeberg.org/caniko/goxlr-nexus";
-            mainProgram = "goxlr-nexus";
-          };
-        };
+      msrvToolchain = pkgs.rust-bin.stable."1.91.0".default.override {
+        extensions = ["clippy" "rustfmt"];
       };
+      msrvCraneLib = (crane.mkLib pkgs).overrideToolchain (_: msrvToolchain);
+      src = msrvCraneLib.cleanCargoSource ./.;
+      commonArgs = {
+        inherit src;
+        strictDeps = true;
+        nativeBuildInputs = [pkgs.pkg-config pkgs.llvmPackages.libclang];
+        buildInputs = [pkgs.pipewire.dev];
+        PKG_CONFIG_PATH = "${pkgs.pipewire.dev}/lib/pkgconfig";
+        LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+        BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.glibc.dev}/include";
+      };
+      package = msrvCraneLib.buildPackage (commonArgs // {cargoArtifacts = null;});
     in {
       packages = {
         default = package;
@@ -58,17 +52,17 @@
           program = "${package}/bin/goxlr-config";
         };
       };
-      devShells.default = pkgs.mkShell {
+      devShells.default = msrvCraneLib.devShell {
         packages = with pkgs; [
-          cargo
-          clippy
-          rustc
-          rustfmt
           pipewire
           pulseaudio
           llvmPackages.libclang
+          pkg-config
           jq
         ];
+        PKG_CONFIG_PATH = "${pkgs.pipewire.dev}/lib/pkgconfig";
+        LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+        BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.glibc.dev}/include";
       };
       checks.default = package;
       formatter = pkgs.alejandra;
