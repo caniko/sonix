@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://codeberg.org/caniko/goxlr-nexus/schemas/processing-status-v1.schema.json",
+  "title": "nexus-audio-processing runtime status",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "daemonRunning", "healthy", "active", "noiseSuppression", "echoCancellation", "processedSource", "captureSource", "renderTarget", "format", "retries", "droppedFrames"],
+  "properties": {
+    "schemaVersion": {"const": 1},
+    "daemonRunning": {"type": "boolean"},
+    "healthy": {"type": "boolean"},
+    "active": {"type": "boolean"},
+    "noiseSuppression": {"type": "boolean"},
+    "echoCancellation": {"type": "boolean"},
+    "noisePersisted": {"type": "boolean"},
+    "echoPersisted": {"type": "boolean"},
+    "processedSource": {"type": "string"},
+    "captureSource": {"type": "string"},
+    "renderTarget": {"type": "string"},
+    "format": {
+      "type": "object",
+      "required": ["sample_rate_hz", "channels"],
+      "properties": {
+        "sample_rate_hz": {"type": "integer", "minimum": 1},
+        "channels": {"type": "integer", "minimum": 1}
+      },
+      "additionalProperties": false
+    },
+    "delayMs": {"type": ["integer", "null"], "minimum": 0},
+    "retries": {"type": "integer", "minimum": 0},
+    "droppedFrames": {"type": "integer", "minimum": 0},
+    "lastError": {"type": ["string", "null"]}
+  }
+}

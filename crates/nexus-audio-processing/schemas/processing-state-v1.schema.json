@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://codeberg.org/caniko/goxlr-nexus/schemas/processing-state-v1.schema.json",
+  "title": "nexus-audio-processing persisted state",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version"],
+  "properties": {
+    "version": {"const": 1},
+    "noise-suppression": {"type": ["boolean", "null"]},
+    "echo-cancellation": {"type": ["boolean", "null"]}
+  }
+}

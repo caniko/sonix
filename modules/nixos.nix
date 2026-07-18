@@ -37,8 +37,33 @@
     default-source = "${cfg.defaultSource}"
     monitor-source = "${cfg.monitorSource}"
 
+    [processing]
+    enable = ${
+      if cfg.processing.enable
+      then "true"
+      else "false"
+    }
+    source-name = "${cfg.processing.sourceName}"
+    source-description = "${cfg.processing.sourceDescription}"
+    noise-suppression = ${
+      if cfg.processing.noiseSuppression
+      then "true"
+      else "false"
+    }
+    echo-cancellation = ${
+      if cfg.processing.echoCancellation
+      then "true"
+      else "false"
+    }
+    noise-level = "${cfg.processing.noiseLevel}"
+    ${lib.optionalString (cfg.processing.echoDelayMs != null) ''echo-delay = { mode = "fixed", milliseconds = ${toString cfg.processing.echoDelayMs} }''}
+
     [obs]
-    enable = ${if cfg.obs.enable then "true" else "false"}
+    enable = ${
+      if cfg.obs.enable
+      then "true"
+      else "false"
+    }
     host = "${cfg.obs.host}"
     port = ${toString cfg.obs.port}
     ${lib.optionalString (cfg.obs.passwordFile != null) "password-file = \"${cfg.obs.passwordFile}\""}
@@ -84,6 +109,38 @@ in {
       type = types.str;
       default = "alsa_input.usb-TC-Helicon_GoXLR-00.HiFi__Line4__source";
     };
+    processing = {
+      enable = mkOption {
+        type = types.bool;
+        default = true;
+        description = "Run the separate user-level PipeWire processing service.";
+      };
+      sourceName = mkOption {
+        type = types.str;
+        default = "goxlr_nexus.processed_mic";
+      };
+      sourceDescription = mkOption {
+        type = types.str;
+        default = "GoXLR Nexus processed microphone";
+      };
+      noiseSuppression = mkOption {
+        type = types.bool;
+        default = false;
+      };
+      echoCancellation = mkOption {
+        type = types.bool;
+        default = false;
+      };
+      noiseLevel = mkOption {
+        type = types.enum ["low" "moderate" "high" "very-high"];
+        default = "high";
+      };
+      echoDelayMs = mkOption {
+        type = types.nullOr types.ints.between 0 500;
+        default = null;
+        description = "Optional fixed AEC delay in milliseconds; null selects automatic timing.";
+      };
+    };
     obs = {
       enable = mkEnableOption "OBS websocket synchronization";
       host = mkOption {
@@ -105,8 +162,12 @@ in {
     environment.systemPackages = [package pkgs.pipewire pkgs.pulseaudio];
     systemd.user.services.goxlr-nexus = {
       description = "GoXLR Nexus audio routing repair";
-      after = ["pipewire.service" "pipewire-pulse.service" "wireplumber.service" goxlrDaemonUnit];
-      wants = ["pipewire.service" "pipewire-pulse.service" "wireplumber.service" goxlrDaemonUnit];
+      after =
+        ["pipewire.service" "pipewire-pulse.service" "wireplumber.service" goxlrDaemonUnit]
+        ++ lib.optional cfg.processing.enable "goxlr-nexus-processing.service";
+      wants =
+        ["pipewire.service" "pipewire-pulse.service" "wireplumber.service" goxlrDaemonUnit]
+        ++ lib.optional cfg.processing.enable "goxlr-nexus-processing.service";
       wantedBy = ["default.target"];
       serviceConfig = {
         Type = "simple";
@@ -118,6 +179,25 @@ in {
       unitConfig = {
         StartLimitIntervalSec = 300;
         StartLimitBurst = 20;
+      };
+    };
+    systemd.user.services.goxlr-nexus-processing = lib.mkIf cfg.processing.enable {
+      description = "GoXLR Nexus noise suppression and echo cancellation";
+      after = ["pipewire.service" "pipewire-pulse.service" "wireplumber.service"];
+      wants = ["pipewire.service" "pipewire-pulse.service" "wireplumber.service"];
+      wantedBy = ["default.target"];
+      serviceConfig = {
+        Type = "simple";
+        Environment = "PATH=${servicePath}";
+        ExecStart = "${package}/bin/goxlr-nexus --config ${configFile} processing daemon";
+        ExecStopPost = "${package}/bin/goxlr-nexus --config ${configFile} processing fail-open";
+        Restart = "on-failure";
+        RestartSec = 2;
+        CPUQuota = "35%";
+        MemoryHigh = "128M";
+        MemoryMax = "256M";
+        TasksMax = 64;
+        TimeoutStopSec = 10;
       };
     };
   };

@@ -12,6 +12,11 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use nexus_audio_processing::{
+    ControlClient, EchoDelay, NoiseSuppressionLevel, ProcessingConfig, ProcessingRuntime,
+    RuntimeConfig, StateStore, Toggle, VirtualSourceConfig, default_control_socket,
+    default_state_path, offline_status,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -81,6 +86,11 @@ enum CommandKind {
         #[command(subcommand)]
         command: ObsCommand,
     },
+    /// Toggle and inspect the optional microphone processor.
+    Processing {
+        #[command(subcommand)]
+        command: ProcessingCommand,
+    },
 }
 
 #[derive(Args)]
@@ -104,6 +114,33 @@ enum ObsCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum ProcessingCommand {
+    /// Toggle noise suppression.
+    Noise { state: ProcessingState },
+    /// Toggle echo cancellation.
+    Echo { state: ProcessingState },
+    /// Show processor health and effective routing.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Clear persisted feature overrides.
+    Reset,
+    /// Run the PipeWire processor service.
+    #[command(hide = true)]
+    Daemon,
+    /// Restore the raw microphone as the default source.
+    #[command(hide = true)]
+    FailOpen,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ProcessingState {
+    On,
+    Off,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
 struct Config {
@@ -117,6 +154,7 @@ struct Config {
     observe_only: bool,
     profile: ProfileConfig,
     obs: ObsConfig,
+    processing: ProcessingSettings,
 }
 
 impl Default for Config {
@@ -132,6 +170,33 @@ impl Default for Config {
             observe_only: false,
             profile: ProfileConfig::default(),
             obs: ObsConfig::default(),
+            processing: ProcessingSettings::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+struct ProcessingSettings {
+    enable: bool,
+    source_name: String,
+    source_description: String,
+    noise_suppression: bool,
+    echo_cancellation: bool,
+    noise_level: NoiseSuppressionLevel,
+    echo_delay: EchoDelay,
+}
+
+impl Default for ProcessingSettings {
+    fn default() -> Self {
+        Self {
+            enable: true,
+            source_name: "goxlr_nexus.processed_mic".to_string(),
+            source_description: "GoXLR Nexus processed microphone".to_string(),
+            noise_suppression: false,
+            echo_cancellation: false,
+            noise_level: NoiseSuppressionLevel::High,
+            echo_delay: EchoDelay::Auto,
         }
     }
 }
@@ -407,6 +472,7 @@ fn main() -> Result<()> {
                 CommandKind::Obs {
                     command: ObsCommand::Sync { dry_run },
                 } => obs_sync(&config, dry_run),
+                CommandKind::Processing { command } => processing_command(&config, command),
             }
         }
     }
@@ -1001,6 +1067,171 @@ fn load_config(explicit: Option<&Path>) -> Result<Config> {
     toml::from_str(&text).with_context(|| format!("failed to parse config {}", path.display()))
 }
 
+fn processing_runtime_config(config: &Config) -> RuntimeConfig {
+    RuntimeConfig {
+        format: nexus_audio_processing::StreamFormat::default(),
+        source: VirtualSourceConfig {
+            capture_source: config.profile.default_source.clone(),
+            render_target: config.profile.default_sink.clone(),
+            source_name: config.processing.source_name.clone(),
+            source_description: config.processing.source_description.clone(),
+        },
+        processing: ProcessingConfig {
+            noise_suppression: config.processing.noise_suppression,
+            echo_cancellation: config.processing.echo_cancellation,
+            noise_level: config.processing.noise_level,
+            echo_delay: config.processing.echo_delay,
+        },
+        state_path: Some(default_state_path()),
+        control_socket: Some(default_control_socket()),
+    }
+}
+
+fn processing_command(config: &Config, command: ProcessingCommand) -> Result<()> {
+    let runtime = processing_runtime_config(config);
+    if !config.processing.enable && !matches!(command, ProcessingCommand::Status { .. }) {
+        bail!("processing runtime is disabled in the GoXLR Nexus configuration")
+    }
+    match command {
+        ProcessingCommand::Noise { state } => processing_toggle(
+            config,
+            &runtime,
+            Toggle::Noise,
+            matches!(state, ProcessingState::On),
+        ),
+        ProcessingCommand::Echo { state } => processing_toggle(
+            config,
+            &runtime,
+            Toggle::Echo,
+            matches!(state, ProcessingState::On),
+        ),
+        ProcessingCommand::Status { json } => processing_status(config, &runtime, json),
+        ProcessingCommand::Reset => {
+            let client = ControlClient::new(default_control_socket());
+            match client.reset() {
+                Ok(status) => {
+                    print_processing_status(&status, false);
+                    reconcile_processing_source(&status);
+                }
+                Err(_) => {
+                    let store = StateStore::new(default_state_path());
+                    let state = store.reset(&runtime.processing)?;
+                    let status = offline_status(
+                        &runtime.source.source_name,
+                        &runtime.source.capture_source,
+                        &runtime.source.render_target,
+                        runtime.format,
+                        &state,
+                    );
+                    print_processing_status(&status, false);
+                    reconcile_processing_source(&status);
+                }
+            }
+            Ok(())
+        }
+        ProcessingCommand::Daemon => {
+            let runtime = ProcessingRuntime::new(runtime)?;
+            runtime.run().map_err(|error| anyhow!(error))
+        }
+        ProcessingCommand::FailOpen => run_or_print(
+            false,
+            "pactl",
+            &["set-default-source", &runtime.source.capture_source],
+        ),
+    }
+}
+
+fn processing_toggle(
+    _config: &Config,
+    runtime: &RuntimeConfig,
+    toggle: Toggle,
+    enabled: bool,
+) -> Result<()> {
+    let client = ControlClient::new(default_control_socket());
+    let result = match toggle {
+        Toggle::Noise => client.set_noise(enabled),
+        Toggle::Echo => client.set_echo(enabled),
+    };
+    match result {
+        Ok(status) => {
+            print_processing_status(&status, false);
+            reconcile_processing_source(&status);
+        }
+        Err(error) => {
+            let store = StateStore::new(default_state_path());
+            let state = store.set(toggle, enabled, &runtime.processing)?;
+            let status = offline_status(
+                &runtime.source.source_name,
+                &runtime.source.capture_source,
+                &runtime.source.render_target,
+                runtime.format,
+                &state,
+            );
+            eprintln!("warn: processing daemon unavailable ({error}); change saved for startup");
+            print_processing_status(&status, false);
+        }
+    }
+    Ok(())
+}
+
+fn processing_status(config: &Config, runtime: &RuntimeConfig, json_output: bool) -> Result<()> {
+    let client = ControlClient::new(default_control_socket());
+    let status = match client.status() {
+        Ok(status) => status,
+        Err(_) => {
+            let state = StateStore::new(default_state_path()).load(&runtime.processing)?;
+            offline_status(
+                &runtime.source.source_name,
+                &runtime.source.capture_source,
+                &runtime.source.render_target,
+                runtime.format,
+                &state,
+            )
+        }
+    };
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&status)?);
+    } else {
+        print_processing_status(&status, true);
+    }
+    if !config.processing.enable {
+        eprintln!("processing runtime disabled in configuration");
+    }
+    Ok(())
+}
+
+fn print_processing_status(status: &nexus_audio_processing::RuntimeStatus, queried: bool) {
+    if queried {
+        println!("processing status:");
+    }
+    println!(
+        "  daemon={} healthy={} active={} noise={} echo={}",
+        status.daemon_running,
+        status.healthy,
+        status.active,
+        status.noise_suppression,
+        status.echo_cancellation
+    );
+    println!(
+        "  source={} raw={}",
+        status.processed_source, status.capture_source
+    );
+    if let Some(error) = &status.last_error {
+        println!("  diagnostic: {error}");
+    }
+}
+
+fn reconcile_processing_source(status: &nexus_audio_processing::RuntimeStatus) {
+    let desired = if status.daemon_running && status.healthy && status.active {
+        &status.processed_source
+    } else {
+        &status.capture_source
+    };
+    if let Err(error) = run_or_print(false, "pactl", &["set-default-source", desired]) {
+        eprintln!("warn: cannot select processing microphone {desired}: {error:#}");
+    }
+}
+
 fn doctor(config: &Config) -> Result<()> {
     let snapshot = snapshot()?;
     let required = required_nodes(config, &snapshot)?;
@@ -1090,6 +1321,32 @@ fn status(config: &Config, json: bool) -> Result<()> {
         out.insert("doctorOk", Value::Bool(required.is_ok() && goxlr_ok));
         out.insert("goxlrOk", Value::Bool(goxlr_ok));
         out.insert("obsEnabled", Value::Bool(config.obs.enable));
+        out.insert(
+            "effectiveMicrophone",
+            Value::String(effective_microphone_name(config)),
+        );
+        let processing = ControlClient::new(default_control_socket())
+            .status()
+            .ok()
+            .or_else(|| {
+                let runtime = processing_runtime_config(config);
+                let state = StateStore::new(default_state_path())
+                    .load(&runtime.processing)
+                    .ok()?;
+                Some(offline_status(
+                    &runtime.source.source_name,
+                    &runtime.source.capture_source,
+                    &runtime.source.render_target,
+                    runtime.format,
+                    &state,
+                ))
+            });
+        if let Some(processing) = processing {
+            out.insert(
+                "processing",
+                serde_json::to_value(processing).expect("processing status is serializable"),
+            );
+        }
         println!("{}", serde_json::to_string_pretty(&out)?);
         return Ok(());
     }
@@ -1113,6 +1370,10 @@ fn status(config: &Config, json: bool) -> Result<()> {
     println!(
         "GoXLR serial: {}",
         config.goxlr_serial.as_deref().unwrap_or("not configured")
+    );
+    println!(
+        "Effective microphone: {}",
+        effective_microphone_name(config)
     );
     println!("GoXLR channel sinks:");
     for name in [
@@ -1790,11 +2051,8 @@ fn apply_profile(config: &Config, profile: Profile, dry_run: bool) -> Result<()>
                 .ok_or_else(|| anyhow!("no JDS sink is configured"))?;
             let jds = find_node(&snapshot, jds_name)?;
             run_or_print(dry_run, "pactl", &["set-default-sink", &jds.name])?;
-            run_or_print(
-                dry_run,
-                "pactl",
-                &["set-default-source", &config.profile.default_source],
-            )?;
+            let source = effective_microphone_node(config, &snapshot)?;
+            run_or_print(dry_run, "pactl", &["set-default-source", &source.name])?;
             Ok(())
         }
         Profile::Off => {
@@ -2074,7 +2332,11 @@ fn obs_source_plan(config: &Config) -> Vec<ObsSourcePlan> {
         .map(|source| ObsSourcePlan {
             name: source.name.clone(),
             input_kind: OBS_INPUT_KIND.to_string(),
-            device_id: source.device_id.clone(),
+            device_id: if source.name == "GoXLR Mic" {
+                effective_microphone_name(config)
+            } else {
+                source.device_id.clone()
+            },
         })
         .collect()
 }
@@ -2268,10 +2530,33 @@ fn validate_goxlr_status(config: &Config, status: &Value) -> Result<()> {
     Ok(())
 }
 
+fn effective_microphone_name(config: &Config) -> String {
+    if !config.processing.enable {
+        return config.profile.default_source.clone();
+    }
+    let client = ControlClient::new(default_control_socket());
+    match client.status() {
+        Ok(status) if status.daemon_running && status.healthy && status.active => {
+            status.processed_source
+        }
+        _ => config.profile.default_source.clone(),
+    }
+}
+
+fn effective_microphone_node(config: &Config, snapshot: &Snapshot) -> Result<Node> {
+    let name = effective_microphone_name(config);
+    find_node(snapshot, &name).or_else(|error| {
+        if name != config.profile.default_source {
+            eprintln!("warn: processed microphone is unavailable ({error:#}); using raw GoXLR mic");
+        }
+        find_node(snapshot, &config.profile.default_source)
+    })
+}
+
 fn required_nodes(config: &Config, snapshot: &Snapshot) -> Result<RequiredNodes> {
     Ok(RequiredNodes {
         outputs: output_nodes(config, snapshot)?,
-        default_source: find_node(snapshot, &config.profile.default_source)?,
+        default_source: effective_microphone_node(config, snapshot)?,
         monitor_source: find_node(snapshot, &config.profile.monitor_source)?,
     })
 }

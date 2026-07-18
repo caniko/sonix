@@ -2,9 +2,22 @@
 name = "goxlr-nexus"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.91"
 license = "MIT OR Apache-2.0"
 repository = "https://codeberg.org/caniko/goxlr-nexus"
 description = "GoXLR, JDS Labs DAC, PipeWire, and OBS audio orchestrator"
+readme = "README.md"
+documentation = "https://docs.rs/goxlr-nexus"
+keywords = ["audio", "pipewire", "goxlr"]
+categories = ["multimedia::audio"]
+include = ["src/**", "crates/**", "README.md", "CHANGELOG.md", "LICENSE*", "config.example.toml", "schemas/**", "Cargo.lock"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[workspace]
+resolver = "3"
+members = ["crates/nexus-audio-processing"]
 
 [[bin]]
 name = "goxlr-config"
@@ -12,6 +25,7 @@ path = "src/bin/goxlr-config.rs"
 
 [dependencies]
 anyhow = "1.0"
+nexus-audio-processing = { path = "crates/nexus-audio-processing", features = ["pipewire-runtime"] }
 base64 = "0.22"
 clap = { version = "4.5", features = ["derive"] }
 dirs = "6.0"

@@ -24,6 +24,12 @@ goxlr-nexus profile stream
 goxlr-nexus profile desktop
 goxlr-nexus obs sync --dry-run
 goxlr-nexus obs sync
+goxlr-nexus processing status
+goxlr-nexus processing noise on
+goxlr-nexus processing echo on
+goxlr-nexus processing noise off
+goxlr-nexus processing echo off
+goxlr-nexus processing reset
 ```
 
 `discover` is the human- and tooling-facing observation command. It reads the
@@ -57,6 +63,26 @@ profile.
 `obs sync` uses obs-websocket v5 to create or update dedicated GoXLR audio
 sources in the active OBS scene. It does not rewrite OBS global Desktop Audio or
 Mic/Aux devices.
+
+## Optional microphone processing
+
+The separate `goxlr-nexus-processing` user service publishes a 48 kHz stereo
+PipeWire virtual microphone backed by the `nexus-audio-processing` crate. The
+crate uses Sonora's current WebRTC noise suppression and AEC3 implementations;
+the render monitor is fed to AEC before the GoXLR capture is processed. Both
+stages are off by default, and state is persisted independently under the XDG
+state directory:
+
+```sh
+goxlr-nexus processing noise on
+goxlr-nexus processing echo on
+goxlr-nexus processing status --json
+```
+
+The routing controller selects the processed source only when the daemon is
+healthy and its virtual node is present. If the daemon, PipeWire node, or DSP
+fails, routing falls back to the configured raw GoXLR microphone; the service's
+stop hook also restores that raw source.
 
 ## Declarative GoXLR Utility artifacts
 

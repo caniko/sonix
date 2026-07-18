@@ -29,16 +29,19 @@
       };
       package = buildCache.withRustCache {
         package = pkgs.rustPlatform.buildRustPackage {
-        pname = manifest.name;
-        inherit (manifest) version;
-        src = ./.;
-        cargoLock.lockFile = ./Cargo.lock;
-        nativeBuildInputs = [pkgs.pkg-config];
-        meta = {
-          description = manifest.description;
-          homepage = "https://codeberg.org/caniko/goxlr-nexus";
-          mainProgram = "goxlr-nexus";
-        };
+          pname = manifest.name;
+          inherit (manifest) version;
+          src = ./.;
+          cargoLock.lockFile = ./Cargo.lock;
+          nativeBuildInputs = [pkgs.pkg-config pkgs.llvmPackages.libclang];
+          buildInputs = [pkgs.pipewire];
+          LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+          BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.glibc.dev}/include";
+          meta = {
+            description = manifest.description;
+            homepage = "https://codeberg.org/caniko/goxlr-nexus";
+            mainProgram = "goxlr-nexus";
+          };
         };
       };
     in {
@@ -63,6 +66,7 @@
           rustfmt
           pipewire
           pulseaudio
+          llvmPackages.libclang
           jq
         ];
       };

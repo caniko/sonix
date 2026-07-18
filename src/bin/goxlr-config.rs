@@ -4,7 +4,7 @@
 //! validated artifacts here.  This keeps the first declarative surface
 //! lossless while the upstream profile model evolves.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -185,8 +185,8 @@ fn discover(device: Option<&str>, json_output: bool) -> Result<()> {
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    let status: Value = serde_json::from_slice(&output.stdout)
-        .context("goxlr-client returned invalid JSON")?;
+    let status: Value =
+        serde_json::from_slice(&output.stdout).context("goxlr-client returned invalid JSON")?;
     let observation = Observation {
         schema: OBSERVATION_SCHEMA,
         device: device.map(str::to_owned),
@@ -254,16 +254,25 @@ fn validate_manifest(manifest: &Manifest) -> Result<()> {
     let mut targets = BTreeSet::new();
     for file in &manifest.files {
         if file.path.is_empty() || Path::new(&file.path).is_absolute() {
-            bail!("manifest path must be non-empty and relative: {}", file.path);
+            bail!(
+                "manifest path must be non-empty and relative: {}",
+                file.path
+            );
         }
         if !file.source.is_file() {
             bail!("manifest source does not exist: {}", file.source.display());
         }
         if !file.target.is_absolute() {
-            bail!("manifest target must be absolute: {}", file.target.display());
+            bail!(
+                "manifest target must be absolute: {}",
+                file.target.display()
+            );
         }
         if !targets.insert(file.target.clone()) {
-            bail!("manifest contains duplicate target: {}", file.target.display());
+            bail!(
+                "manifest contains duplicate target: {}",
+                file.target.display()
+            );
         }
     }
     Ok(())
@@ -397,7 +406,11 @@ fn print_plan(plan: &Plan, json_output: bool) -> Result<()> {
         return Ok(());
     }
     if plan.requires_apply {
-        println!("{}: {} file(s) require reconciliation", plan.schema, changed_files(plan));
+        println!(
+            "{}: {} file(s) require reconciliation",
+            plan.schema,
+            changed_files(plan)
+        );
         for file in &plan.files {
             if file.status != FileStatus::Same {
                 println!("{:?} {}", file.status, file.path);

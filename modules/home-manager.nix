@@ -41,7 +41,11 @@
     ${lib.optionalString (cfg.thinkpadSink != null) ''thinkpad-sink = "${cfg.thinkpadSink}"''}
     ${lib.optionalString (cfg.goxlrSerial != null) ''goxlr-serial = "${cfg.goxlrSerial}"''}
     ${lib.optionalString (cfg.maxMonitorSinkVolume != null) ''max-monitor-sink-volume = ${toString cfg.maxMonitorSinkVolume}''}
-    observe-only = ${if cfg.observeOnly then "true" else "false"}
+    observe-only = ${
+      if cfg.observeOnly
+      then "true"
+      else "false"
+    }
 
     [obs]
     enable = ${
@@ -53,6 +57,27 @@
     port = ${toString cfg.obs.port}
     ${lib.optionalString (cfg.obs.passwordFile != null) "password-file = \"${cfg.obs.passwordFile}\""}
     ${obsSourceToml}
+
+    [processing]
+    enable = ${
+      if cfg.processing.enable
+      then "true"
+      else "false"
+    }
+    source-name = "${cfg.processing.sourceName}"
+    source-description = "${cfg.processing.sourceDescription}"
+    noise-suppression = ${
+      if cfg.processing.noiseSuppression
+      then "true"
+      else "false"
+    }
+    echo-cancellation = ${
+      if cfg.processing.echoCancellation
+      then "true"
+      else "false"
+    }
+    noise-level = "${cfg.processing.noiseLevel}"
+    ${lib.optionalString (cfg.processing.echoDelayMs != null) ''echo-delay = { mode = "fixed", milliseconds = ${toString cfg.processing.echoDelayMs} }''}
   '';
 in {
   options.programs.goxlr-nexus = {
@@ -102,6 +127,38 @@ in {
       type = types.bool;
       default = false;
       description = "Observe and report routing drift without applying audio mutations.";
+    };
+    processing = {
+      enable = mkOption {
+        type = types.bool;
+        default = true;
+        description = "Run the separate user-level PipeWire processing service.";
+      };
+      sourceName = mkOption {
+        type = types.str;
+        default = "goxlr_nexus.processed_mic";
+      };
+      sourceDescription = mkOption {
+        type = types.str;
+        default = "GoXLR Nexus processed microphone";
+      };
+      noiseSuppression = mkOption {
+        type = types.bool;
+        default = false;
+      };
+      echoCancellation = mkOption {
+        type = types.bool;
+        default = false;
+      };
+      noiseLevel = mkOption {
+        type = types.enum ["low" "moderate" "high" "very-high"];
+        default = "high";
+      };
+      echoDelayMs = mkOption {
+        type = types.nullOr types.ints.between 0 500;
+        default = null;
+        description = "Optional fixed AEC delay in milliseconds; null selects automatic timing.";
+      };
     };
     obs = {
       enable = mkEnableOption "OBS websocket synchronization";
@@ -184,8 +241,12 @@ in {
     systemd.user.services.goxlr-nexus = {
       Unit = {
         Description = "GoXLR Nexus audio routing repair";
-        After = ["pipewire.service" "pipewire-pulse.service" "wireplumber.service" goxlrDaemonUnit];
-        Wants = ["pipewire.service" "pipewire-pulse.service" "wireplumber.service" goxlrDaemonUnit];
+        After =
+          ["pipewire.service" "pipewire-pulse.service" "wireplumber.service" goxlrDaemonUnit]
+          ++ lib.optional cfg.processing.enable "goxlr-nexus-processing.service";
+        Wants =
+          ["pipewire.service" "pipewire-pulse.service" "wireplumber.service" goxlrDaemonUnit]
+          ++ lib.optional cfg.processing.enable "goxlr-nexus-processing.service";
         PartOf = ["pipewire.service" "pipewire-pulse.service" "wireplumber.service"];
         StartLimitIntervalSec = 300;
         StartLimitBurst = 20;
@@ -211,6 +272,28 @@ in {
         TimeoutStopSec = 10;
         LogRateLimitIntervalSec = 30;
         LogRateLimitBurst = 100;
+      };
+      Install.WantedBy = ["default.target"];
+    };
+    systemd.user.services.goxlr-nexus-processing = lib.mkIf cfg.processing.enable {
+      Unit = {
+        Description = "GoXLR Nexus noise suppression and echo cancellation";
+        After = ["pipewire.service" "pipewire-pulse.service" "wireplumber.service"];
+        Wants = ["pipewire.service" "pipewire-pulse.service" "wireplumber.service"];
+        PartOf = ["pipewire.service" "pipewire-pulse.service" "wireplumber.service"];
+      };
+      Service = {
+        Type = "simple";
+        Environment = "PATH=${servicePath}";
+        ExecStart = "${package}/bin/goxlr-nexus --config ${configFile} processing daemon";
+        ExecStopPost = "${package}/bin/goxlr-nexus --config ${configFile} processing fail-open";
+        Restart = "on-failure";
+        RestartSec = 2;
+        CPUQuota = "35%";
+        MemoryHigh = "128M";
+        MemoryMax = "256M";
+        TasksMax = 64;
+        TimeoutStopSec = 10;
       };
       Install.WantedBy = ["default.target"];
     };
