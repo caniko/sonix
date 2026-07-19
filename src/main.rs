@@ -905,7 +905,13 @@ fn print_adoption(report: &AdoptionReport) {
 }
 
 fn nix_quote(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace("${", "\\${")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
 }
 
 fn pipewire_node(node: Node) -> PipewireNode {
@@ -2535,7 +2541,7 @@ fn parse_pw_graph_with_properties(bytes: &[u8], include_properties: bool) -> Res
                     BTreeMap::new()
                 };
                 graph.nodes.push(Node {
-                    id: item.get("id").and_then(Value::as_u64).unwrap_or_default() as u32,
+                    id: checked_pipewire_id(item.get("id"), "node id")?,
                     name: name.to_string(),
                     description: props
                         .get("node.description")
@@ -2566,8 +2572,9 @@ fn parse_pw_graph_with_properties(bytes: &[u8], include_properties: bool) -> Res
                     continue;
                 };
                 graph.ports.push(Port {
-                    id: item.get("id").and_then(Value::as_u64).unwrap_or_default() as u32,
-                    node_id: node_id as u32,
+                    id: checked_pipewire_id(item.get("id"), "port id")?,
+                    node_id: u32::try_from(node_id)
+                        .with_context(|| format!("PipeWire port node id {node_id} exceeds u32"))?,
                     direction: info
                         .get("direction")
                         .and_then(Value::as_str)
@@ -2600,11 +2607,19 @@ fn parse_pw_graph_with_properties(bytes: &[u8], include_properties: bool) -> Res
                     continue;
                 };
                 graph.links.push(Link {
-                    id: item.get("id").and_then(Value::as_u64).unwrap_or_default() as u32,
-                    output_node_id: output_node_id as u32,
-                    output_port_id: output_port_id as u32,
-                    input_node_id: input_node_id as u32,
-                    input_port_id: input_port_id as u32,
+                    id: checked_pipewire_id(item.get("id"), "link id")?,
+                    output_node_id: u32::try_from(output_node_id).with_context(|| {
+                        format!("PipeWire link output node id {output_node_id} exceeds u32")
+                    })?,
+                    output_port_id: u32::try_from(output_port_id).with_context(|| {
+                        format!("PipeWire link output port id {output_port_id} exceeds u32")
+                    })?,
+                    input_node_id: u32::try_from(input_node_id).with_context(|| {
+                        format!("PipeWire link input node id {input_node_id} exceeds u32")
+                    })?,
+                    input_port_id: u32::try_from(input_port_id).with_context(|| {
+                        format!("PipeWire link input port id {input_port_id} exceeds u32")
+                    })?,
                     state: info
                         .get("state")
                         .and_then(Value::as_str)
@@ -2615,6 +2630,14 @@ fn parse_pw_graph_with_properties(bytes: &[u8], include_properties: bool) -> Res
         }
     }
     Ok(graph)
+}
+
+fn checked_pipewire_id(value: Option<&Value>, field: &str) -> Result<u32> {
+    let value = value
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("PipeWire object is missing numeric {field}"))?;
+    u32::try_from(value)
+        .with_context(|| format!("PipeWire {field} {value} exceeds the supported u32 range"))
 }
 
 fn goxlr_status() -> Result<Value> {
@@ -2825,7 +2848,7 @@ mod tests {
     #[test]
     fn parses_pipewire_nodes() {
         let json = br#"[
-          {"type":"PipeWire:Interface:Node","info":{"props":{
+          {"id": 1, "type":"PipeWire:Interface:Node","info":{"props":{
             "node.name":"alsa_output.usb-TC-Helicon_GoXLR-00.HiFi__Speaker__sink",
             "node.description":"GoXLR System",
             "media.class":"Audio/Sink"
@@ -2856,6 +2879,23 @@ mod tests {
         assert_eq!(graph.ports[0].channel.as_deref(), Some("FL"));
         assert_eq!(graph.links.len(), 1);
         assert_eq!(graph.links[0].output_port_id, 11);
+    }
+
+    #[test]
+    fn rejects_pipewire_ids_that_do_not_fit_internal_types() {
+        let json = br#"[
+          {"id": 4294967296, "type":"PipeWire:Interface:Node","info":{"props":{"node.name":"source","media.class":"Audio/Source"}}}
+        ]"#;
+        let error = parse_pw_graph(json).unwrap_err();
+        assert!(error.to_string().contains("node id"));
+    }
+
+    #[test]
+    fn escapes_nix_interpolation_in_adoption_output() {
+        assert_eq!(
+            nix_quote("sink${builtins.abort \"x\"}\nnext"),
+            "sink\\${builtins.abort \\\"x\\\"}\\nnext"
+        );
     }
 
     #[test]

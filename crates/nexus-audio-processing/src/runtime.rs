@@ -112,6 +112,7 @@ impl ProcessingRuntime {
             }
         });
         let effective = state.processing(&defaults);
+        let initially_active = effective.active();
         let status = RuntimeStatus {
             schema_version: SCHEMA_VERSION,
             daemon_running: true,
@@ -149,6 +150,12 @@ impl ProcessingRuntime {
             worker: OnceLock::new(),
             status: Mutex::new(status),
         });
+
+        // Publish the initial state before either worker can report a failure.
+        // Setting this after spawning the threads could overwrite a bind or
+        // processor-construction error with a misleading healthy status.
+        shared.healthy.store(true, Ordering::Release);
+        shared.active.store(initially_active, Ordering::Release);
 
         pw::init();
         let main_loop = pw::main_loop::MainLoopRc::new(None)?;
@@ -223,15 +230,6 @@ impl ProcessingRuntime {
             .spawn(move || processing_worker(worker_shared, worker_format))
             .map_err(RuntimeError::Io)?;
 
-        shared.healthy.store(true, Ordering::Release);
-        shared.active.store(
-            shared
-                .config
-                .lock()
-                .map(|config| config.active())
-                .unwrap_or(false),
-            Ordering::Release,
-        );
         main_loop.run();
         shared.stop.store(true, Ordering::Release);
         wake_control_server(&socket_path);
@@ -395,7 +393,7 @@ fn make_output_stream<'a>(
                     .iter_mut()
                     .zip(data.pending.iter().take(written))
                 {
-                    chunk.copy_from_slice(&sample.to_ne_bytes());
+                    chunk.copy_from_slice(&sample.to_le_bytes());
                 }
                 for chunk in bytes.as_chunks_mut::<4>().0.iter_mut().skip(written) {
                     chunk.fill(0);
@@ -423,7 +421,7 @@ fn make_output_stream<'a>(
 fn enqueue_input_frames(data: &mut StreamData, bytes: &[u8]) {
     let expected = data.format.frame_samples() * data.format.channels as usize;
     for chunk in bytes.as_chunks::<4>().0 {
-        data.pending.push(f32::from_ne_bytes(*chunk));
+        data.pending.push(f32::from_le_bytes(*chunk));
         if data.pending.len() == expected {
             let queue = match data.role {
                 StreamRole::Render => &data.shared.render,
@@ -596,8 +594,8 @@ fn control_server(path: &Path, shared: Arc<SharedRuntime>) {
             let _ = fs::create_dir_all(parent);
             let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
         }
-        if path.exists() {
-            let _ = fs::remove_file(path);
+        if !prepare_control_socket(path, &shared) {
+            return;
         }
         let Ok(listener) = UnixListener::bind(path) else {
             mark_unhealthy(
@@ -614,7 +612,18 @@ fn control_server(path: &Path, shared: Arc<SharedRuntime>) {
             match listener.accept() {
                 Ok((stream, _)) => {
                     if let Err(error) = handle_control(stream, &shared) {
-                        mark_unhealthy(&shared, error.to_string());
+                        if matches!(
+                            &error,
+                            RuntimeError::ConfigLockPoisoned
+                                | RuntimeError::Config(_)
+                                | RuntimeError::State(_)
+                                | RuntimeError::Dsp(_)
+                                | RuntimeError::PipeWire(_)
+                        ) {
+                            mark_unhealthy(&shared, error.to_string());
+                        } else {
+                            eprintln!("warn: rejected processing control request: {error}");
+                        }
                     }
                 }
                 Err(_) => break,
@@ -626,6 +635,76 @@ fn control_server(path: &Path, shared: Arc<SharedRuntime>) {
     {
         let _ = (path, shared);
     }
+}
+
+#[cfg(unix)]
+fn prepare_control_socket(path: &Path, shared: &SharedRuntime) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    use std::os::unix::net::UnixStream;
+
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
+        Err(error) => {
+            mark_unhealthy(
+                shared,
+                format!("cannot inspect control socket {}: {error}", path.display()),
+            );
+            return false;
+        }
+    };
+    if !metadata.file_type().is_socket() {
+        mark_unhealthy(
+            shared,
+            format!(
+                "control socket path exists and is not a Unix socket: {}",
+                path.display()
+            ),
+        );
+        return false;
+    }
+
+    match UnixStream::connect(path) {
+        Ok(_) => {
+            mark_unhealthy(
+                shared,
+                format!("control socket is already in use: {}", path.display()),
+            );
+            false
+        }
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            ) =>
+        {
+            match fs::remove_file(path) {
+                Ok(()) => true,
+                Err(error) => {
+                    mark_unhealthy(
+                        shared,
+                        format!(
+                            "cannot remove stale control socket {}: {error}",
+                            path.display()
+                        ),
+                    );
+                    false
+                }
+            }
+        }
+        Err(error) => {
+            mark_unhealthy(
+                shared,
+                format!("cannot probe control socket {}: {error}", path.display()),
+            );
+            false
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn prepare_control_socket(_path: &Path, _shared: &SharedRuntime) -> bool {
+    true
 }
 
 #[cfg(unix)]
@@ -709,32 +788,8 @@ fn apply_command(
     shared: &Arc<SharedRuntime>,
 ) -> Result<(), RuntimeError> {
     match command {
-        ControlCommand::SetNoise { enabled } => {
-            let state = shared
-                .state_store
-                .set(Toggle::Noise, *enabled, &shared.defaults)?;
-            *shared
-                .config
-                .lock()
-                .map_err(|_| RuntimeError::ConfigLockPoisoned)? =
-                state.processing(&shared.defaults);
-            shared.config_revision.fetch_add(1, Ordering::Release);
-            wake_worker(shared);
-            update_status_from_state(shared, &state);
-        }
-        ControlCommand::SetEcho { enabled } => {
-            let state = shared
-                .state_store
-                .set(Toggle::Echo, *enabled, &shared.defaults)?;
-            *shared
-                .config
-                .lock()
-                .map_err(|_| RuntimeError::ConfigLockPoisoned)? =
-                state.processing(&shared.defaults);
-            shared.config_revision.fetch_add(1, Ordering::Release);
-            wake_worker(shared);
-            update_status_from_state(shared, &state);
-        }
+        ControlCommand::SetNoise { enabled } => apply_toggle(shared, Toggle::Noise, *enabled)?,
+        ControlCommand::SetEcho { enabled } => apply_toggle(shared, Toggle::Echo, *enabled)?,
         ControlCommand::Reset => {
             let state = shared.state_store.reset(&shared.defaults)?;
             *shared
@@ -748,6 +803,22 @@ fn apply_command(
         }
         ControlCommand::Status => {}
     }
+    Ok(())
+}
+
+fn apply_toggle(
+    shared: &Arc<SharedRuntime>,
+    toggle: Toggle,
+    enabled: bool,
+) -> Result<(), RuntimeError> {
+    let state = shared.state_store.set(toggle, enabled, &shared.defaults)?;
+    *shared
+        .config
+        .lock()
+        .map_err(|_| RuntimeError::ConfigLockPoisoned)? = state.processing(&shared.defaults);
+    shared.config_revision.fetch_add(1, Ordering::Release);
+    wake_worker(shared);
+    update_status_from_state(shared, &state);
     Ok(())
 }
 
