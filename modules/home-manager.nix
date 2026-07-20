@@ -158,7 +158,7 @@ in {
         default = "high";
       };
       echoDelayMs = mkOption {
-        type = types.nullOr types.ints.between 0 500;
+        type = types.nullOr (types.ints.between 0 500);
         default = null;
         description = "Optional fixed AEC delay in milliseconds; null selects automatic timing.";
       };
