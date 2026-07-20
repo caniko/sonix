@@ -2,7 +2,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
 
 use crossbeam_queue::ArrayQueue;
@@ -51,6 +51,18 @@ pub enum RuntimeError {
     /// The runtime configuration lock was poisoned by a failed worker.
     #[error("processing runtime configuration lock is poisoned")]
     ConfigLockPoisoned,
+    /// A frame pool could not be initialized to its fixed capacity.
+    #[error("processing frame pool initialization failed")]
+    FramePoolFull,
+    /// A runtime worker thread panicked during shutdown.
+    #[error("processing runtime thread {0} panicked")]
+    ThreadPanicked(&'static str),
+    /// A secure default state or runtime directory was not available.
+    #[error("cannot resolve runtime paths: {0}")]
+    DefaultPath(#[from] crate::state::DefaultPathError),
+    /// The control server could not bind its private socket during startup.
+    #[error("processing control server failed to start: {0}")]
+    ControlServer(String),
 }
 
 #[derive(Debug)]
@@ -84,32 +96,30 @@ impl ProcessingRuntime {
     /// Creates a runtime from explicit configuration and persistent state.
     pub fn new(mut config: RuntimeConfig) -> Result<Self, RuntimeError> {
         config.validate()?;
-        if config.state_path.is_none() {
-            config.state_path = Some(default_state_path());
+        if config.state_path().is_none() {
+            config = config.with_state_path(default_state_path()?);
         }
-        if config.control_socket.is_none() {
-            config.control_socket = Some(default_control_socket());
+        if config.control_socket().is_none() {
+            config = config.with_control_socket(default_control_socket()?);
         }
         Ok(Self { config })
     }
 
     /// Runs the runtime until PipeWire or the process exits.
     pub fn run(self) -> Result<(), RuntimeError> {
-        let state_store = StateStore::new(
-            self.config
-                .state_path
-                .clone()
-                .unwrap_or_else(default_state_path),
-        );
-        let defaults = self.config.processing.clone();
+        let format = self.config.format();
+        let source = self.config.source();
+        let state_defaults = self.config.processing().clone();
+        let state_path = self
+            .config
+            .state_path()
+            .map(Path::to_path_buf)
+            .ok_or(crate::state::DefaultPathError::StateDirectory)?;
+        let state_store = StateStore::new(state_path);
+        let defaults = state_defaults;
         let state = state_store.load(&defaults).unwrap_or_else(|error| {
-            eprintln!("warn: ignoring invalid processing state: {error}");
-            crate::state::StateSnapshot {
-                noise_suppression: defaults.noise_suppression,
-                echo_cancellation: defaults.echo_cancellation,
-                noise_persisted: false,
-                echo_persisted: false,
-            }
+            tracing::warn!(error = %error, "ignoring invalid processing state");
+            crate::state::StateSnapshot::from_defaults(&defaults)
         });
         let effective = state.processing(&defaults);
         let initially_active = effective.active();
@@ -118,14 +128,14 @@ impl ProcessingRuntime {
             daemon_running: true,
             healthy: false,
             active: false,
-            noise_suppression: state.noise_suppression,
-            echo_cancellation: state.echo_cancellation,
-            noise_persisted: state.noise_persisted,
-            echo_persisted: state.echo_persisted,
-            processed_source: self.config.source.source_name.clone(),
-            capture_source: self.config.source.capture_source.clone(),
-            render_target: self.config.source.render_target.clone(),
-            format: self.config.format,
+            noise_suppression: state.noise_suppression(),
+            echo_cancellation: state.echo_cancellation(),
+            noise_persisted: state.noise_persisted(),
+            echo_persisted: state.echo_persisted(),
+            processed_source: source.source_name().to_owned(),
+            capture_source: source.capture_source().to_owned(),
+            render_target: source.render_target().to_owned(),
+            format,
             delay_ms: effective.processing_delay_ms(),
             retries: 0,
             dropped_frames: 0,
@@ -138,9 +148,9 @@ impl ProcessingRuntime {
             render: ArrayQueue::new(QUEUE_CAPACITY),
             capture: ArrayQueue::new(QUEUE_CAPACITY),
             output: ArrayQueue::new(QUEUE_CAPACITY),
-            render_free: frame_pool(self.config.format),
-            capture_free: frame_pool(self.config.format),
-            output_free: frame_pool(self.config.format),
+            render_free: frame_pool(format)?,
+            capture_free: frame_pool(format)?,
+            output_free: frame_pool(format)?,
             stop: AtomicBool::new(false),
             config_revision: AtomicU64::new(0),
             retries: AtomicU64::new(0),
@@ -161,7 +171,7 @@ impl ProcessingRuntime {
         let main_loop = pw::main_loop::MainLoopRc::new(None)?;
         let context = pw::context::ContextRc::new(&main_loop, None)?;
         let core = context.connect_rc(None)?;
-        let params = audio_params(self.config.format)?;
+        let params = audio_params(format)?;
 
         let render = make_input_stream(
             &core,
@@ -171,10 +181,10 @@ impl ProcessingRuntime {
                     *pw::keys::MEDIA_TYPE => "Audio",
                     *pw::keys::MEDIA_CATEGORY => "Capture",
                     *pw::keys::MEDIA_ROLE => "Communication",
-                    "target.object" => self.config.source.render_target.as_str(),
+                    "target.object" => source.render_target(),
                     *pw::keys::STREAM_CAPTURE_SINK => "true",
                 },
-                format: self.config.format,
+                format,
                 shared: Arc::clone(&shared),
                 role: StreamRole::Render,
                 params: params.bytes.clone(),
@@ -188,9 +198,9 @@ impl ProcessingRuntime {
                     *pw::keys::MEDIA_TYPE => "Audio",
                     *pw::keys::MEDIA_CATEGORY => "Capture",
                     *pw::keys::MEDIA_ROLE => "Communication",
-                    "target.object" => self.config.source.capture_source.as_str(),
+                    "target.object" => source.capture_source(),
                 },
-                format: self.config.format,
+                format,
                 shared: Arc::clone(&shared),
                 role: StreamRole::Capture,
                 params: params.bytes.clone(),
@@ -204,53 +214,81 @@ impl ProcessingRuntime {
                 *pw::keys::MEDIA_CATEGORY => "Capture",
                 *pw::keys::MEDIA_ROLE => "Communication",
                 *pw::keys::MEDIA_CLASS => "Audio/Source",
-                *pw::keys::NODE_NAME => self.config.source.source_name.as_str(),
-                *pw::keys::NODE_DESCRIPTION => self.config.source.source_description.as_str(),
+                *pw::keys::NODE_NAME => source.source_name(),
+                *pw::keys::NODE_DESCRIPTION => source.source_description(),
             },
-            self.config.format,
+            format,
             Arc::clone(&shared),
             &params,
         )?;
 
         let socket_path = self
             .config
-            .control_socket
-            .unwrap_or_else(default_control_socket);
+            .control_socket()
+            .map(Path::to_path_buf)
+            .ok_or(crate::state::DefaultPathError::RuntimeDirectory)?;
         let server_socket_path = socket_path.clone();
         let server_shared = Arc::clone(&shared);
+        let (server_ready, server_started) = mpsc::sync_channel(1);
         let server = thread::Builder::new()
             .name("nexus-processing-control".into())
-            .spawn(move || control_server(&server_socket_path, server_shared))
+            .spawn(move || control_server(&server_socket_path, server_shared, server_ready))
             .map_err(RuntimeError::Io)?;
+        match server_started.recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                shared.stop.store(true, Ordering::Release);
+                let _ = server.join();
+                return Err(RuntimeError::ControlServer(error));
+            }
+            Err(error) => {
+                shared.stop.store(true, Ordering::Release);
+                let _ = server.join();
+                return Err(RuntimeError::ControlServer(error.to_string()));
+            }
+        }
 
         let worker_shared = Arc::clone(&shared);
-        let worker_format = self.config.format;
-        let worker = thread::Builder::new()
+        let worker_format = format;
+        let worker = match thread::Builder::new()
             .name("nexus-audio-dsp".into())
             .spawn(move || processing_worker(worker_shared, worker_format))
-            .map_err(RuntimeError::Io)?;
+        {
+            Ok(worker) => worker,
+            Err(error) => {
+                shared.stop.store(true, Ordering::Release);
+                wake_control_server(&socket_path);
+                server
+                    .join()
+                    .map_err(|_| RuntimeError::ThreadPanicked("control server"))?;
+                return Err(RuntimeError::Io(error));
+            }
+        };
 
         main_loop.run();
         shared.stop.store(true, Ordering::Release);
         wake_control_server(&socket_path);
         shared.worker.get().map(thread::Thread::unpark);
-        let _ = worker.join();
         drop(source);
         drop(capture);
         drop(render);
-        let _ = server.join();
+        worker
+            .join()
+            .map_err(|_| RuntimeError::ThreadPanicked("dsp worker"))?;
+        server
+            .join()
+            .map_err(|_| RuntimeError::ThreadPanicked("control server"))?;
         Ok(())
     }
 }
 
-fn frame_pool(format: crate::StreamFormat) -> ArrayQueue<AudioFrame> {
+fn frame_pool(format: crate::StreamFormat) -> Result<ArrayQueue<AudioFrame>, RuntimeError> {
     let pool = ArrayQueue::new(QUEUE_CAPACITY);
     for _ in 0..QUEUE_CAPACITY {
-        // The queue starts empty and this loop runs exactly to its capacity.
         pool.push(AudioFrame::silence(format))
-            .expect("new frame pool has capacity");
+            .map_err(|_| RuntimeError::FramePoolFull)?;
     }
-    pool
+    Ok(pool)
 }
 
 impl ProcessingConfig {
@@ -301,7 +339,7 @@ fn make_input_stream<'a>(
             role: spec.role,
             shared: spec.shared,
             pending: Vec::with_capacity(
-                spec.format.frame_samples() * spec.format.channels as usize,
+                spec.format.frame_samples() * spec.format.channels() as usize,
             ),
             scratch: Vec::new(),
         })
@@ -327,7 +365,7 @@ fn make_input_stream<'a>(
         })
         .register()?;
     let params = AudioParams { bytes: spec.params };
-    let mut param_refs = params.pod_refs();
+    let mut param_refs = params.pod_refs()?;
     stream.connect(
         spa::utils::Direction::Input,
         None,
@@ -359,8 +397,8 @@ fn make_output_stream<'a>(
             format,
             role: StreamRole::Output,
             shared,
-            pending: Vec::with_capacity(format.frame_samples() * format.channels as usize * 4),
-            scratch: vec![0.0; format.frame_samples() * format.channels as usize],
+            pending: Vec::with_capacity(format.frame_samples() * format.channels() as usize * 4),
+            scratch: vec![0.0; format.frame_samples() * format.channels() as usize],
         })
         .process(|stream, data| {
             let Some(mut buffer) = stream.dequeue_buffer() else {
@@ -376,7 +414,7 @@ fn make_output_stream<'a>(
                     let Some(frame) = data.shared.output.pop() else {
                         break;
                     };
-                    let expected = data.format.frame_samples() * data.format.channels as usize;
+                    let expected = data.format.frame_samples() * data.format.channels() as usize;
                     let written = data.pending.len() + expected <= data.pending.capacity();
                     if written {
                         frame.write_interleaved_unchecked(&mut data.scratch);
@@ -406,7 +444,7 @@ fn make_output_stream<'a>(
             }
         })
         .register()?;
-    let mut param_refs = params.pod_refs();
+    let mut param_refs = params.pod_refs()?;
     stream.connect(
         spa::utils::Direction::Output,
         None,
@@ -419,7 +457,7 @@ fn make_output_stream<'a>(
 }
 
 fn enqueue_input_frames(data: &mut StreamData, bytes: &[u8]) {
-    let expected = data.format.frame_samples() * data.format.channels as usize;
+    let expected = data.format.frame_samples() * data.format.channels() as usize;
     for chunk in bytes.as_chunks::<4>().0 {
         data.pending.push(f32::from_le_bytes(*chunk));
         if data.pending.len() == expected {
@@ -458,18 +496,22 @@ struct AudioParams {
 }
 
 impl AudioParams {
-    fn pod_refs(&self) -> Vec<&Pod> {
-        // `bytes` is produced by `audio_params`; only an internal invariant
-        // violation can make the serialized PipeWire pod invalid here.
-        vec![Pod::from_bytes(&self.bytes).expect("serialized audio params")]
+    fn pod_refs(&self) -> Result<Vec<&Pod>, RuntimeError> {
+        let pod = Pod::from_bytes(&self.bytes).ok_or_else(|| {
+            RuntimeError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "serialized PipeWire audio parameters are invalid",
+            ))
+        })?;
+        Ok(vec![pod])
     }
 }
 
 fn audio_params(format: crate::StreamFormat) -> Result<AudioParams, RuntimeError> {
     let mut audio = spa::param::audio::AudioInfoRaw::new();
     audio.set_format(spa::param::audio::AudioFormat::F32LE);
-    audio.set_rate(format.sample_rate_hz);
-    audio.set_channels(format.channels.into());
+    audio.set_rate(format.sample_rate_hz());
+    audio.set_channels(format.channels().into());
     let object = pw::spa::pod::Object {
         type_: pw::spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
         id: pw::spa::param::ParamType::EnumFormat.as_raw(),
@@ -584,7 +626,11 @@ fn wake_worker(shared: &SharedRuntime) {
     }
 }
 
-fn control_server(path: &Path, shared: Arc<SharedRuntime>) {
+fn control_server(
+    path: &Path,
+    shared: Arc<SharedRuntime>,
+    ready: mpsc::SyncSender<Result<(), String>>,
+) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -595,16 +641,23 @@ fn control_server(path: &Path, shared: Arc<SharedRuntime>) {
             let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
         }
         if !prepare_control_socket(path, &shared) {
+            let _ = ready.send(Err(format!(
+                "cannot prepare control socket {}",
+                path.display()
+            )));
             return;
         }
-        let Ok(listener) = UnixListener::bind(path) else {
-            mark_unhealthy(
-                &shared,
-                format!("cannot bind control socket {}", path.display()),
-            );
-            return;
+        let listener = match UnixListener::bind(path) {
+            Ok(listener) => listener,
+            Err(error) => {
+                let diagnostic = format!("cannot bind control socket {}: {error}", path.display());
+                mark_unhealthy(&shared, diagnostic.clone());
+                let _ = ready.send(Err(diagnostic));
+                return;
+            }
         };
         let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+        let _ = ready.send(Ok(()));
         loop {
             if shared.stop.load(Ordering::Acquire) {
                 break;
@@ -622,7 +675,7 @@ fn control_server(path: &Path, shared: Arc<SharedRuntime>) {
                         ) {
                             mark_unhealthy(&shared, error.to_string());
                         } else {
-                            eprintln!("warn: rejected processing control request: {error}");
+                            tracing::warn!(error = %error, "rejected processing control request");
                         }
                     }
                 }
@@ -634,6 +687,7 @@ fn control_server(path: &Path, shared: Arc<SharedRuntime>) {
     #[cfg(not(unix))]
     {
         let _ = (path, shared);
+        let _ = ready.send(Err("control IPC is only supported on Unix".into()));
     }
 }
 
@@ -824,14 +878,14 @@ fn apply_toggle(
 
 fn update_status_from_state(shared: &Arc<SharedRuntime>, state: &crate::state::StateSnapshot) {
     shared.active.store(
-        state.noise_suppression || state.echo_cancellation,
+        state.noise_suppression() || state.echo_cancellation(),
         Ordering::Release,
     );
     if let Ok(mut status) = shared.status.lock() {
-        status.noise_suppression = state.noise_suppression;
-        status.echo_cancellation = state.echo_cancellation;
-        status.noise_persisted = state.noise_persisted;
-        status.echo_persisted = state.echo_persisted;
+        status.noise_suppression = state.noise_suppression();
+        status.echo_cancellation = state.echo_cancellation();
+        status.noise_persisted = state.noise_persisted();
+        status.echo_persisted = state.echo_persisted();
     }
 }
 

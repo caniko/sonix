@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::Error as DeserializeError};
 use thiserror::Error;
 
 /// The schema version used by persisted processor state and runtime status.
@@ -32,26 +32,37 @@ pub enum ConfigError {
         /// Configuration field containing the empty node identity.
         field: &'static str,
     },
+    /// The published virtual source description is empty.
+    #[error("source description must not be empty")]
+    EmptySourceDescription,
 }
 
 /// A PCM stream format accepted by the processing core.
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Serialize,
-    Deserialize,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
 )]
 pub struct StreamFormat {
     /// Samples per second.
-    pub sample_rate_hz: u32,
+    sample_rate_hz: u32,
     /// Number of interleaved input channels (the DSP deinterleaves them).
-    pub channels: u16,
+    channels: u16,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawStreamFormat {
+    sample_rate_hz: u32,
+    channels: u16,
+}
+
+impl<'de> Deserialize<'de> for StreamFormat {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = RawStreamFormat::deserialize(deserializer)?;
+        Self::new(raw.sample_rate_hz, raw.channels).map_err(DeserializeError::custom)
+    }
 }
 
 impl StreamFormat {
@@ -75,6 +86,16 @@ impl StreamFormat {
     /// The number of samples in one ten-millisecond frame per channel.
     pub const fn frame_samples(self) -> usize {
         (self.sample_rate_hz / 100) as usize
+    }
+
+    /// Returns the samples-per-second rate.
+    pub const fn sample_rate_hz(self) -> u32 {
+        self.sample_rate_hz
+    }
+
+    /// Returns the number of interleaved channels.
+    pub const fn channels(self) -> u16 {
+        self.channels
     }
 }
 
@@ -125,7 +146,7 @@ impl EchoDelay {
 
 /// Feature switches and DSP settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, rename_all = "kebab-case")]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct ProcessingConfig {
     /// Whether noise suppression is requested.
     pub noise_suppression: bool,
@@ -156,17 +177,109 @@ impl ProcessingConfig {
 }
 
 /// PipeWire node names and the published virtual source identity.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, rename_all = "kebab-case")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct VirtualSourceConfig {
     /// Raw capture node used as the near-end input.
-    pub capture_source: String,
+    capture_source: String,
     /// Playback sink whose monitor is used as the far-end reference.
-    pub render_target: String,
+    render_target: String,
     /// Name exposed to applications for processed microphone capture.
-    pub source_name: String,
+    source_name: String,
     /// Human-readable description of the virtual source.
-    pub source_description: String,
+    source_description: String,
+}
+
+#[derive(Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+struct RawVirtualSourceConfig {
+    capture_source: String,
+    render_target: String,
+    source_name: String,
+    source_description: String,
+}
+
+impl Default for RawVirtualSourceConfig {
+    fn default() -> Self {
+        let source = VirtualSourceConfig::default();
+        Self {
+            capture_source: source.capture_source,
+            render_target: source.render_target,
+            source_name: source.source_name,
+            source_description: source.source_description,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for VirtualSourceConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = RawVirtualSourceConfig::deserialize(deserializer)?;
+        Self::new(
+            raw.capture_source,
+            raw.render_target,
+            raw.source_name,
+            raw.source_description,
+        )
+        .map_err(DeserializeError::custom)
+    }
+}
+
+impl VirtualSourceConfig {
+    /// Creates a validated virtual-source configuration.
+    pub fn new(
+        capture_source: impl Into<String>,
+        render_target: impl Into<String>,
+        source_name: impl Into<String>,
+        source_description: impl Into<String>,
+    ) -> Result<Self, ConfigError> {
+        let config = Self {
+            capture_source: capture_source.into(),
+            render_target: render_target.into(),
+            source_name: source_name.into(),
+            source_description: source_description.into(),
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Returns the raw capture node identity.
+    pub fn capture_source(&self) -> &str {
+        &self.capture_source
+    }
+
+    /// Returns the render monitor node identity.
+    pub fn render_target(&self) -> &str {
+        &self.render_target
+    }
+
+    /// Returns the published virtual source name.
+    pub fn source_name(&self) -> &str {
+        &self.source_name
+    }
+
+    /// Returns the published virtual source description.
+    pub fn source_description(&self) -> &str {
+        &self.source_description
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        for (field, value) in [
+            ("capture source", &self.capture_source),
+            ("render target", &self.render_target),
+            ("source name", &self.source_name),
+        ] {
+            if value.trim().is_empty() {
+                return Err(ConfigError::EmptyNodeName { field });
+            }
+        }
+        if self.source_description.trim().is_empty() {
+            return Err(ConfigError::EmptySourceDescription);
+        }
+        Ok(())
+    }
 }
 
 impl Default for VirtualSourceConfig {
@@ -182,33 +295,79 @@ impl Default for VirtualSourceConfig {
 
 /// Runtime configuration for the optional PipeWire service.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(default, rename_all = "kebab-case")]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct RuntimeConfig {
     /// Fixed PCM format negotiated with PipeWire.
-    pub format: StreamFormat,
+    format: StreamFormat,
     /// PipeWire graph identities and virtual-source metadata.
-    pub source: VirtualSourceConfig,
+    source: VirtualSourceConfig,
     /// DSP feature defaults and settings.
-    pub processing: ProcessingConfig,
+    processing: ProcessingConfig,
     /// Persistent state path. `None` selects the XDG state directory.
-    pub state_path: Option<std::path::PathBuf>,
+    state_path: Option<std::path::PathBuf>,
     /// Control socket path. `None` selects the XDG runtime directory.
-    pub control_socket: Option<std::path::PathBuf>,
+    control_socket: Option<std::path::PathBuf>,
 }
 
 impl RuntimeConfig {
+    /// Creates a runtime configuration from validated stream and node data.
+    pub fn new(
+        format: StreamFormat,
+        source: VirtualSourceConfig,
+        processing: ProcessingConfig,
+    ) -> Result<Self, ConfigError> {
+        let config = Self {
+            format,
+            source,
+            processing,
+            state_path: None,
+            control_socket: None,
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Sets an explicit persistent-state path.
+    pub fn with_state_path(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.state_path = Some(path.into());
+        self
+    }
+
+    /// Sets an explicit control-socket path.
+    pub fn with_control_socket(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.control_socket = Some(path.into());
+        self
+    }
+
+    /// Returns the negotiated stream format.
+    pub fn format(&self) -> StreamFormat {
+        self.format
+    }
+
+    /// Returns the virtual-source configuration.
+    pub fn source(&self) -> &VirtualSourceConfig {
+        &self.source
+    }
+
+    /// Returns the default processing settings.
+    pub fn processing(&self) -> &ProcessingConfig {
+        &self.processing
+    }
+
+    /// Returns the explicit state path, if configured.
+    pub fn state_path(&self) -> Option<&std::path::Path> {
+        self.state_path.as_deref()
+    }
+
+    /// Returns the explicit control socket, if configured.
+    pub fn control_socket(&self) -> Option<&std::path::Path> {
+        self.control_socket.as_deref()
+    }
+
     /// Validates the configured stream and node identities.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        let _ = StreamFormat::new(self.format.sample_rate_hz, self.format.channels)?;
-        for (field, value) in [
-            ("capture source", &self.source.capture_source),
-            ("render target", &self.source.render_target),
-            ("source name", &self.source.source_name),
-        ] {
-            if value.trim().is_empty() {
-                return Err(ConfigError::EmptyNodeName { field });
-            }
-        }
+        let _ = StreamFormat::new(self.format.sample_rate_hz(), self.format.channels())?;
+        self.source.validate()?;
         Ok(())
     }
 }
@@ -227,6 +386,16 @@ mod tests {
     }
 
     #[test]
+    fn rejects_invalid_stream_format_during_deserialization() {
+        let error = serde_json::from_value::<StreamFormat>(serde_json::json!({
+            "sample_rate_hz": 44101,
+            "channels": 2
+        }))
+        .expect_err("invalid frame rates must not deserialize");
+        assert!(error.to_string().contains("does not produce"));
+    }
+
+    #[test]
     fn reports_empty_runtime_node_names() {
         let mut config = RuntimeConfig::default();
         config.source.capture_source.clear();
@@ -236,6 +405,18 @@ mod tests {
                 field: "capture source"
             })
         );
+    }
+
+    #[test]
+    fn rejects_invalid_virtual_source_during_deserialization() {
+        let error = serde_json::from_value::<VirtualSourceConfig>(serde_json::json!({
+            "capture-source": "capture",
+            "render-target": "render",
+            "source-name": "processed",
+            "source-description": ""
+        }))
+        .expect_err("empty descriptions must not deserialize");
+        assert!(error.to_string().contains("source description"));
     }
 
     #[test]

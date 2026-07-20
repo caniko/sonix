@@ -26,7 +26,7 @@ pub(crate) const CONTROL_SOCKET_TIMEOUT: Duration = Duration::from_secs(2);
 #[derive(
     Debug, Clone, Copy, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
 )]
-#[serde(rename_all = "kebab-case", tag = "action")]
+#[serde(deny_unknown_fields, rename_all = "kebab-case", tag = "action")]
 pub enum ControlCommand {
     /// Set noise suppression.
     SetNoise {
@@ -46,6 +46,7 @@ pub enum ControlCommand {
 
 /// A versioned legacy JSON control request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ControlRequest {
     /// Protocol identifier.
     pub protocol: String,
@@ -59,7 +60,7 @@ pub struct ControlRequest {
 #[derive(
     Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
 )]
-#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct RuntimeStatus {
     /// State schema version.
     pub schema_version: u32,
@@ -97,7 +98,7 @@ pub struct RuntimeStatus {
 
 /// A successful or failed legacy JSON control response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ControlResponse {
     /// Protocol identifier.
     pub protocol: String,
@@ -466,10 +467,10 @@ pub fn offline_status(
         daemon_running: false,
         healthy: false,
         active: false,
-        noise_suppression: state.noise_suppression,
-        echo_cancellation: state.echo_cancellation,
-        noise_persisted: state.noise_persisted,
-        echo_persisted: state.echo_persisted,
+        noise_suppression: state.noise_suppression(),
+        echo_cancellation: state.echo_cancellation(),
+        noise_persisted: state.noise_persisted(),
+        echo_persisted: state.echo_persisted(),
         processed_source: processed_source.into(),
         capture_source: capture_source.into(),
         render_target: render_target.into(),

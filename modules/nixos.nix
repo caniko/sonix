@@ -26,7 +26,6 @@
     pkgs.pulseaudio
   ];
   configFile = pkgs.writeText "goxlr-nexus-config.pkl" ''
-        user = ${pklString cfg.user}
         outputSinks = new Listing {
     ${outputSinksPkl}
         }
@@ -77,10 +76,6 @@
 in {
   options.programs.goxlr-nexus = {
     enable = mkEnableOption "GoXLR/JDS/PipeWire/OBS audio orchestration";
-    user = mkOption {
-      type = types.str;
-      default = "can";
-    };
     jdsSink = mkOption {
       type = types.nullOr types.str;
       default = null;

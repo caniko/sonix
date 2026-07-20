@@ -54,8 +54,23 @@ pub enum StateError {
     LockTimeout(PathBuf),
 }
 
+/// Errors resolving the per-user state and control locations.
+#[derive(Debug, PartialEq, Eq, Error)]
+#[non_exhaustive]
+pub enum DefaultPathError {
+    /// No secure state directory could be derived from the environment.
+    #[error("cannot determine a per-user state directory; set XDG_STATE_HOME or HOME")]
+    StateDirectory,
+    /// No secure runtime directory could be derived from the environment.
+    #[error("cannot determine a per-user runtime directory; set XDG_RUNTIME_DIR")]
+    RuntimeDirectory,
+    /// An environment-provided directory was relative and therefore unsafe.
+    #[error("{0} must be an absolute path")]
+    RelativeDirectory(&'static str),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(default, rename_all = "kebab-case")]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 struct PersistedState {
     version: u32,
     noise_suppression: Option<bool>,
@@ -67,16 +82,46 @@ struct PersistedState {
 #[serde(rename_all = "kebab-case")]
 pub struct StateSnapshot {
     /// Effective noise-suppression switch.
-    pub noise_suppression: bool,
+    noise_suppression: bool,
     /// Effective echo-cancellation switch.
-    pub echo_cancellation: bool,
+    echo_cancellation: bool,
     /// Whether the noise switch came from persisted state.
-    pub noise_persisted: bool,
+    noise_persisted: bool,
     /// Whether the echo switch came from persisted state.
-    pub echo_persisted: bool,
+    echo_persisted: bool,
 }
 
 impl StateSnapshot {
+    #[cfg(feature = "pipewire-runtime")]
+    pub(crate) const fn from_defaults(defaults: &ProcessingConfig) -> Self {
+        Self {
+            noise_suppression: defaults.noise_suppression,
+            echo_cancellation: defaults.echo_cancellation,
+            noise_persisted: false,
+            echo_persisted: false,
+        }
+    }
+
+    /// Returns the effective noise-suppression switch.
+    pub const fn noise_suppression(&self) -> bool {
+        self.noise_suppression
+    }
+
+    /// Returns the effective echo-cancellation switch.
+    pub const fn echo_cancellation(&self) -> bool {
+        self.echo_cancellation
+    }
+
+    /// Returns whether noise suppression was explicitly persisted.
+    pub const fn noise_persisted(&self) -> bool {
+        self.noise_persisted
+    }
+
+    /// Returns whether echo cancellation was explicitly persisted.
+    pub const fn echo_persisted(&self) -> bool {
+        self.echo_persisted
+    }
+
     /// Returns the effective feature configuration.
     pub const fn processing(&self, defaults: &ProcessingConfig) -> ProcessingConfig {
         ProcessingConfig {
@@ -269,7 +314,7 @@ fn set_private_path(path: &Path) -> std::io::Result<()> {
 }
 
 struct LockFile {
-    path: PathBuf,
+    _file: File,
 }
 
 impl LockFile {
@@ -281,28 +326,30 @@ impl LockFile {
             })?;
         }
         let deadline = Instant::now() + Duration::from_millis(250);
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|source| StateError::Write {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        set_private_file(&file).map_err(|source| StateError::Write {
+            path: path.to_path_buf(),
+            source,
+        })?;
         loop {
-            match OpenOptions::new().create_new(true).write(true).open(path) {
-                Ok(file) => {
-                    if let Err(source) = set_private_file(&file) {
-                        drop(file);
-                        let _ = fs::remove_file(path);
-                        return Err(StateError::Write {
-                            path: path.to_path_buf(),
-                            source,
-                        });
-                    }
-                    return Ok(Self {
-                        path: path.to_path_buf(),
-                    });
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if Instant::now() >= deadline {
-                        return Err(StateError::LockTimeout(path.to_path_buf()));
-                    }
+            match fs4::FileExt::try_lock(&file) {
+                Ok(()) => return Ok(Self { _file: file }),
+                Err(fs4::TryLockError::WouldBlock) if Instant::now() < deadline => {
                     thread::sleep(Duration::from_millis(5));
                 }
-                Err(source) => {
+                Err(fs4::TryLockError::WouldBlock) => {
+                    return Err(StateError::LockTimeout(path.to_path_buf()));
+                }
+                Err(fs4::TryLockError::Error(source)) => {
                     return Err(StateError::Write {
                         path: path.to_path_buf(),
                         source,
@@ -313,27 +360,31 @@ impl LockFile {
     }
 }
 
-impl Drop for LockFile {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
 /// Returns the default per-user state path.
-pub fn default_state_path() -> PathBuf {
-    std::env::var_os("XDG_STATE_HOME")
+pub fn default_state_path() -> Result<PathBuf, DefaultPathError> {
+    let directory = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("goxlr-nexus/processing-v1.json")
+        .ok_or(DefaultPathError::StateDirectory)?;
+    require_absolute(directory, "XDG_STATE_HOME or HOME")
+        .map(|path| path.join("goxlr-nexus/processing-v1.json"))
 }
 
 /// Returns the default per-user control socket path.
-pub fn default_control_socket() -> PathBuf {
-    std::env::var_os("XDG_RUNTIME_DIR")
+pub fn default_control_socket() -> Result<PathBuf, DefaultPathError> {
+    let directory = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("goxlr-nexus/processing.sock")
+        .ok_or(DefaultPathError::RuntimeDirectory)?;
+    require_absolute(directory, "XDG_RUNTIME_DIR")
+        .map(|path| path.join("goxlr-nexus/processing.sock"))
+}
+
+fn require_absolute(path: PathBuf, variable: &'static str) -> Result<PathBuf, DefaultPathError> {
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Err(DefaultPathError::RelativeDirectory(variable))
+    }
 }
 
 #[cfg(test)]
@@ -353,10 +404,10 @@ mod tests {
         let defaults = ProcessingConfig::default();
         store.set(Toggle::Noise, true, &defaults).unwrap();
         let snapshot = store.load(&defaults).unwrap();
-        assert!(snapshot.noise_suppression);
-        assert!(!snapshot.echo_cancellation);
-        assert!(snapshot.noise_persisted);
-        assert!(!snapshot.echo_persisted);
+        assert!(snapshot.noise_suppression());
+        assert!(!snapshot.echo_cancellation());
+        assert!(snapshot.noise_persisted());
+        assert!(!snapshot.echo_persisted());
     }
 
     #[test]
@@ -367,8 +418,8 @@ mod tests {
             ..Default::default()
         };
         store.set(Toggle::Echo, false, &defaults).unwrap();
-        assert!(!store.load(&defaults).unwrap().echo_cancellation);
-        assert!(store.reset(&defaults).unwrap().echo_cancellation);
+        assert!(!store.load(&defaults).unwrap().echo_cancellation());
+        assert!(store.reset(&defaults).unwrap().echo_cancellation());
     }
 
     #[test]
@@ -379,6 +430,14 @@ mod tests {
             store.load(&ProcessingConfig::default()),
             Err(StateError::UnsupportedVersion(2))
         ));
+    }
+
+    #[test]
+    fn rejects_relative_default_directories() {
+        assert_eq!(
+            require_absolute(PathBuf::from("relative"), "XDG_RUNTIME_DIR"),
+            Err(DefaultPathError::RelativeDirectory("XDG_RUNTIME_DIR"))
+        );
     }
 
     #[test]

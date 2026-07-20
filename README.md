@@ -99,6 +99,14 @@ healthy and its virtual node is present. If the daemon, PipeWire node, or DSP
 fails, routing falls back to the configured raw GoXLR microphone; the service's
 stop hook also restores that raw source.
 
+The processor stores its state at
+`$XDG_STATE_HOME/goxlr-nexus/processing-v1.json` (or
+`$HOME/.local/state/goxlr-nexus/processing-v1.json`) and serves control IPC at
+`$XDG_RUNTIME_DIR/goxlr-nexus/processing.sock`. These environment-provided
+directories must be absolute; there is no shared `/tmp` fallback. The state
+file is written atomically under an advisory lock, and the control socket is
+created with user-only permissions.
+
 ## Declarative GoXLR Utility artifacts
 
 The `goxlr-config` companion binary and `homeModules.goxlr-utility` module keep
@@ -123,3 +131,20 @@ mutating operations. Every write is staged atomically and followed by a hash
 verification. The manifest format is intentionally opaque so new Utility
 fields remain reproducible before a typed schema is available. The machine
 contracts are checked in under `schemas/config-*-v1.schema.json`.
+
+## Publishing
+
+The workspace publishes the reusable library before the application because
+`goxlr-nexus` consumes `nexus-audio-processing` as a crates.io dependency in
+uploaded metadata. Validate and publish in this order:
+
+```sh
+cargo publish -p nexus-audio-processing --dry-run
+cargo publish -p nexus-audio-processing
+# wait for the registry index to expose version 0.1.0
+cargo publish -p goxlr-nexus --dry-run
+cargo publish -p goxlr-nexus
+```
+
+The library dry-run is locally verifiable; the application dry-run cannot pass
+until the library upload has propagated through the configured registry.

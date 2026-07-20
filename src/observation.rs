@@ -93,7 +93,7 @@ pub struct ObsFacts {
     pub diagnostic: Option<String>,
 }
 
-pub fn facts_digest(facts: &Facts) -> String {
+pub fn facts_digest(facts: &Facts) -> Result<String, serde_json::Error> {
     let mut canonical = facts.clone();
     canonical
         .pipewire
@@ -110,11 +110,8 @@ pub fn facts_digest(facts: &Facts) -> String {
             .unwrap_or("")
             .to_string()
     });
-    // All fields are serde_json::Value or ordinary serializable data, so this
-    // serialization cannot fail unless the observation model changes to add a
-    // non-JSON type.
-    let bytes = serde_json::to_vec(&canonical).expect("observation facts are serializable");
-    format!("sha256:{:x}", Sha256::digest(bytes))
+    let bytes = serde_json::to_vec(&canonical)?;
+    Ok(format!("sha256:{}", hex::encode(Sha256::digest(bytes))))
 }
 
 #[cfg(test)]
@@ -163,8 +160,8 @@ mod tests {
     #[test]
     fn digest_is_stable_when_runtime_lists_are_reordered() {
         assert_eq!(
-            facts_digest(&facts_with_order(&["node-b", "node-a"])),
-            facts_digest(&facts_with_order(&["node-a", "node-b"]))
+            facts_digest(&facts_with_order(&["node-b", "node-a"])).unwrap(),
+            facts_digest(&facts_with_order(&["node-a", "node-b"])).unwrap()
         );
     }
 }

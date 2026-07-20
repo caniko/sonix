@@ -16,3 +16,8 @@
 - Reduced the PipeWire processing hot path to pooled frames, in-place DSP,
   atomic status/config updates, and worker wakeups instead of polling and
   per-frame allocations.
+- Updated the Rust dependency graph, added structured long-running diagnostics,
+  strict configuration decoding, secure XDG-only runtime paths, advisory state
+  locking, and transactional artifact rollback verification.
+- Extracted processing CLI concerns into a dedicated module and added executable
+  schema-contract and rollback regression tests.

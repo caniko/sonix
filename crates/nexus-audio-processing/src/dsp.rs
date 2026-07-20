@@ -30,15 +30,25 @@ pub enum DspError {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AudioFrame {
     /// One vector per channel, each containing `format.frame_samples()` f32s.
-    pub channels: Vec<Vec<f32>>,
+    channels: Vec<Vec<f32>>,
 }
 
 impl AudioFrame {
     /// Creates a silent frame for a format.
     pub fn silence(format: StreamFormat) -> Self {
         Self {
-            channels: vec![vec![0.0; format.frame_samples()]; format.channels as usize],
+            channels: vec![vec![0.0; format.frame_samples()]; format.channels() as usize],
         }
+    }
+
+    /// Returns the number of channels in the frame.
+    pub fn channel_count(&self) -> usize {
+        self.channels.len()
+    }
+
+    /// Returns one channel's samples when the index exists.
+    pub fn channel(&self, index: usize) -> Option<&[f32]> {
+        self.channels.get(index).map(Vec::as_slice)
     }
 
     /// Deinterleaves an f32 frame from PipeWire.
@@ -117,7 +127,7 @@ pub struct DuplexProcessor {
 impl DuplexProcessor {
     /// Creates a processor with the supplied format and feature state.
     pub fn new(format: StreamFormat, config: ProcessingConfig) -> Result<Self, DspError> {
-        let format = StreamFormat::new(format.sample_rate_hz, format.channels)?;
+        let format = StreamFormat::new(format.sample_rate_hz(), format.channels())?;
         let apm = build_apm(format, &config);
         let mut processor = Self {
             format,
@@ -235,9 +245,9 @@ impl DuplexProcessor {
 
 #[cfg(feature = "sonora")]
 fn validate_frame(frame: &AudioFrame, format: StreamFormat) -> Result<(), DspError> {
-    let expected = format.frame_samples() * format.channels as usize;
+    let expected = format.frame_samples() * format.channels() as usize;
     let actual = frame.channels.iter().map(Vec::len).sum();
-    if frame.channels.len() != format.channels as usize
+    if frame.channels.len() != format.channels() as usize
         || frame
             .channels
             .iter()
@@ -290,7 +300,7 @@ fn build_apm(format: StreamFormat, config: &ProcessingConfig) -> sonora::AudioPr
             analyze_linear_aec_output_when_available: config.echo_cancellation,
         });
     }
-    let stream = StreamConfig::new(format.sample_rate_hz, format.channels);
+    let stream = StreamConfig::new(format.sample_rate_hz(), format.channels());
     AudioProcessing::builder()
         .config(sonora_config)
         .capture_config(stream)
@@ -413,7 +423,7 @@ mod tests {
         let capture = AudioFrame::silence(format);
         processor.process_render(&render).unwrap();
         let output = processor.process_capture(&capture).unwrap();
-        assert_eq!(output.channels.len(), format.channels as usize);
+        assert_eq!(output.channels.len(), format.channels() as usize);
         assert_eq!(output.channels[0].len(), format.frame_samples());
     }
 }

@@ -23,7 +23,8 @@ pub use control::{
 pub use dsp::DuplexProcessor;
 pub use dsp::{AudioFrame, DspError};
 pub use state::{
-    StateError, StateSnapshot, StateStore, Toggle, default_control_socket, default_state_path,
+    DefaultPathError, StateError, StateSnapshot, StateStore, Toggle, default_control_socket,
+    default_state_path,
 };
 
 #[cfg(feature = "pipewire-runtime")]

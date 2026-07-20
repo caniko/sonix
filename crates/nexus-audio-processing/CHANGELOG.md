@@ -11,3 +11,6 @@
 - The PipeWire runtime now uses preallocated frame pools, in-place processing,
   event-driven worker wakeups, and atomic hot-path status/config state to keep
   callback CPU and memory use bounded.
+- Runtime configuration and persisted state now reject unknown or invalid
+  values, resolve only absolute per-user XDG paths, and serialize updates under
+  an advisory lock with explicit startup/shutdown error propagation.

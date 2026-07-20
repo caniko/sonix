@@ -215,25 +215,8 @@ fn read_plan(path: &Path) -> Result<Plan> {
     let files = manifest
         .files
         .iter()
-        .map(|file| {
-            let source_sha256 = sha256(&file.source).ok();
-            let target_sha256 = sha256(&file.target).ok();
-            let status = match (&source_sha256, &target_sha256) {
-                (Some(source), Some(target)) if source == target => FileStatus::Same,
-                (Some(_), Some(_)) => FileStatus::Changed,
-                (Some(_), None) => FileStatus::Missing,
-                (None, _) => FileStatus::Missing,
-            };
-            PlanFile {
-                path: file.path.clone(),
-                source: file.source.display().to_string(),
-                target: file.target.display().to_string(),
-                status,
-                source_sha256,
-                target_sha256,
-            }
-        })
-        .collect::<Vec<_>>();
+        .map(inspect_manifest_file)
+        .collect::<Result<Vec<_>>>()?;
     let requires_apply = files.iter().any(|file| file.status != FileStatus::Same);
     Ok(Plan {
         schema: PLAN_SCHEMA,
@@ -282,9 +265,13 @@ fn apply(plan: &Plan) -> Result<()> {
     if !plan.requires_apply {
         return Ok(());
     }
-    let mut backups = Vec::new();
+    enum JournalEntry {
+        Created { target: PathBuf },
+        Replaced { backup: PathBuf, target: PathBuf },
+    }
+    let mut journal = Vec::new();
     let result = (|| {
-        for file in &plan.files {
+        for (index, file) in plan.files.iter().enumerate() {
             if file.status == FileStatus::Same {
                 continue;
             }
@@ -294,13 +281,19 @@ fn apply(plan: &Plan) -> Result<()> {
                 fs::create_dir_all(parent)
                     .with_context(|| format!("cannot create {}", parent.display()))?;
             }
-            let backup = PathBuf::from(format!("{}.canix-previous", target.display()));
             if target.exists() {
-                let _ = fs::remove_file(&backup);
+                let backup = backup_path(target, index)?;
                 fs::rename(target, &backup).with_context(|| {
                     format!("cannot stage previous target {}", target.display())
                 })?;
-                backups.push((backup.clone(), target.to_path_buf()));
+                journal.push(JournalEntry::Replaced {
+                    backup,
+                    target: target.to_path_buf(),
+                });
+            } else {
+                journal.push(JournalEntry::Created {
+                    target: target.to_path_buf(),
+                });
             }
             atomic_copy(source, target)?;
         }
@@ -312,15 +305,24 @@ fn apply(plan: &Plan) -> Result<()> {
     })();
     match result {
         Ok(()) => {
-            for (backup, _) in backups {
-                let _ = fs::remove_file(backup);
+            for entry in journal {
+                if let JournalEntry::Replaced { backup, .. } = entry {
+                    let _ = fs::remove_file(backup);
+                }
             }
             Ok(())
         }
         Err(error) => {
-            for (backup, target) in backups.into_iter().rev() {
-                let _ = fs::remove_file(&target);
-                let _ = fs::rename(backup, target);
+            for entry in journal.into_iter().rev() {
+                match entry {
+                    JournalEntry::Created { target } => {
+                        let _ = fs::remove_file(target);
+                    }
+                    JournalEntry::Replaced { backup, target } => {
+                        let _ = fs::remove_file(&target);
+                        let _ = fs::rename(backup, target);
+                    }
+                }
             }
             Err(error)
         }
@@ -331,26 +333,8 @@ fn read_plan_from_plan(plan: &Plan) -> Result<Plan> {
     let files = plan
         .files
         .iter()
-        .map(|file| {
-            let source = Path::new(&file.source);
-            let target = Path::new(&file.target);
-            let source_sha256 = sha256(source).ok();
-            let target_sha256 = sha256(target).ok();
-            let status = match (&source_sha256, &target_sha256) {
-                (Some(source), Some(target)) if source == target => FileStatus::Same,
-                (Some(_), Some(_)) => FileStatus::Changed,
-                _ => FileStatus::Missing,
-            };
-            PlanFile {
-                path: file.path.clone(),
-                source: file.source.clone(),
-                target: file.target.clone(),
-                status,
-                source_sha256,
-                target_sha256,
-            }
-        })
-        .collect::<Vec<_>>();
+        .map(inspect_plan_file)
+        .collect::<Result<Vec<_>>>()?;
     Ok(Plan {
         schema: PLAN_SCHEMA,
         module: plan.module.clone(),
@@ -358,6 +342,80 @@ fn read_plan_from_plan(plan: &Plan) -> Result<Plan> {
         requires_apply: files.iter().any(|file| file.status != FileStatus::Same),
         files,
     })
+}
+
+fn inspect_manifest_file(file: &ManifestFile) -> Result<PlanFile> {
+    let source_sha256 = Some(sha256(&file.source)?);
+    let target_sha256 = sha256_optional(&file.target)?;
+    Ok(plan_file(
+        file.path.clone(),
+        file.source.display().to_string(),
+        file.target.display().to_string(),
+        source_sha256,
+        target_sha256,
+    ))
+}
+
+fn inspect_plan_file(file: &PlanFile) -> Result<PlanFile> {
+    let source_sha256 = Some(sha256(Path::new(&file.source))?);
+    let target_sha256 = sha256_optional(Path::new(&file.target))?;
+    Ok(plan_file(
+        file.path.clone(),
+        file.source.clone(),
+        file.target.clone(),
+        source_sha256,
+        target_sha256,
+    ))
+}
+
+fn plan_file(
+    path: String,
+    source: String,
+    target: String,
+    source_sha256: Option<String>,
+    target_sha256: Option<String>,
+) -> PlanFile {
+    let status = match (&source_sha256, &target_sha256) {
+        (Some(source), Some(target)) if source == target => FileStatus::Same,
+        (Some(_), Some(_)) => FileStatus::Changed,
+        _ => FileStatus::Missing,
+    };
+    PlanFile {
+        path,
+        source,
+        target,
+        status,
+        source_sha256,
+        target_sha256,
+    }
+}
+
+fn sha256_optional(path: &Path) -> Result<Option<String>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(format!(
+            "sha256:{}",
+            hex::encode(Sha256::digest(bytes))
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("cannot read {}", path.display())),
+    }
+}
+
+fn backup_path(target: &Path, index: usize) -> Result<PathBuf> {
+    let parent = target.parent().unwrap_or_else(|| Path::new("."));
+    let name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("target has no valid file name: {}", target.display()))?;
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let backup = parent.join(format!(".{name}.canix-previous-{}-{index}", suffix));
+    if backup.exists() {
+        bail!("refusing to overwrite staged backup {}", backup.display());
+    }
+    Ok(backup)
 }
 
 fn atomic_copy(source: &Path, target: &Path) -> Result<()> {
@@ -390,7 +448,7 @@ fn atomic_copy(source: &Path, target: &Path) -> Result<()> {
 
 fn sha256(path: &Path) -> Result<String> {
     let bytes = fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
-    Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
+    Ok(format!("sha256:{}", hex::encode(Sha256::digest(bytes))))
 }
 
 fn changed_files(plan: &Plan) -> usize {
@@ -460,6 +518,51 @@ mod tests {
         assert!(plan.requires_apply);
         assert_eq!(plan.files[0].status, FileStatus::Missing);
 
+        fs::remove_dir_all(root).expect("test root should be removable");
+    }
+
+    #[test]
+    fn apply_restores_replaced_targets_when_a_later_copy_fails() {
+        let root = std::env::temp_dir().join(format!(
+            "goxlr-config-rollback-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock should be after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("test root should be creatable");
+        let source = root.join("source");
+        let target = root.join("target");
+        fs::write(&source, b"new").expect("source should be writable");
+        fs::write(&target, b"old").expect("target should be writable");
+        let missing = root.join("missing");
+        let plan = Plan {
+            schema: PLAN_SCHEMA,
+            module: "test".into(),
+            manifest_version: MANIFEST_VERSION,
+            requires_apply: true,
+            files: vec![
+                plan_file(
+                    "first".into(),
+                    source.display().to_string(),
+                    target.display().to_string(),
+                    Some(sha256(&source).expect("source hash")),
+                    Some(sha256(&target).expect("target hash")),
+                ),
+                plan_file(
+                    "second".into(),
+                    missing.display().to_string(),
+                    root.join("second-target").display().to_string(),
+                    Some("sha256:deadbeef".into()),
+                    None,
+                ),
+            ],
+        };
+
+        assert!(apply(&plan).is_err());
+        assert_eq!(fs::read(&target).expect("target should remain"), b"old");
+        assert!(!root.join("second-target").exists());
         fs::remove_dir_all(root).expect("test root should be removable");
     }
 }
