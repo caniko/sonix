@@ -27,7 +27,18 @@
         extensions = ["clippy" "rustfmt"];
       };
       msrvCraneLib = (crane.mkLib pkgs).overrideToolchain (_: msrvToolchain);
-      src = msrvCraneLib.cleanCargoSource ./.;
+      src = pkgs.lib.cleanSourceWith {
+        src = pkgs.lib.cleanSource ./.;
+        filter = path: type:
+          pkgs.lib.cleanSourceFilter path type
+          && !(pkgs.lib.hasInfix "/graphify-out" (toString path));
+      };
+      spaBindgenHeader = pkgs.writeText "spa-bindgen.h" ''
+        #include <stdint.h>
+
+        static const uint32_t SPA_ID_INVALID = 0xffffffffu;
+        static const uint32_t PW_ID_ANY = 0xffffffffu;
+      '';
       commonArgs = {
         inherit src;
         strictDeps = true;
@@ -35,7 +46,7 @@
         buildInputs = [pkgs.pipewire.dev];
         PKG_CONFIG_PATH = "${pkgs.pipewire.dev}/lib/pkgconfig";
         LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
-        BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.glibc.dev}/include";
+        BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.glibc.dev}/include -include ${spaBindgenHeader}";
       };
       package = msrvCraneLib.buildPackage (commonArgs // {cargoArtifacts = null;});
     in {
@@ -62,7 +73,7 @@
         ];
         PKG_CONFIG_PATH = "${pkgs.pipewire.dev}/lib/pkgconfig";
         LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
-        BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.glibc.dev}/include";
+        BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.glibc.dev}/include -include ${spaBindgenHeader}";
       };
       checks.default = package;
       formatter = pkgs.alejandra;
