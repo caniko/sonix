@@ -124,7 +124,7 @@
           import ./modules/home-manager/sonix.nix {
             inherit config lib pkgs self;
           };
-        default = {
+        goxlr-nexus = {
           config,
           lib,
           pkgs,
@@ -141,7 +141,8 @@
         }:
           import ./modules/home-manager/goxlr-utility.nix {
             inherit config lib pkgs self;
-          };
+        };
+        default = self.homeModules.sonix;
       };
       homeManagerModules = self.homeModules;
     };
