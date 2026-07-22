@@ -228,7 +228,7 @@ in {
     assertions = [
       {
         assertion = !cfg.obs.manageSettings || !cfg.obs.authRequired || cfg.obs.passwordFile != null;
-        message = "programs.goxlr-nexus.obs.authRequired requires programs.goxlr-nexus.obs.passwordFile when manageSettings is enabled.";
+        message = "programs.sonix.goxlr.obs.authRequired requires programs.sonix.goxlr.obs.passwordFile when manageSettings is enabled.";
       }
     ];
     xdg.configFile."obs-studio/plugin_config/obs-websocket/config.json" = mkIf cfg.obs.manageSettings {

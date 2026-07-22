@@ -835,7 +835,7 @@ where
 fn print_adoption(report: &AdoptionReport) {
     println!("{} on {}", report.schema, report.producer.name);
     println!("Review this Home Manager fragment before copying it:");
-    println!("programs.goxlr-nexus = {{");
+    println!("programs.sonix.goxlr = {{");
     if let Some(value) = &report.config.jds_sink {
         println!("  jdsSink = \"{}\";", nix_quote(value));
     }
@@ -1058,30 +1058,18 @@ fn print_observation(observation: &Observation) {
 async fn load_config(explicit: Option<&Path>) -> Result<Config> {
     let configured_path = explicit
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("GOXLR_NEXUS_CONFIG").map(PathBuf::from));
+        .or_else(|| std::env::var_os("SONIX_GOXLR_CONFIG").map(PathBuf::from));
     let config_dir = dirs::config_dir();
     let path = configured_path.clone().or_else(|| {
         config_dir
             .as_ref()
-            .map(|directory| directory.join("goxlr-nexus/config.pkl"))
+            .map(|directory| directory.join("sonix/goxlr-config.pkl"))
     });
 
     let Some(path) = path else {
         return Ok(Config::default());
     };
     if !path.exists() {
-        if configured_path.is_none()
-            && let Some(config_dir) = config_dir
-        {
-            let legacy_path = config_dir.join("goxlr-nexus/config.toml");
-            if legacy_path.exists() {
-                bail!(
-                    "found legacy TOML configuration at {}; migrate it to {}",
-                    legacy_path.display(),
-                    path.display()
-                );
-            }
-        }
         return Ok(Config::default());
     }
 
@@ -1995,7 +1983,7 @@ fn apply_profile(config: &Config, profile: Profile, dry_run: bool) -> Result<()>
 
 fn obs_sync(config: &Config, dry_run: bool) -> Result<()> {
     if !config.obs.enable {
-        bail!("OBS integration is disabled; set programs.goxlr-nexus.obs.enable = true");
+        bail!("OBS integration is disabled; set programs.sonix.goxlr.obs.enable = true");
     }
     let sources = obs_source_plan(config);
 
