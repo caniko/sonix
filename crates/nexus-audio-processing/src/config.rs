@@ -297,8 +297,10 @@ impl Default for VirtualSourceConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct RuntimeConfig {
-    /// Fixed PCM format negotiated with PipeWire.
+    /// PCM format negotiated for microphone capture.
     format: StreamFormat,
+    /// PCM format negotiated for the render reference.
+    render_format: StreamFormat,
     /// PipeWire graph identities and virtual-source metadata.
     source: VirtualSourceConfig,
     /// DSP feature defaults and settings.
@@ -316,8 +318,19 @@ impl RuntimeConfig {
         source: VirtualSourceConfig,
         processing: ProcessingConfig,
     ) -> Result<Self, ConfigError> {
+        Self::new_with_formats(format, format, source, processing)
+    }
+
+    /// Creates a runtime with independent capture and render formats.
+    pub fn new_with_formats(
+        capture_format: StreamFormat,
+        render_format: StreamFormat,
+        source: VirtualSourceConfig,
+        processing: ProcessingConfig,
+    ) -> Result<Self, ConfigError> {
         let config = Self {
-            format,
+            format: capture_format,
+            render_format,
             source,
             processing,
             state_path: None,
@@ -344,6 +357,11 @@ impl RuntimeConfig {
         self.format
     }
 
+    /// Returns the negotiated render-reference format.
+    pub fn render_format(&self) -> StreamFormat {
+        self.render_format
+    }
+
     /// Returns the virtual-source configuration.
     pub fn source(&self) -> &VirtualSourceConfig {
         &self.source
@@ -367,6 +385,10 @@ impl RuntimeConfig {
     /// Validates the configured stream and node identities.
     pub fn validate(&self) -> Result<(), ConfigError> {
         let _ = StreamFormat::new(self.format.sample_rate_hz(), self.format.channels())?;
+        let _ = StreamFormat::new(
+            self.render_format.sample_rate_hz(),
+            self.render_format.channels(),
+        )?;
         self.source.validate()?;
         Ok(())
     }

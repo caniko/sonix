@@ -51,8 +51,8 @@ impl Default for ProcessingSettings {
             enable: true,
             source_name: "goxlr_nexus.processed_mic".to_string(),
             source_description: "GoXLR Nexus processed microphone".to_string(),
-            noise_suppression: false,
-            echo_cancellation: false,
+            noise_suppression: true,
+            echo_cancellation: true,
             noise_level: NoiseSuppressionLevel::High,
             echo_delay: EchoDelay::Auto,
         }

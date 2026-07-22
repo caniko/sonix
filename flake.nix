@@ -1,5 +1,5 @@
 {
-  description = "Declarative GoXLR Utility configuration and PipeWire/OBS audio orchestration";
+  description = "Sonix generic PipeWire echo/noise processing with GoXLR routing";
 
   inputs = {
     rs-harbor.url = "git+https://codeberg.org/caniko/rs-harbor.git?ref=trunk&rev=9bfa8bdb0ecb22d7bc11448665f7fbaebae7a759";
@@ -52,11 +52,13 @@
     in {
       packages = {
         default = package;
+        sonix = package;
         goxlr-nexus = package;
         goxlr-config = package;
       };
       apps = {
         default = flake-utils.lib.mkApp {drv = package;};
+        sonix = flake-utils.lib.mkApp {drv = package;};
         goxlr-nexus = flake-utils.lib.mkApp {drv = package;};
         goxlr-config = {
           type = "app";
@@ -79,6 +81,29 @@
       formatter = pkgs.alejandra;
     })
     // {
+      # Named subflake surfaces. They intentionally re-export the same
+      # validated implementation so consumers can compose the hierarchy
+      # without importing GoXLR-specific options.
+      nexus = {
+        packages = self.packages;
+        homeModules.default = self.homeModules.sonix;
+      };
+      external-input-only-nexus = {
+        packages = self.packages;
+        homeModules.default = self.homeModules.sonix;
+      };
+      laptop-nexus = {
+        packages = self.packages;
+        homeModules.default = self.homeModules.sonix;
+      };
+      noise-echo = {
+        packages = self.packages;
+        homeModules.default = self.homeModules.sonix;
+      };
+      goxlr-nexus = {
+        packages = self.packages;
+        homeModules.default = self.homeModules.default;
+      };
       nixosModules.default = {
         config,
         lib,
@@ -88,7 +113,17 @@
         import ./modules/nixos.nix {
           inherit config lib pkgs self;
         };
+      nixosModules.sonix = import ./modules/nixos/sonix.nix;
       homeModules = {
+        sonix = {
+          config,
+          lib,
+          pkgs,
+          ...
+        }:
+          import ./modules/home-manager/sonix.nix {
+            inherit config lib pkgs self;
+          };
         default = {
           config,
           lib,

@@ -1,11 +1,11 @@
 [package]
-name = "goxlr-nexus"
+name = "sonix"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.91"
 license = "MIT OR Apache-2.0"
-repository = "https://codeberg.org/caniko/goxlr-nexus"
-description = "GoXLR, JDS Labs DAC, PipeWire, and OBS audio orchestrator"
+repository = "https://codeberg.org/caniko/sonix"
+description = "Generic PipeWire echo/noise processing with GoXLR routing"
 readme = "README.md"
 documentation = "https://docs.rs/goxlr-nexus"
 keywords = ["audio", "pipewire", "goxlr"]
@@ -22,6 +22,10 @@ members = ["crates/nexus-audio-processing"]
 [[bin]]
 name = "goxlr-config"
 path = "src/bin/goxlr-config.rs"
+
+[[bin]]
+name = "sonix"
+path = "src/bin/sonix.rs"
 
 [dependencies]
 anyhow = "1.0"

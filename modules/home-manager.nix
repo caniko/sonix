@@ -5,7 +5,7 @@
   self,
   ...
 }: let
-  cfg = config.programs.goxlr-nexus;
+  cfg = config.programs.sonix.goxlr;
   inherit (lib) mkEnableOption mkIf mkOption types;
   package = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
   effectiveOutputSinks =
@@ -87,7 +87,7 @@
         }
   '';
 in {
-  options.programs.goxlr-nexus = {
+  options.programs.sonix.goxlr = {
     enable = mkEnableOption "GoXLR/JDS/PipeWire/OBS audio orchestration";
     jdsSink = mkOption {
       type = types.nullOr types.str;

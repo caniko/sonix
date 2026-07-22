@@ -43,8 +43,8 @@ const GOXLR_CHAT_MIC: &str = "alsa_input.usb-TC-Helicon_GoXLR-00.HiFi__Headset__
 const GOXLR_STREAM_MIX: &str = "alsa_input.usb-TC-Helicon_GoXLR-00.HiFi__Line4__source";
 const GOXLR_SAMPLER: &str = "alsa_input.usb-TC-Helicon_GoXLR-00.HiFi__Line5__source";
 const OBS_INPUT_KIND: &str = "pulse_input_capture";
-const PLAN_SCHEMA: &str = "goxlr-nexus.plan/v2";
-const ADOPT_SCHEMA: &str = "goxlr-nexus.adopt/v1";
+const PLAN_SCHEMA: &str = "sonix.goxlr.plan/v2";
+const ADOPT_SCHEMA: &str = "sonix.goxlr.adopt/v1";
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -605,7 +605,7 @@ fn discover(config: Config, json_output: bool) -> Result<()> {
     let observation = Observation {
         schema: SCHEMA,
         producer: Producer {
-            name: "goxlr-nexus",
+            name: "sonix-goxlr",
             version: env!("CARGO_PKG_VERSION"),
         },
         captured_at: std::time::SystemTime::now()
@@ -1912,7 +1912,7 @@ fn write_runtime_status(
     fs::create_dir_all(&directory)
         .with_context(|| format!("create runtime status directory {}", directory.display()))?;
     let status = RuntimeStatus {
-        schema: "goxlr-nexus.runtime/v1",
+        schema: "sonix.goxlr.runtime/v1",
         mode,
         profile: profile.to_string(),
         proposed_operations,

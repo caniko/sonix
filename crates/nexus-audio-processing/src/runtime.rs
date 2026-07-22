@@ -82,6 +82,7 @@ struct SharedRuntime {
     dropped_frames: AtomicU64,
     healthy: AtomicBool,
     active: AtomicBool,
+    capture_connected: AtomicBool,
     worker: OnceLock<thread::Thread>,
     status: Mutex<RuntimeStatus>,
 }
@@ -107,7 +108,8 @@ impl ProcessingRuntime {
 
     /// Runs the runtime until PipeWire or the process exits.
     pub fn run(self) -> Result<(), RuntimeError> {
-        let format = self.config.format();
+        let capture_format = self.config.format();
+        let render_format = self.config.render_format();
         let source = self.config.source();
         let state_defaults = self.config.processing().clone();
         let state_path = self
@@ -122,7 +124,6 @@ impl ProcessingRuntime {
             crate::state::StateSnapshot::from_defaults(&defaults)
         });
         let effective = state.processing(&defaults);
-        let initially_active = effective.active();
         let status = RuntimeStatus {
             schema_version: SCHEMA_VERSION,
             daemon_running: true,
@@ -135,7 +136,7 @@ impl ProcessingRuntime {
             processed_source: source.source_name().to_owned(),
             capture_source: source.capture_source().to_owned(),
             render_target: source.render_target().to_owned(),
-            format,
+            format: capture_format,
             delay_ms: effective.processing_delay_ms(),
             retries: 0,
             dropped_frames: 0,
@@ -148,15 +149,16 @@ impl ProcessingRuntime {
             render: ArrayQueue::new(QUEUE_CAPACITY),
             capture: ArrayQueue::new(QUEUE_CAPACITY),
             output: ArrayQueue::new(QUEUE_CAPACITY),
-            render_free: frame_pool(format)?,
-            capture_free: frame_pool(format)?,
-            output_free: frame_pool(format)?,
+            render_free: frame_pool(render_format)?,
+            capture_free: frame_pool(capture_format)?,
+            output_free: frame_pool(capture_format)?,
             stop: AtomicBool::new(false),
             config_revision: AtomicU64::new(0),
             retries: AtomicU64::new(0),
             dropped_frames: AtomicU64::new(0),
             healthy: AtomicBool::new(false),
             active: AtomicBool::new(false),
+            capture_connected: AtomicBool::new(false),
             worker: OnceLock::new(),
             status: Mutex::new(status),
         });
@@ -165,13 +167,16 @@ impl ProcessingRuntime {
         // Setting this after spawning the threads could overwrite a bind or
         // processor-construction error with a misleading healthy status.
         shared.healthy.store(true, Ordering::Release);
-        shared.active.store(initially_active, Ordering::Release);
+        // A configured processor is idle until its capture stream is actually
+        // connected. This is the external-input-only contract.
+        shared.active.store(false, Ordering::Release);
 
         pw::init();
         let main_loop = pw::main_loop::MainLoopRc::new(None)?;
         let context = pw::context::ContextRc::new(&main_loop, None)?;
         let core = context.connect_rc(None)?;
-        let params = audio_params(format)?;
+        let capture_params = audio_params(capture_format)?;
+        let render_params = audio_params(render_format)?;
 
         let render = make_input_stream(
             &core,
@@ -184,10 +189,10 @@ impl ProcessingRuntime {
                     "target.object" => source.render_target(),
                     *pw::keys::STREAM_CAPTURE_SINK => "true",
                 },
-                format,
+                format: render_format,
                 shared: Arc::clone(&shared),
                 role: StreamRole::Render,
-                params: params.bytes.clone(),
+                params: render_params.bytes.clone(),
             },
         )?;
         let capture = make_input_stream(
@@ -200,10 +205,10 @@ impl ProcessingRuntime {
                     *pw::keys::MEDIA_ROLE => "Communication",
                     "target.object" => source.capture_source(),
                 },
-                format,
+                format: capture_format,
                 shared: Arc::clone(&shared),
                 role: StreamRole::Capture,
-                params: params.bytes.clone(),
+                params: capture_params.bytes.clone(),
             },
         )?;
         let source = make_output_stream(
@@ -217,9 +222,9 @@ impl ProcessingRuntime {
                 *pw::keys::NODE_NAME => source.source_name(),
                 *pw::keys::NODE_DESCRIPTION => source.source_description(),
             },
-            format,
+            capture_format,
             Arc::clone(&shared),
-            &params,
+            &capture_params,
         )?;
 
         let socket_path = self
@@ -249,11 +254,13 @@ impl ProcessingRuntime {
         }
 
         let worker_shared = Arc::clone(&shared);
-        let worker_format = format;
+        let worker_capture_format = capture_format;
+        let worker_render_format = render_format;
         let worker = match thread::Builder::new()
             .name("nexus-audio-dsp".into())
-            .spawn(move || processing_worker(worker_shared, worker_format))
-        {
+            .spawn(move || {
+                processing_worker(worker_shared, worker_capture_format, worker_render_format)
+            }) {
             Ok(worker) => worker,
             Err(error) => {
                 shared.stop.store(true, Ordering::Release);
@@ -344,6 +351,15 @@ fn make_input_stream<'a>(
             scratch: Vec::new(),
         })
         .state_changed(|_, data, _, new| {
+            if matches!(data.role, StreamRole::Capture) {
+                let connected = matches!(new, pw::stream::StreamState::Streaming);
+                data.shared
+                    .capture_connected
+                    .store(connected, Ordering::Release);
+                if !connected {
+                    data.shared.active.store(false, Ordering::Release);
+                }
+            }
             if matches!(new, pw::stream::StreamState::Error(_)) {
                 mark_unhealthy(&data.shared, format!("{new:?}"));
             }
@@ -527,7 +543,11 @@ fn audio_params(format: crate::StreamFormat) -> Result<AudioParams, RuntimeError
     Ok(AudioParams { bytes })
 }
 
-fn processing_worker(shared: Arc<SharedRuntime>, format: crate::StreamFormat) {
+fn processing_worker(
+    shared: Arc<SharedRuntime>,
+    capture_format: crate::StreamFormat,
+    render_format: crate::StreamFormat,
+) {
     let _ = shared.worker.set(thread::current());
     let mut config = match shared.config.lock() {
         Ok(value) => value.clone(),
@@ -537,15 +557,16 @@ fn processing_worker(shared: Arc<SharedRuntime>, format: crate::StreamFormat) {
         }
     };
     let mut config_revision = shared.config_revision.load(Ordering::Acquire);
-    let mut processor = match DuplexProcessor::new(format, config.clone()) {
-        Ok(processor) => processor,
-        Err(error) => {
-            mark_unhealthy(&shared, error.to_string());
-            return;
-        }
-    };
-    let silence = AudioFrame::silence(format);
-    let mut render_output = AudioFrame::silence(format);
+    let mut processor =
+        match DuplexProcessor::new_with_formats(capture_format, render_format, config.clone()) {
+            Ok(processor) => processor,
+            Err(error) => {
+                mark_unhealthy(&shared, error.to_string());
+                return;
+            }
+        };
+    let silence = AudioFrame::silence(render_format);
+    let mut render_output = AudioFrame::silence(render_format);
     while !shared.stop.load(Ordering::Acquire) {
         let current_revision = shared.config_revision.load(Ordering::Acquire);
         if current_revision != config_revision {
@@ -596,7 +617,10 @@ fn processing_worker(shared: Arc<SharedRuntime>, format: crate::StreamFormat) {
                 {
                     status.last_error = None;
                 }
-                shared.active.store(config.active(), Ordering::Release);
+                shared.active.store(
+                    config.active() && shared.capture_connected.load(Ordering::Acquire),
+                    Ordering::Release,
+                );
             }
             Err(error) => {
                 shared.retries.fetch_add(1, Ordering::Relaxed);

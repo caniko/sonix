@@ -118,7 +118,8 @@ impl AudioFrame {
 #[cfg(feature = "sonora")]
 #[derive(Debug)]
 pub struct DuplexProcessor {
-    format: StreamFormat,
+    capture_format: StreamFormat,
+    render_format: StreamFormat,
     config: ProcessingConfig,
     apm: sonora::AudioProcessing,
 }
@@ -127,10 +128,23 @@ pub struct DuplexProcessor {
 impl DuplexProcessor {
     /// Creates a processor with the supplied format and feature state.
     pub fn new(format: StreamFormat, config: ProcessingConfig) -> Result<Self, DspError> {
-        let format = StreamFormat::new(format.sample_rate_hz(), format.channels())?;
-        let apm = build_apm(format, &config);
+        Self::new_with_formats(format, format, config)
+    }
+
+    /// Creates a processor with independent capture and render layouts.
+    pub fn new_with_formats(
+        capture_format: StreamFormat,
+        render_format: StreamFormat,
+        config: ProcessingConfig,
+    ) -> Result<Self, DspError> {
+        let capture_format =
+            StreamFormat::new(capture_format.sample_rate_hz(), capture_format.channels())?;
+        let render_format =
+            StreamFormat::new(render_format.sample_rate_hz(), render_format.channels())?;
+        let apm = build_apm(capture_format, render_format, &config);
         let mut processor = Self {
-            format,
+            capture_format,
+            render_format,
             config,
             apm,
         };
@@ -140,7 +154,17 @@ impl DuplexProcessor {
 
     /// Returns the configured stream format.
     pub const fn format(&self) -> StreamFormat {
-        self.format
+        self.capture_format
+    }
+
+    /// Returns the microphone capture format.
+    pub const fn capture_format(&self) -> StreamFormat {
+        self.capture_format
+    }
+
+    /// Returns the render-reference format.
+    pub const fn render_format(&self) -> StreamFormat {
+        self.render_format
     }
 
     /// Returns the active processing configuration.
@@ -151,7 +175,7 @@ impl DuplexProcessor {
     /// Rebuilds the processor after changing feature state.
     pub fn set_config(&mut self, config: ProcessingConfig) -> Result<(), DspError> {
         self.config = config;
-        self.apm = build_apm(self.format, &self.config);
+        self.apm = build_apm(self.capture_format, self.render_format, &self.config);
         self.apply_delay()
     }
 
@@ -163,7 +187,7 @@ impl DuplexProcessor {
 
     /// Supplies a render frame to AEC3. The output is unchanged.
     pub fn process_render(&mut self, frame: &AudioFrame) -> Result<AudioFrame, DspError> {
-        let mut output = AudioFrame::silence(self.format);
+        let mut output = AudioFrame::silence(self.render_format);
         self.process_render_into(frame, &mut output)?;
         Ok(output)
     }
@@ -174,8 +198,8 @@ impl DuplexProcessor {
         frame: &AudioFrame,
         output: &mut AudioFrame,
     ) -> Result<(), DspError> {
-        validate_frame(frame, self.format)?;
-        validate_frame(output, self.format)?;
+        validate_frame(frame, self.render_format)?;
+        validate_frame(output, self.render_format)?;
         self.process_render_into_unchecked(frame, output)
     }
 
@@ -198,7 +222,7 @@ impl DuplexProcessor {
 
     /// Processes one microphone frame after the matching render frame.
     pub fn process_capture(&mut self, frame: &AudioFrame) -> Result<AudioFrame, DspError> {
-        let mut output = AudioFrame::silence(self.format);
+        let mut output = AudioFrame::silence(self.capture_format);
         self.process_capture_into(frame, &mut output)?;
         Ok(output)
     }
@@ -209,8 +233,8 @@ impl DuplexProcessor {
         frame: &AudioFrame,
         output: &mut AudioFrame,
     ) -> Result<(), DspError> {
-        validate_frame(frame, self.format)?;
-        validate_frame(output, self.format)?;
+        validate_frame(frame, self.capture_format)?;
+        validate_frame(output, self.capture_format)?;
         self.process_capture_into_unchecked(frame, output)
     }
 
@@ -267,7 +291,11 @@ fn copy_frame(input: &AudioFrame, output: &mut AudioFrame) -> Result<(), DspErro
 }
 
 #[cfg(feature = "sonora")]
-fn build_apm(format: StreamFormat, config: &ProcessingConfig) -> sonora::AudioProcessing {
+fn build_apm(
+    capture_format: StreamFormat,
+    render_format: StreamFormat,
+    config: &ProcessingConfig,
+) -> sonora::AudioProcessing {
     use sonora::config::{EchoCanceller, MaxProcessingRate, NoiseSuppression, TransparentModeType};
     use sonora::{AudioProcessing, Config, StreamConfig};
 
@@ -300,11 +328,13 @@ fn build_apm(format: StreamFormat, config: &ProcessingConfig) -> sonora::AudioPr
             analyze_linear_aec_output_when_available: config.echo_cancellation,
         });
     }
-    let stream = StreamConfig::new(format.sample_rate_hz(), format.channels());
+    let capture_stream =
+        StreamConfig::new(capture_format.sample_rate_hz(), capture_format.channels());
+    let render_stream = StreamConfig::new(render_format.sample_rate_hz(), render_format.channels());
     AudioProcessing::builder()
         .config(sonora_config)
-        .capture_config(stream)
-        .render_config(stream)
+        .capture_config(capture_stream)
+        .render_config(render_stream)
         .build()
 }
 

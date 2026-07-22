@@ -367,7 +367,7 @@ pub fn default_state_path() -> Result<PathBuf, DefaultPathError> {
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
         .ok_or(DefaultPathError::StateDirectory)?;
     require_absolute(directory, "XDG_STATE_HOME or HOME")
-        .map(|path| path.join("goxlr-nexus/processing-v1.json"))
+        .map(|path| path.join("sonix/processing-v1.json"))
 }
 
 /// Returns the default per-user control socket path.
@@ -375,8 +375,7 @@ pub fn default_control_socket() -> Result<PathBuf, DefaultPathError> {
     let directory = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .ok_or(DefaultPathError::RuntimeDirectory)?;
-    require_absolute(directory, "XDG_RUNTIME_DIR")
-        .map(|path| path.join("goxlr-nexus/processing.sock"))
+    require_absolute(directory, "XDG_RUNTIME_DIR").map(|path| path.join("sonix/processing.sock"))
 }
 
 fn require_absolute(path: PathBuf, variable: &'static str) -> Result<PathBuf, DefaultPathError> {
