@@ -5,6 +5,8 @@
 
 use std::path::PathBuf;
 use std::process::Command;
+use std::thread;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
@@ -173,9 +175,7 @@ fn main() -> Result<()> {
     .context("decode Sonix config JSON")?;
     let runtime_config = runtime(config)?;
     match cli.command {
-        CommandKind::Daemon => ProcessingRuntime::new(runtime_config)?
-            .run()
-            .map_err(|error| anyhow!(error)),
+        CommandKind::Daemon => run_daemon(runtime_config),
         CommandKind::Status { json } => {
             let client = ControlClient::new(default_control_socket()?);
             let status = match client.status() {
@@ -218,4 +218,46 @@ fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn run_daemon(runtime_config: RuntimeConfig) -> Result<()> {
+    let raw_source = runtime_config.source().capture_source().to_owned();
+    let processed_source = runtime_config.source().source_name().to_owned();
+    let runtime = ProcessingRuntime::new(runtime_config)?;
+    let worker = thread::spawn(move || runtime.run());
+    let mut selected = None::<String>;
+
+    loop {
+        if worker.is_finished() {
+            return worker
+                .join()
+                .map_err(|_| anyhow!("Sonix runtime thread panicked"))?
+                .map_err(|error| anyhow!(error));
+        }
+        let desired = match ControlClient::new(default_control_socket()?).status() {
+            Ok(status) if status.daemon_running && status.healthy && status.active => {
+                processed_source.as_str()
+            }
+            _ => raw_source.as_str(),
+        };
+        if selected.as_deref() != Some(desired) {
+            if let Err(error) = set_default_source(desired) {
+                tracing::warn!(source = desired, error = %error, "cannot select Sonix microphone");
+            } else {
+                selected = Some(desired.to_owned());
+            }
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn set_default_source(source: &str) -> Result<()> {
+    let status = Command::new("pactl")
+        .args(["set-default-source", source])
+        .status()
+        .context("run pactl set-default-source")?;
+    if !status.success() {
+        bail!("pactl set-default-source failed with {status}");
+    }
+    Ok(())
 }
