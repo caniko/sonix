@@ -245,11 +245,9 @@ in {
       Unit = {
         Description = "GoXLR Nexus audio routing repair";
         After =
-          ["pipewire.service" "pipewire-pulse.service" "wireplumber.service" goxlrDaemonUnit]
-          ++ lib.optional cfg.processing.enable "goxlr-nexus-processing.service";
+          ["pipewire.service" "pipewire-pulse.service" "wireplumber.service" goxlrDaemonUnit];
         Wants =
-          ["pipewire.service" "pipewire-pulse.service" "wireplumber.service" goxlrDaemonUnit]
-          ++ lib.optional cfg.processing.enable "goxlr-nexus-processing.service";
+          ["pipewire.service" "pipewire-pulse.service" "wireplumber.service" goxlrDaemonUnit];
         PartOf = ["pipewire.service" "pipewire-pulse.service" "wireplumber.service"];
         StartLimitIntervalSec = 300;
         StartLimitBurst = 20;
@@ -275,28 +273,6 @@ in {
         TimeoutStopSec = 10;
         LogRateLimitIntervalSec = 30;
         LogRateLimitBurst = 100;
-      };
-      Install.WantedBy = ["default.target"];
-    };
-    systemd.user.services.goxlr-nexus-processing = lib.mkIf cfg.processing.enable {
-      Unit = {
-        Description = "GoXLR Nexus noise suppression and echo cancellation";
-        After = ["pipewire.service" "pipewire-pulse.service" "wireplumber.service"];
-        Wants = ["pipewire.service" "pipewire-pulse.service" "wireplumber.service"];
-        PartOf = ["pipewire.service" "pipewire-pulse.service" "wireplumber.service"];
-      };
-      Service = {
-        Type = "simple";
-        Environment = "PATH=${servicePath}";
-        ExecStart = "${package}/bin/goxlr-nexus --config ${configFile} processing daemon";
-        ExecStopPost = "${package}/bin/goxlr-nexus --config ${configFile} processing fail-open";
-        Restart = "on-failure";
-        RestartSec = 2;
-        CPUQuota = "35%";
-        MemoryHigh = "128M";
-        MemoryMax = "256M";
-        TasksMax = 64;
-        TimeoutStopSec = 10;
       };
       Install.WantedBy = ["default.target"];
     };

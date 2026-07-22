@@ -164,11 +164,9 @@ in {
     systemd.user.services.goxlr-nexus = {
       description = "GoXLR Nexus audio routing repair";
       after =
-        ["pipewire.service" "pipewire-pulse.service" "wireplumber.service" goxlrDaemonUnit]
-        ++ lib.optional cfg.processing.enable "goxlr-nexus-processing.service";
+        ["pipewire.service" "pipewire-pulse.service" "wireplumber.service" goxlrDaemonUnit];
       wants =
-        ["pipewire.service" "pipewire-pulse.service" "wireplumber.service" goxlrDaemonUnit]
-        ++ lib.optional cfg.processing.enable "goxlr-nexus-processing.service";
+        ["pipewire.service" "pipewire-pulse.service" "wireplumber.service" goxlrDaemonUnit];
       wantedBy = ["default.target"];
       serviceConfig = {
         Type = "simple";
@@ -180,25 +178,6 @@ in {
       unitConfig = {
         StartLimitIntervalSec = 300;
         StartLimitBurst = 20;
-      };
-    };
-    systemd.user.services.goxlr-nexus-processing = lib.mkIf cfg.processing.enable {
-      description = "GoXLR Nexus noise suppression and echo cancellation";
-      after = ["pipewire.service" "pipewire-pulse.service" "wireplumber.service"];
-      wants = ["pipewire.service" "pipewire-pulse.service" "wireplumber.service"];
-      wantedBy = ["default.target"];
-      serviceConfig = {
-        Type = "simple";
-        Environment = "PATH=${servicePath}";
-        ExecStart = "${package}/bin/goxlr-nexus --config ${configFile} processing daemon";
-        ExecStopPost = "${package}/bin/goxlr-nexus --config ${configFile} processing fail-open";
-        Restart = "on-failure";
-        RestartSec = 2;
-        CPUQuota = "35%";
-        MemoryHigh = "128M";
-        MemoryMax = "256M";
-        TasksMax = 64;
-        TimeoutStopSec = 10;
       };
     };
   };
