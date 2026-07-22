@@ -110,8 +110,15 @@
         pkgs,
         ...
       }:
-        import ./modules/nixos.nix {
-          inherit config lib pkgs self;
+        {
+          imports = [
+            (import ./modules/nixos/sonix.nix {
+              inherit config lib pkgs self;
+            })
+            (import ./modules/nixos.nix {
+              inherit config lib pkgs self;
+            })
+          ];
         };
       nixosModules.sonix = import ./modules/nixos/sonix.nix;
       homeModules = {
@@ -130,8 +137,15 @@
           pkgs,
           ...
         }:
-          import ./modules/home-manager.nix {
-            inherit config lib pkgs self;
+          {
+            imports = [
+              (import ./modules/home-manager/sonix.nix {
+                inherit config lib pkgs self;
+              })
+              (import ./modules/home-manager.nix {
+                inherit config lib pkgs self;
+              })
+            ];
           };
         goxlr-utility = {
           config,
