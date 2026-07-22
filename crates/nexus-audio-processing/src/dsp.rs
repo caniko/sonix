@@ -456,4 +456,23 @@ mod tests {
         assert_eq!(output.channels.len(), format.channels() as usize);
         assert_eq!(output.channels[0].len(), format.frame_samples());
     }
+
+    #[test]
+    fn processor_supports_mono_capture_with_stereo_render() {
+        let capture = StreamFormat::new(48_000, 1).unwrap();
+        let render = StreamFormat::new(48_000, 2).unwrap();
+        let config = ProcessingConfig {
+            noise_suppression: true,
+            echo_cancellation: true,
+            ..Default::default()
+        };
+        let mut processor = DuplexProcessor::new_with_formats(capture, render, config).unwrap();
+        let render_frame = AudioFrame::silence(render);
+        let capture_frame = AudioFrame::silence(capture);
+        let render_output = processor.process_render(&render_frame).unwrap();
+        let capture_output = processor.process_capture(&capture_frame).unwrap();
+        assert_eq!(render_output.channels.len(), 2);
+        assert_eq!(capture_output.channels.len(), 1);
+        assert_eq!(capture_output.channels[0].len(), capture.frame_samples());
+    }
 }
