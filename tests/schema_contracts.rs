@@ -49,8 +49,8 @@ fn observation_and_reconciliation_schemas_accept_representative_outputs() {
     assert_valid(
         include_str!("../schemas/observation-v1.schema.json"),
         json!({
-            "schema": "goxlr-nexus.observation/v1",
-            "producer": {"name": "goxlr-nexus", "version": "0.1.0"},
+            "schema": "sonix.goxlr.observation/v1",
+            "producer": {"name": "sonix-goxlr", "version": "0.1.0"},
             "capturedAt": 1,
             "host": "atlas",
             "sources": [{"source": "pipewire", "status": "ok"}],
@@ -61,8 +61,8 @@ fn observation_and_reconciliation_schemas_accept_representative_outputs() {
     assert_valid(
         include_str!("../schemas/plan-v1.schema.json"),
         json!({
-            "schema": "goxlr-nexus.plan/v1",
-            "producer": {"name": "goxlr-nexus", "version": "0.1.0"},
+            "schema": "sonix.goxlr.plan/v1",
+            "producer": {"name": "sonix-goxlr", "version": "0.1.0"},
             "readOnly": true,
             "requiresApply": true,
             "current": {"defaultSink": "sink", "defaultSource": "source"},
@@ -74,8 +74,8 @@ fn observation_and_reconciliation_schemas_accept_representative_outputs() {
     assert_valid(
         include_str!("../schemas/adopt-v1.schema.json"),
         json!({
-            "schema": "goxlr-nexus.adopt/v1",
-            "producer": {"name": "goxlr-nexus", "version": "0.1.0"},
+            "schema": "sonix.goxlr.adopt/v1",
+            "producer": {"name": "sonix-goxlr", "version": "0.1.0"},
             "readOnly": true,
             "config": {"outputSinks": [], "obsSources": []},
             "candidates": [],

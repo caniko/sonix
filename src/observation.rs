@@ -4,7 +4,7 @@ use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-pub const SCHEMA: &str = "goxlr-nexus.observation/v1";
+pub const SCHEMA: &str = "sonix.goxlr.observation/v1";
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]

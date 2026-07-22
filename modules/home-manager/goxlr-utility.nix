@@ -52,7 +52,7 @@ in
     package = mkOption {
       type = types.nullOr types.package;
       default = null;
-      defaultText = lib.literalExpression "inputs.goxlr-nexus.packages.${system}.default";
+      defaultText = lib.literalExpression "inputs.sonix.packages.${system}.default";
       description = "Package providing the deterministic goxlr-config CLI.";
     };
 

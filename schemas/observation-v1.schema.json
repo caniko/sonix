@@ -1,15 +1,15 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://codeberg.org/caniko/goxlr-nexus/schemas/observation-v1.schema.json",
+  "$id": "https://codeberg.org/caniko/sonix/schemas/observation-v1.schema.json",
   "title": "GoXLR Nexus observation v1",
   "type": "object",
   "required": ["schema", "producer", "capturedAt", "host", "sources", "facts", "factsDigest"],
   "properties": {
-    "schema": {"const": "goxlr-nexus.observation/v1"},
+    "schema": {"const": "sonix.goxlr.observation/v1"},
     "producer": {
       "type": "object",
       "required": ["name", "version"],
-      "properties": {"name": {"const": "goxlr-nexus"}, "version": {"type": "string"}}
+      "properties": {"name": {"const": "sonix-goxlr"}, "version": {"type": "string"}}
     },
     "capturedAt": {"type": "integer", "minimum": 0},
     "host": {"type": "string", "minLength": 1},

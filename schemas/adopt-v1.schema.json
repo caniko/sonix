@@ -1,16 +1,16 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://codeberg.org/caniko/goxlr-nexus/schemas/adopt-v1.schema.json",
+  "$id": "https://codeberg.org/caniko/sonix/schemas/adopt-v1.schema.json",
   "title": "GoXLR Nexus adoption report v1",
   "type": "object",
   "required": ["schema", "producer", "readOnly", "config", "candidates", "diagnostics"],
   "properties": {
-    "schema": {"const": "goxlr-nexus.adopt/v1"},
+    "schema": {"const": "sonix.goxlr.adopt/v1"},
     "producer": {
       "type": "object",
       "required": ["name", "version"],
       "properties": {
-        "name": {"const": "goxlr-nexus"},
+        "name": {"const": "sonix-goxlr"},
         "version": {"type": "string", "minLength": 1}
       },
       "additionalProperties": false

@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://codeberg.org/caniko/goxlr-nexus/schemas/plan-v2.schema.json",
+  "$id": "https://codeberg.org/caniko/sonix/schemas/plan-v2.schema.json",
   "title": "GoXLR Nexus reconciliation plan v2",
   "type": "object",
   "required": [
@@ -14,12 +14,12 @@
     "diagnostics"
   ],
   "properties": {
-    "schema": {"const": "goxlr-nexus.plan/v2"},
+    "schema": {"const": "sonix.goxlr.plan/v2"},
     "producer": {
       "type": "object",
       "required": ["name", "version"],
       "properties": {
-        "name": {"const": "goxlr-nexus"},
+        "name": {"const": "sonix-goxlr"},
         "version": {"type": "string", "minLength": 1}
       },
       "additionalProperties": false
