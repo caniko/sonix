@@ -1,0 +1,6 @@
+[ci]
+provider = "actions"
+platform = "forgejo"
+runtime = "nix"
+runner = "atlas-nix-trusted"
+workspace = true

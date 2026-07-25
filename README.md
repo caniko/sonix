@@ -1,5 +1,11 @@
 # Sonix
 
+<!-- simit:badges:start -->
+
+![CI](https://img.shields.io/badge/CI-managed-2088ff) [![crates.io](https://img.shields.io/badge/crates.io-ready-f46623)](https://crates.io/crates/nexus-audio-processing)
+
+<!-- simit:badges:end -->
+
 Sonix is the generic audio-processing umbrella. Its reusable hierarchy is
 `nexus -> external-input-only-nexus -> laptop-nexus`; the GoXLR router is an
 implementation of the same external-input contract. Murph uses the generic

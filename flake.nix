@@ -48,7 +48,11 @@
         LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
         BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.glibc.dev}/include -include ${spaBindgenHeader}";
       };
-      package = msrvCraneLib.buildPackage (commonArgs // {cargoArtifacts = null;});
+      package = msrvCraneLib.buildPackage (commonArgs
+        // {
+          cargoArtifacts = null;
+          cargoExtraArgs = "--locked --bins";
+        });
     in {
       packages = {
         default = package;
