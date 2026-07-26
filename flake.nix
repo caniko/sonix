@@ -85,25 +85,6 @@
       formatter = pkgs.alejandra;
     })
     // {
-      # Named subflake surfaces. They intentionally re-export the same
-      # validated implementation so consumers can compose the hierarchy
-      # without importing GoXLR-specific options.
-      nexus = {
-        packages = self.packages;
-        homeModules.default = self.homeModules.sonix;
-      };
-      external-input-only-nexus = {
-        packages = self.packages;
-        homeModules.default = self.homeModules.sonix;
-      };
-      laptop-nexus = {
-        packages = self.packages;
-        homeModules.default = self.homeModules.sonix;
-      };
-      noise-echo = {
-        packages = self.packages;
-        homeModules.default = self.homeModules.sonix;
-      };
       goxlr-nexus = {
         packages = self.packages;
         homeModules.default = self.homeModules.default;

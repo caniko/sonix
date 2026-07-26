@@ -6,10 +6,9 @@
 
 <!-- simit:badges:end -->
 
-Sonix is the generic audio-processing umbrella. Its reusable hierarchy is
-`nexus -> external-input-only-nexus -> laptop-nexus`; the GoXLR router is an
-implementation of the same external-input contract. Murph uses the generic
-external-input module directly, so it does not need a separate murph flake.
+Sonix provides reusable external-input audio processing; the GoXLR router
+composes the same module. Consumers use the `sonix` package and module
+directly.
 
 The `sonix` processor enables noise suppression and echo cancellation when its
 configured capture input is connected. It idles and fails open when that input
