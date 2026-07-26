@@ -11,7 +11,7 @@ decide how to expose the resulting virtual source to their own routing layer.
 
 ## Library use
 
-Add the portable processor to an application with the default `sonora` feature:
+Add the portable processor to an application:
 
 ```toml
 nexus-audio-processing = "0.1"
@@ -54,7 +54,6 @@ cargo publish -p nexus-audio-processing --dry-run
 
 ## Features
 
-- `sonora` (default): the portable DSP processor.
 - `pipewire-runtime`: Linux PipeWire streams, runtime state, and control IPC.
 
 The persisted processor state remains the small, human-inspectable

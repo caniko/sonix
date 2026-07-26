@@ -1,4 +1,4 @@
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -341,15 +341,15 @@ impl LockFile {
             source,
         })?;
         loop {
-            match fs4::FileExt::try_lock(&file) {
+            match file.try_lock() {
                 Ok(()) => return Ok(Self { _file: file }),
-                Err(fs4::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
                     thread::sleep(Duration::from_millis(5));
                 }
-                Err(fs4::TryLockError::WouldBlock) => {
+                Err(TryLockError::WouldBlock) => {
                     return Err(StateError::LockTimeout(path.to_path_buf()));
                 }
-                Err(fs4::TryLockError::Error(source)) => {
+                Err(TryLockError::Error(source)) => {
                     return Err(StateError::Write {
                         path: path.to_path_buf(),
                         source,

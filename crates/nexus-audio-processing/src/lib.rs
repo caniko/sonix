@@ -19,7 +19,6 @@ pub use control::{
     CONTROL_PROTOCOL, ControlClient, ControlCommand, ControlError, ControlRequest, ControlResponse,
     LEGACY_CONTROL_PROTOCOL, RuntimeStatus, offline_status,
 };
-#[cfg(feature = "sonora")]
 pub use dsp::DuplexProcessor;
 pub use dsp::{AudioFrame, DspError};
 pub use state::{

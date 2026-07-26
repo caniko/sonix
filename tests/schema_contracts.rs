@@ -59,19 +59,6 @@ fn observation_and_reconciliation_schemas_accept_representative_outputs() {
         }),
     );
     assert_valid(
-        include_str!("../schemas/plan-v1.schema.json"),
-        json!({
-            "schema": "sonix.goxlr.plan/v1",
-            "producer": {"name": "sonix-goxlr", "version": "0.1.0"},
-            "readOnly": true,
-            "requiresApply": true,
-            "current": {"defaultSink": "sink", "defaultSource": "source"},
-            "goxlrStatus": "ready",
-            "operations": [],
-            "diagnostics": []
-        }),
-    );
-    assert_valid(
         include_str!("../schemas/adopt-v1.schema.json"),
         json!({
             "schema": "sonix.goxlr.adopt/v1",

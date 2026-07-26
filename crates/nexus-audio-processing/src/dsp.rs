@@ -1,7 +1,5 @@
 use crate::config::StreamFormat;
-#[cfg(feature = "sonora")]
 use crate::config::{EchoDelay, ProcessingConfig};
-#[cfg(feature = "sonora")]
 use smallvec::SmallVec;
 use thiserror::Error;
 
@@ -13,7 +11,6 @@ pub enum DspError {
     #[error("invalid stream format: {0}")]
     Format(#[from] crate::config::FormatError),
     /// Sonora rejected a frame or stream parameter.
-    #[cfg(feature = "sonora")]
     #[error("sonora rejected audio: {0}")]
     Sonora(#[from] sonora::Error),
     /// The interleaved frame length does not match the configured format.
@@ -115,7 +112,6 @@ impl AudioFrame {
 }
 
 /// A Sonora-backed duplex processor.
-#[cfg(feature = "sonora")]
 #[derive(Debug)]
 pub struct DuplexProcessor {
     capture_format: StreamFormat,
@@ -124,7 +120,6 @@ pub struct DuplexProcessor {
     apm: sonora::AudioProcessing,
 }
 
-#[cfg(feature = "sonora")]
 impl DuplexProcessor {
     /// Creates a processor with the supplied format and feature state.
     pub fn new(format: StreamFormat, config: ProcessingConfig) -> Result<Self, DspError> {
@@ -267,7 +262,6 @@ impl DuplexProcessor {
     }
 }
 
-#[cfg(feature = "sonora")]
 fn validate_frame(frame: &AudioFrame, format: StreamFormat) -> Result<(), DspError> {
     let expected = format.frame_samples() * format.channels() as usize;
     let actual = frame.channels.iter().map(Vec::len).sum();
@@ -282,7 +276,6 @@ fn validate_frame(frame: &AudioFrame, format: StreamFormat) -> Result<(), DspErr
     Ok(())
 }
 
-#[cfg(feature = "sonora")]
 fn copy_frame(input: &AudioFrame, output: &mut AudioFrame) -> Result<(), DspError> {
     for (source, destination) in input.channels.iter().zip(&mut output.channels) {
         destination.copy_from_slice(source);
@@ -290,7 +283,6 @@ fn copy_frame(input: &AudioFrame, output: &mut AudioFrame) -> Result<(), DspErro
     Ok(())
 }
 
-#[cfg(feature = "sonora")]
 fn build_apm(
     capture_format: StreamFormat,
     render_format: StreamFormat,
@@ -338,7 +330,7 @@ fn build_apm(
         .build()
 }
 
-#[cfg(all(test, feature = "sonora"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{NoiseSuppressionLevel, ProcessingConfig};

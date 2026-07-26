@@ -1059,7 +1059,9 @@ async fn load_config(explicit: Option<&Path>) -> Result<Config> {
     let configured_path = explicit
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("SONIX_GOXLR_CONFIG").map(PathBuf::from));
-    let config_dir = dirs::config_dir();
+    let config_dir = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")));
     let path = configured_path.clone().or_else(|| {
         config_dir
             .as_ref()

@@ -116,7 +116,7 @@ in {
       }
       {
         assertion = !cfg.laptop.enable || (!cfg.externalInput.enable);
-        message = "programs.sonix.laptop and programs.sonix.externalInput are mutually exclusive; laptop inherits external-input-only-nexus";
+        message = "programs.sonix.laptop and programs.sonix.externalInput are mutually exclusive";
       }
     ];
     home.packages = lib.mkIf active [package pkgs.pipewire pkgs.pulseaudio];
