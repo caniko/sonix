@@ -83,12 +83,8 @@ pub(crate) fn processing_runtime_config(config: &super::Config) -> Result<Runtim
         config.profile.render_channels,
     )
     .map_err(|error| anyhow!(error))?;
-    let runtime =
-        RuntimeConfig::new_with_formats(capture_format, render_format, source, processing)
-            .map_err(|error| anyhow!(error))?
-            .with_state_path(default_state_path().map_err(|error| anyhow!(error))?)
-            .with_control_socket(default_control_socket().map_err(|error| anyhow!(error))?);
-    Ok(runtime)
+    RuntimeConfig::new_with_formats(capture_format, render_format, source, processing)
+        .map_err(|error| anyhow!(error))
 }
 
 pub(crate) fn processing_command(config: &super::Config, command: ProcessingCommand) -> Result<()> {
