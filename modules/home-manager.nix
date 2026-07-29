@@ -5,7 +5,8 @@
   self,
   ...
 }: let
-  cfg = config.programs.sonix.goxlr;
+  sonixCfg = config.programs.sonix;
+  cfg = sonixCfg.goxlr;
   inherit (lib) mkEnableOption mkIf mkOption types;
   package = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
   effectiveOutputSinks =
@@ -16,6 +17,76 @@
     if cfg.fallbackSink == null
     then cfg.jdsSink
     else cfg.fallbackSink;
+  effectiveCaptureSource =
+    if cfg.defaultSource == null
+    then
+      if sonixCfg.externalInput.enable
+      then sonixCfg.externalInput.captureSource
+      else "alsa_input.usb-TC-Helicon_GoXLR-00.HiFi__Headset__source"
+    else cfg.defaultSource;
+  effectiveRenderTarget =
+    if cfg.defaultSink == null
+    then
+      if sonixCfg.externalInput.enable
+      then sonixCfg.externalInput.renderTarget
+      else "alsa_output.usb-TC-Helicon_GoXLR-00.HiFi__Speaker__sink"
+    else cfg.defaultSink;
+  effectiveCaptureSampleRate =
+    if sonixCfg.externalInput.enable
+    then sonixCfg.externalInput.captureSampleRate
+    else 48000;
+  effectiveRenderSampleRate =
+    if sonixCfg.externalInput.enable
+    then sonixCfg.externalInput.renderSampleRate
+    else 48000;
+  effectiveCaptureChannels =
+    if sonixCfg.externalInput.enable
+    then sonixCfg.externalInput.captureChannels
+    else 2;
+  effectiveRenderChannels =
+    if sonixCfg.externalInput.enable
+    then sonixCfg.externalInput.renderChannels
+    else 2;
+  effectiveProcessing = {
+    sourceName =
+      if cfg.processing.sourceName == null
+      then
+        if sonixCfg.externalInput.enable
+        then sonixCfg.externalInput.sourceName
+        else "goxlr_nexus.processed_mic"
+      else cfg.processing.sourceName;
+    sourceDescription =
+      if cfg.processing.sourceDescription == null
+      then
+        if sonixCfg.externalInput.enable
+        then sonixCfg.externalInput.sourceDescription
+        else "GoXLR Nexus processed microphone"
+      else cfg.processing.sourceDescription;
+    noiseSuppression =
+      cfg.processing.enable
+      != false
+      && (
+        if cfg.processing.noiseSuppression == null
+        then sonixCfg.processing.noiseSuppression
+        else cfg.processing.noiseSuppression
+      );
+    echoCancellation =
+      cfg.processing.enable
+      != false
+      && (
+        if cfg.processing.echoCancellation == null
+        then sonixCfg.processing.echoCancellation
+        else cfg.processing.echoCancellation
+      );
+    noiseLevel =
+      if cfg.processing.noiseLevel == null
+      then sonixCfg.processing.noiseLevel
+      else cfg.processing.noiseLevel;
+    echoDelayMs =
+      if cfg.processing.echoDelayMs == null
+      then sonixCfg.processing.echoDelayMs
+      else cfg.processing.echoDelayMs;
+  };
   pklString = value: builtins.toJSON value;
   outputSinksPkl = lib.concatMapStringsSep "\n" (sink: "    ${pklString sink}") effectiveOutputSinks;
   goxlrDaemonUnit = "app-goxlr\\x2ddaemon@autostart.service";
@@ -50,6 +121,16 @@
       else "false"
     }
 
+        profile = new {
+        defaultSink = ${pklString effectiveRenderTarget}
+        defaultSource = ${pklString effectiveCaptureSource}
+        monitorSource = ${pklString cfg.monitorSource}
+        captureSampleRate = ${toString effectiveCaptureSampleRate}
+        renderSampleRate = ${toString effectiveRenderSampleRate}
+        captureChannels = ${toString effectiveCaptureChannels}
+        renderChannels = ${toString effectiveRenderChannels}
+        }
+
         obs = new {
         enable = ${
       if cfg.obs.enable
@@ -65,25 +146,20 @@
         }
 
         processing = new {
-        enable = ${
-      if cfg.processing.enable
-      then "true"
-      else "false"
-    }
-        sourceName = ${pklString cfg.processing.sourceName}
-        sourceDescription = ${pklString cfg.processing.sourceDescription}
+        sourceName = ${pklString effectiveProcessing.sourceName}
+        sourceDescription = ${pklString effectiveProcessing.sourceDescription}
         noiseSuppression = ${
-      if cfg.processing.noiseSuppression
+      if effectiveProcessing.noiseSuppression
       then "true"
       else "false"
     }
         echoCancellation = ${
-      if cfg.processing.echoCancellation
+      if effectiveProcessing.echoCancellation
       then "true"
       else "false"
     }
-        noiseLevel = ${pklString cfg.processing.noiseLevel}
-        ${lib.optionalString (cfg.processing.echoDelayMs != null) ''echoDelay = new { mode = "fixed"; milliseconds = ${toString cfg.processing.echoDelayMs} }''}
+        noiseLevel = ${pklString effectiveProcessing.noiseLevel}
+        ${lib.optionalString (effectiveProcessing.echoDelayMs != null) ''echoDelay = new { mode = "fixed"; milliseconds = ${toString effectiveProcessing.echoDelayMs} }''}
         }
   '';
 in {
@@ -101,6 +177,16 @@ in {
     thinkpadSink = mkOption {
       type = types.nullOr types.str;
       default = null;
+    };
+    defaultSink = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      description = "Deprecated alias for programs.sonix.externalInput.renderTarget.";
+    };
+    defaultSource = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      description = "Deprecated alias for programs.sonix.externalInput.captureSource.";
     };
     outputSinks = mkOption {
       type = types.nullOr (types.listOf types.str);
@@ -131,36 +217,46 @@ in {
       default = false;
       description = "Observe and report routing drift without applying audio mutations.";
     };
+    monitorSource = mkOption {
+      type = types.str;
+      default = "alsa_input.usb-TC-Helicon_GoXLR-00.HiFi__Line4__source";
+      description = "GoXLR stream-mix source used for routing and monitoring.";
+    };
     processing = {
       enable = mkOption {
-        type = types.bool;
-        default = true;
-        description = "Run the separate user-level PipeWire processing service.";
+        type = types.nullOr types.bool;
+        default = null;
+        description = "Deprecated compatibility option; processing is embedded in GoXLR Nexus.";
       };
       sourceName = mkOption {
-        type = types.str;
-        default = "goxlr_nexus.processed_mic";
+        type = types.nullOr types.str;
+        default = null;
+        description = "Deprecated alias for programs.sonix.externalInput.sourceName.";
       };
       sourceDescription = mkOption {
-        type = types.str;
-        default = "GoXLR Nexus processed microphone";
+        type = types.nullOr types.str;
+        default = null;
+        description = "Deprecated alias for programs.sonix.externalInput.sourceDescription.";
       };
       noiseSuppression = mkOption {
-        type = types.bool;
-        default = false;
+        type = types.nullOr types.bool;
+        default = null;
+        description = "Deprecated alias for programs.sonix.processing.noiseSuppression.";
       };
       echoCancellation = mkOption {
-        type = types.bool;
-        default = false;
+        type = types.nullOr types.bool;
+        default = null;
+        description = "Deprecated alias for programs.sonix.processing.echoCancellation.";
       };
       noiseLevel = mkOption {
-        type = types.enum ["low" "moderate" "high" "very-high"];
-        default = "high";
+        type = types.nullOr (types.enum ["low" "moderate" "high" "very-high"]);
+        default = null;
+        description = "Deprecated alias for programs.sonix.processing.noiseLevel.";
       };
       echoDelayMs = mkOption {
         type = types.nullOr (types.ints.between 0 500);
         default = null;
-        description = "Optional fixed AEC delay in milliseconds; null selects automatic timing.";
+        description = "Deprecated alias for programs.sonix.processing.echoDelayMs.";
       };
     };
     obs = {
@@ -227,6 +323,43 @@ in {
     home.packages = [package];
     assertions = [
       {
+        assertion = !sonixCfg.laptop.enable;
+        message = "programs.sonix.goxlr.enable cannot be combined with programs.sonix.laptop.enable.";
+      }
+      {
+        assertion = effectiveCaptureSource != "default" && effectiveRenderTarget != "default";
+        message = "programs.sonix.goxlr requires concrete externalInput captureSource and renderTarget node names.";
+      }
+      {
+        assertion = !sonixCfg.externalInput.enable || (effectiveCaptureChannels > 0 && effectiveRenderChannels > 0);
+        message = "programs.sonix.goxlr requires positive externalInput channel counts.";
+      }
+      {
+        assertion = builtins.all (value: lib.strings.trim value != "") [
+          effectiveCaptureSource
+          effectiveRenderTarget
+          effectiveProcessing.sourceName
+          effectiveProcessing.sourceDescription
+          cfg.monitorSource
+        ];
+        message = "Sonix and GoXLR audio node names must not be blank.";
+      }
+      {
+        assertion = builtins.all (rate: rate >= 8000 && rate <= 384000 && (rate / 100) * 100 == rate) [
+          effectiveCaptureSampleRate
+          effectiveRenderSampleRate
+        ];
+        message = "Sonix sample rates must be between 8000 and 384000 Hz and divisible by 100.";
+      }
+      {
+        assertion = cfg.outputSinks == null || lib.unique cfg.outputSinks == cfg.outputSinks;
+        message = "programs.sonix.goxlr.outputSinks must not contain duplicates.";
+      }
+      {
+        assertion = cfg.maxMonitorSinkVolume == null || (cfg.maxMonitorSinkVolume >= 0.0 && cfg.maxMonitorSinkVolume <= 1.0);
+        message = "programs.sonix.goxlr.maxMonitorSinkVolume must be between 0 and 1.";
+      }
+      {
         assertion = !cfg.obs.manageSettings || !cfg.obs.authRequired || cfg.obs.passwordFile != null;
         message = "programs.sonix.goxlr.obs.authRequired requires programs.sonix.goxlr.obs.passwordFile when manageSettings is enabled.";
       }
@@ -243,11 +376,9 @@ in {
     };
     systemd.user.services.goxlr-nexus = {
       Unit = {
-        Description = "GoXLR Nexus audio routing repair";
-        After =
-          ["pipewire.service" "pipewire-pulse.service" "wireplumber.service" goxlrDaemonUnit];
-        Wants =
-          ["pipewire.service" "pipewire-pulse.service" "wireplumber.service" goxlrDaemonUnit];
+        Description = "GoXLR Nexus routing with embedded Sonix processing";
+        After = ["pipewire.service" "pipewire-pulse.service" "wireplumber.service" goxlrDaemonUnit];
+        Wants = ["pipewire.service" "pipewire-pulse.service" "wireplumber.service" goxlrDaemonUnit];
         PartOf = ["pipewire.service" "pipewire-pulse.service" "wireplumber.service"];
         StartLimitIntervalSec = 300;
         StartLimitBurst = 20;
@@ -264,12 +395,13 @@ in {
           "-${pkgs.pulseaudio}/bin/pactl set-card-profile ${lib.escapeShellArg cfg.goxlrCard} ${lib.escapeShellArg cfg.goxlrProfile}"
         ];
         ExecStart = "${package}/bin/goxlr-nexus --config ${configFile} follow";
+        ExecStopPost = "-${package}/bin/goxlr-nexus --config ${configFile} processing fail-open";
         Restart = "on-failure";
         RestartSec = 5;
-        CPUQuota = "10%";
-        MemoryHigh = "64M";
-        MemoryMax = "128M";
-        TasksMax = 32;
+        CPUQuota = "35%";
+        MemoryHigh = "128M";
+        MemoryMax = "256M";
+        TasksMax = 64;
         TimeoutStopSec = 10;
         LogRateLimitIntervalSec = 30;
         LogRateLimitBurst = 100;

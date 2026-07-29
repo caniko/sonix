@@ -87,24 +87,23 @@
     // {
       goxlr-nexus = {
         packages = self.packages;
-        homeModules.default = self.homeModules.default;
+        homeModules.default = self.homeModules.goxlr-nexus;
       };
       nixosModules.default = {
         config,
         lib,
         pkgs,
         ...
-      }:
-        {
-          imports = [
-            (import ./modules/nixos/sonix.nix {
-              inherit config lib pkgs self;
-            })
-            (import ./modules/nixos.nix {
-              inherit config lib pkgs self;
-            })
-          ];
-        };
+      }: {
+        imports = [
+          (import ./modules/nixos/sonix.nix {
+            inherit config lib pkgs self;
+          })
+          (import ./modules/nixos.nix {
+            inherit config lib pkgs self;
+          })
+        ];
+      };
       nixosModules.sonix = import ./modules/nixos/sonix.nix;
       homeModules = {
         sonix = {
@@ -121,17 +120,16 @@
           lib,
           pkgs,
           ...
-        }:
-          {
-            imports = [
-              (import ./modules/home-manager/sonix.nix {
-                inherit config lib pkgs self;
-              })
-              (import ./modules/home-manager.nix {
-                inherit config lib pkgs self;
-              })
-            ];
-          };
+        }: {
+          imports = [
+            (import ./modules/home-manager/sonix.nix {
+              inherit config lib pkgs self;
+            })
+            (import ./modules/home-manager.nix {
+              inherit config lib pkgs self;
+            })
+          ];
+        };
         goxlr-utility = {
           config,
           lib,
@@ -140,7 +138,7 @@
         }:
           import ./modules/home-manager/goxlr-utility.nix {
             inherit config lib pkgs self;
-        };
+          };
         default = self.homeModules.sonix;
       };
       homeManagerModules = self.homeModules;

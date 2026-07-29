@@ -11,12 +11,15 @@ profile = new {
   defaultSink = "alsa_output.usb-TC-Helicon_GoXLR-00.HiFi__Speaker__sink"
   defaultSource = "alsa_input.usb-TC-Helicon_GoXLR-00.HiFi__Headset__source"
   monitorSource = "alsa_input.usb-TC-Helicon_GoXLR-00.HiFi__Line4__source"
+  captureSampleRate = 48000
+  renderSampleRate = 48000
+  captureChannels = 2
+  renderChannels = 2
 }
 
 processing = new {
-  // The processor is a separate user service. Both stages are fail-open and
-  // off by default; use `goxlr-nexus processing noise on` or `echo on` to enable one.
-  enable = true
+  // Sonix processing runs inside the GoXLR Nexus process. Both stages are
+  // fail-open and can be changed at runtime with the processing subcommands.
   sourceName = "goxlr_nexus.processed_mic"
   sourceDescription = "GoXLR Nexus processed microphone"
   noiseSuppression = false

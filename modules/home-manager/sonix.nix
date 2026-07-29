@@ -10,6 +10,7 @@
     if cfg.laptop.enable
     then cfg.laptop
     else cfg.externalInput;
+  goxlrEnabled = lib.attrByPath ["goxlr" "enable"] false cfg;
   package = self.packages.${pkgs.stdenv.hostPlatform.system}.sonix;
   jsonConfig = pkgs.writeText "sonix-processing-config.json" (builtins.toJSON {
     captureSource = external.captureSource;
@@ -26,9 +27,13 @@
     echoDelay =
       if cfg.processing.echoDelayMs == null
       then {mode = "auto";}
-      else {mode = "fixed"; milliseconds = cfg.processing.echoDelayMs;};
+      else {
+        mode = "fixed";
+        milliseconds = cfg.processing.echoDelayMs;
+      };
   });
   active = cfg.enable && (cfg.externalInput.enable || cfg.laptop.enable);
+  standalone = active && !goxlrEnabled;
 in {
   options.programs.sonix = {
     enable = lib.mkEnableOption "Sonix generic audio processing";
@@ -74,18 +79,39 @@ in {
 
     laptop = {
       enable = lib.mkEnableOption "laptop Sonix input processing";
-      captureSource = lib.mkOption {type = lib.types.str; default = "default";};
-      renderTarget = lib.mkOption {type = lib.types.str; default = "default";};
-      sourceName = lib.mkOption {type = lib.types.str; default = "sonix.laptop.processed_mic";};
-      sourceDescription = lib.mkOption {type = lib.types.str; default = "Sonix laptop processed microphone";};
-      captureSampleRate = lib.mkOption {type = lib.types.ints.positive; default = 48000;};
-      renderSampleRate = lib.mkOption {type = lib.types.ints.positive; default = 48000;};
+      captureSource = lib.mkOption {
+        type = lib.types.str;
+        default = "default";
+      };
+      renderTarget = lib.mkOption {
+        type = lib.types.str;
+        default = "default";
+      };
+      sourceName = lib.mkOption {
+        type = lib.types.str;
+        default = "sonix.laptop.processed_mic";
+      };
+      sourceDescription = lib.mkOption {
+        type = lib.types.str;
+        default = "Sonix laptop processed microphone";
+      };
+      captureSampleRate = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 48000;
+      };
+      renderSampleRate = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 48000;
+      };
       captureChannels = lib.mkOption {
         type = lib.types.ints.between 0 32;
         default = 0;
         description = "Zero detects native external-microphone layout; built-ins can be pinned to mono.";
       };
-      renderChannels = lib.mkOption {type = lib.types.ints.between 1 32; default = 2;};
+      renderChannels = lib.mkOption {
+        type = lib.types.ints.between 1 32;
+        default = 2;
+      };
     };
 
     processing = {
@@ -111,8 +137,24 @@ in {
   config = lib.mkIf cfg.enable {
     assertions = [
       {
-        assertion = !active || external.captureSource != "";
-        message = "programs.sonix requires a captureSource for an active implementation";
+        assertion =
+          !active
+          || builtins.all (value: lib.strings.trim value != "") [
+            external.captureSource
+            external.renderTarget
+            external.sourceName
+            external.sourceDescription
+          ];
+        message = "programs.sonix requires non-empty audio node and virtual-source names for an active implementation";
+      }
+      {
+        assertion =
+          !active
+          || builtins.all (rate: rate >= 8000 && rate <= 384000 && (rate / 100) * 100 == rate) [
+            external.captureSampleRate
+            external.renderSampleRate
+          ];
+        message = "programs.sonix sample rates must be between 8000 and 384000 Hz and divisible by 100";
       }
       {
         assertion = !cfg.laptop.enable || (!cfg.externalInput.enable);
@@ -120,7 +162,7 @@ in {
       }
     ];
     home.packages = lib.mkIf active [package pkgs.pipewire pkgs.pulseaudio];
-    systemd.user.services.sonix-noise-echo = lib.mkIf active {
+    systemd.user.services.sonix-noise-echo = lib.mkIf standalone {
       Unit = {
         Description = "Sonix echo cancellation and noise suppression";
         After = ["pipewire.service" "pipewire-pulse.service" "wireplumber.service"];
@@ -131,7 +173,7 @@ in {
         Type = "simple";
         Environment = "PATH=${lib.makeBinPath [package pkgs.pipewire pkgs.pulseaudio]}";
         ExecStart = "${package}/bin/sonix --config ${jsonConfig} daemon";
-        ExecStopPost = "${package}/bin/sonix --config ${jsonConfig} fail-open";
+        ExecStopPost = "-${package}/bin/sonix --config ${jsonConfig} fail-open";
         Restart = "on-failure";
         RestartSec = 2;
         CPUQuota = "35%";

@@ -95,14 +95,15 @@ profile.
 sources in the active OBS scene. It does not rewrite OBS global Desktop Audio or
 Mic/Aux devices.
 
-## Optional microphone processing
+## Embedded microphone processing
 
-The separate `goxlr-nexus-processing` user service publishes a 48 kHz stereo
-PipeWire virtual microphone backed by the `nexus-audio-processing` crate. The
+When GoXLR Nexus is enabled, the same process publishes a PipeWire virtual
+microphone using the configured sample rates and channel counts, backed by the
+`nexus-audio-processing` crate. The
 crate uses Sonora's current WebRTC noise suppression and AEC3 implementations;
 the render monitor is fed to AEC before the GoXLR capture is processed. Both
-stages are off by default, and state is persisted independently under the XDG
-state directory:
+stages are controlled by the top-level Sonix settings and state is persisted
+independently under the XDG state directory:
 
 ```sh
 goxlr-nexus processing noise on
@@ -110,15 +111,16 @@ goxlr-nexus processing echo on
 goxlr-nexus processing status --json
 ```
 
-The routing controller selects the processed source only when the daemon is
-healthy and its virtual node is present. If the daemon, PipeWire node, or DSP
-fails, routing falls back to the configured raw GoXLR microphone; the service's
-stop hook also restores that raw source.
+The routing controller selects the processed source only when the embedded
+runtime is healthy, its virtual node is present, and its capture/render targets
+are the configured GoXLR nodes. If the runtime, PipeWire endpoint, or DSP fails,
+routing falls back to the configured raw GoXLR microphone. Shutdown and service
+failure also restore that raw source.
 
 The processor stores its state at
-`$XDG_STATE_HOME/goxlr-nexus/processing-v1.json` (or
-`$HOME/.local/state/goxlr-nexus/processing-v1.json`) and serves control IPC at
-`$XDG_RUNTIME_DIR/goxlr-nexus/processing.sock`. These environment-provided
+`$XDG_STATE_HOME/sonix/processing-v1.json` (or
+`$HOME/.local/state/sonix/processing-v1.json`) and serves control IPC at
+`$XDG_RUNTIME_DIR/sonix/processing.sock`. These environment-provided
 directories must be absolute; there is no shared `/tmp` fallback. The state
 file is written atomically under an advisory lock, and the control socket is
 created with user-only permissions.

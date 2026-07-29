@@ -1,5 +1,6 @@
 use std::fs;
 use std::io::{Read, Write};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
@@ -7,6 +8,7 @@ use std::thread;
 
 use crossbeam_queue::ArrayQueue;
 use pipewire as pw;
+use pw::channel::{Receiver, Sender};
 use pw::properties::properties;
 use pw::spa;
 use pw::spa::pod::Pod;
@@ -54,7 +56,7 @@ pub enum RuntimeError {
     /// A frame pool could not be initialized to its fixed capacity.
     #[error("processing frame pool initialization failed")]
     FramePoolFull,
-    /// A runtime worker thread panicked during shutdown.
+    /// A runtime worker thread panicked.
     #[error("processing runtime thread {0} panicked")]
     ThreadPanicked(&'static str),
     /// A secure default state or runtime directory was not available.
@@ -65,7 +67,6 @@ pub enum RuntimeError {
     ControlServer(String),
 }
 
-#[derive(Debug)]
 struct SharedRuntime {
     config: Mutex<ProcessingConfig>,
     defaults: ProcessingConfig,
@@ -83,14 +84,31 @@ struct SharedRuntime {
     healthy: AtomicBool,
     active: AtomicBool,
     capture_connected: AtomicBool,
+    render_connected: AtomicBool,
     worker: OnceLock<thread::Thread>,
     status: Mutex<RuntimeStatus>,
+    shutdown: Sender<()>,
+    terminal_error: Mutex<Option<String>>,
+}
+
+/// Requests a running processing runtime to stop its PipeWire loop.
+#[derive(Clone)]
+pub struct ProcessingRuntimeShutdown {
+    sender: Sender<()>,
+}
+
+impl ProcessingRuntimeShutdown {
+    /// Requests shutdown. The runtime remains responsible for joining its workers.
+    pub fn shutdown(&self) {
+        let _ = self.sender.send(());
+    }
 }
 
 /// A long-lived PipeWire capture, processing, and virtual-source runtime.
-#[derive(Debug)]
 pub struct ProcessingRuntime {
     config: RuntimeConfig,
+    shutdown: ProcessingRuntimeShutdown,
+    shutdown_receiver: Receiver<()>,
 }
 
 impl ProcessingRuntime {
@@ -103,7 +121,17 @@ impl ProcessingRuntime {
         if config.control_socket().is_none() {
             config = config.with_control_socket(default_control_socket()?);
         }
-        Ok(Self { config })
+        let (sender, receiver) = pw::channel::channel();
+        Ok(Self {
+            config,
+            shutdown: ProcessingRuntimeShutdown { sender },
+            shutdown_receiver: receiver,
+        })
+    }
+
+    /// Returns a handle that can stop this runtime from another thread.
+    pub fn shutdown_handle(&self) -> ProcessingRuntimeShutdown {
+        self.shutdown.clone()
     }
 
     /// Runs the runtime until PipeWire or the process exits.
@@ -112,6 +140,8 @@ impl ProcessingRuntime {
         let render_format = self.config.render_format();
         let source = self.config.source();
         let state_defaults = self.config.processing().clone();
+        let shutdown_receiver = self.shutdown_receiver;
+        let shutdown_sender = self.shutdown.sender.clone();
         let state_path = self
             .config
             .state_path()
@@ -159,8 +189,11 @@ impl ProcessingRuntime {
             healthy: AtomicBool::new(false),
             active: AtomicBool::new(false),
             capture_connected: AtomicBool::new(false),
+            render_connected: AtomicBool::new(false),
             worker: OnceLock::new(),
             status: Mutex::new(status),
+            shutdown: shutdown_sender,
+            terminal_error: Mutex::new(None),
         });
 
         // Publish the initial state before either worker can report a failure.
@@ -227,6 +260,14 @@ impl ProcessingRuntime {
             &capture_params,
         )?;
 
+        let shutdown_shared = Arc::clone(&shared);
+        let shutdown_loop = main_loop.clone();
+        let shutdown_receiver = shutdown_receiver.attach(main_loop.loop_(), move |_| {
+            shutdown_shared.stop.store(true, Ordering::Release);
+            wake_worker(&shutdown_shared);
+            shutdown_loop.quit();
+        });
+
         let socket_path = self
             .config
             .control_socket()
@@ -234,10 +275,23 @@ impl ProcessingRuntime {
             .ok_or(crate::state::DefaultPathError::RuntimeDirectory)?;
         let server_socket_path = socket_path.clone();
         let server_shared = Arc::clone(&shared);
+        let server_panic_shared = Arc::clone(&shared);
         let (server_ready, server_started) = mpsc::sync_channel(1);
         let server = thread::Builder::new()
             .name("nexus-processing-control".into())
-            .spawn(move || control_server(&server_socket_path, server_shared, server_ready))
+            .spawn(move || {
+                if let Err(payload) = catch_unwind(AssertUnwindSafe(|| {
+                    control_server(&server_socket_path, server_shared, server_ready)
+                })) {
+                    mark_terminal(
+                        &server_panic_shared,
+                        format!(
+                            "control server panicked: {}",
+                            panic_message(payload.as_ref())
+                        ),
+                    );
+                }
+            })
             .map_err(RuntimeError::Io)?;
         match server_started.recv() {
             Ok(Ok(())) => {}
@@ -254,12 +308,25 @@ impl ProcessingRuntime {
         }
 
         let worker_shared = Arc::clone(&shared);
+        let worker_panic_shared = Arc::clone(&shared);
         let worker_capture_format = capture_format;
         let worker_render_format = render_format;
         let worker = match thread::Builder::new()
             .name("nexus-audio-dsp".into())
             .spawn(move || {
-                processing_worker(worker_shared, worker_capture_format, worker_render_format)
+                match catch_unwind(AssertUnwindSafe(|| {
+                    processing_worker(worker_shared, worker_capture_format, worker_render_format)
+                })) {
+                    Ok(result) => result,
+                    Err(payload) => {
+                        let error = RuntimeError::ThreadPanicked("dsp worker");
+                        mark_terminal(
+                            &worker_panic_shared,
+                            format!("{error}: {}", panic_message(payload.as_ref())),
+                        );
+                        Err(error)
+                    }
+                }
             }) {
             Ok(worker) => worker,
             Err(error) => {
@@ -276,15 +343,25 @@ impl ProcessingRuntime {
         shared.stop.store(true, Ordering::Release);
         wake_control_server(&socket_path);
         shared.worker.get().map(thread::Thread::unpark);
+        drop(shutdown_receiver);
         drop(source);
         drop(capture);
         drop(render);
-        worker
+        let worker_result = worker
             .join()
             .map_err(|_| RuntimeError::ThreadPanicked("dsp worker"))?;
         server
             .join()
             .map_err(|_| RuntimeError::ThreadPanicked("control server"))?;
+        worker_result?;
+        if let Some(error) = shared
+            .terminal_error
+            .lock()
+            .map_err(|_| RuntimeError::ConfigLockPoisoned)?
+            .clone()
+        {
+            return Err(RuntimeError::Io(std::io::Error::other(error)));
+        }
         Ok(())
     }
 }
@@ -311,7 +388,6 @@ enum StreamRole {
     Output,
 }
 
-#[derive(Debug)]
 struct StreamData {
     format: crate::StreamFormat,
     role: StreamRole,
@@ -351,17 +427,23 @@ fn make_input_stream<'a>(
             scratch: Vec::new(),
         })
         .state_changed(|_, data, _, new| {
-            if matches!(data.role, StreamRole::Capture) {
-                let connected = matches!(new, pw::stream::StreamState::Streaming);
-                data.shared
+            let connected = matches!(new, pw::stream::StreamState::Streaming);
+            match data.role {
+                StreamRole::Capture => data
+                    .shared
                     .capture_connected
-                    .store(connected, Ordering::Release);
-                if !connected {
-                    data.shared.active.store(false, Ordering::Release);
-                }
+                    .store(connected, Ordering::Release),
+                StreamRole::Render => data
+                    .shared
+                    .render_connected
+                    .store(connected, Ordering::Release),
+                StreamRole::Output => {}
+            }
+            if matches!(data.role, StreamRole::Capture | StreamRole::Render) && !connected {
+                data.shared.active.store(false, Ordering::Release);
             }
             if matches!(new, pw::stream::StreamState::Error(_)) {
-                mark_unhealthy(&data.shared, format!("{new:?}"));
+                mark_terminal(&data.shared, format!("PipeWire stream entered {new:?}"));
             }
         })
         .process(|stream, data| {
@@ -415,6 +497,11 @@ fn make_output_stream<'a>(
             shared,
             pending: Vec::with_capacity(format.frame_samples() * format.channels() as usize * 4),
             scratch: vec![0.0; format.frame_samples() * format.channels() as usize],
+        })
+        .state_changed(|_, data, _, new| {
+            if matches!(new, pw::stream::StreamState::Error(_)) {
+                mark_terminal(&data.shared, format!("PipeWire stream entered {new:?}"));
+            }
         })
         .process(|stream, data| {
             let Some(mut buffer) = stream.dequeue_buffer() else {
@@ -547,13 +634,14 @@ fn processing_worker(
     shared: Arc<SharedRuntime>,
     capture_format: crate::StreamFormat,
     render_format: crate::StreamFormat,
-) {
+) -> Result<(), RuntimeError> {
     let _ = shared.worker.set(thread::current());
     let mut config = match shared.config.lock() {
         Ok(value) => value.clone(),
         Err(_) => {
-            mark_unhealthy(&shared, RuntimeError::ConfigLockPoisoned.to_string());
-            return;
+            let error = RuntimeError::ConfigLockPoisoned;
+            mark_terminal(&shared, error.to_string());
+            return Err(error);
         }
     };
     let mut config_revision = shared.config_revision.load(Ordering::Acquire);
@@ -561,8 +649,8 @@ fn processing_worker(
         match DuplexProcessor::new_with_formats(capture_format, render_format, config.clone()) {
             Ok(processor) => processor,
             Err(error) => {
-                mark_unhealthy(&shared, error.to_string());
-                return;
+                mark_terminal(&shared, error.to_string());
+                return Err(error.into());
             }
         };
     let silence = AudioFrame::silence(render_format);
@@ -573,8 +661,9 @@ fn processing_worker(
             let updated = match shared.config.lock() {
                 Ok(value) => value.clone(),
                 Err(_) => {
-                    mark_unhealthy(&shared, RuntimeError::ConfigLockPoisoned.to_string());
-                    return;
+                    let error = RuntimeError::ConfigLockPoisoned;
+                    mark_terminal(&shared, error.to_string());
+                    return Err(error);
                 }
             };
             config_revision = current_revision;
@@ -618,7 +707,9 @@ fn processing_worker(
                     status.last_error = None;
                 }
                 shared.active.store(
-                    config.active() && shared.capture_connected.load(Ordering::Acquire),
+                    config.active()
+                        && shared.capture_connected.load(Ordering::Acquire)
+                        && shared.render_connected.load(Ordering::Acquire),
                     Ordering::Release,
                 );
             }
@@ -628,6 +719,7 @@ fn processing_worker(
             }
         }
     }
+    Ok(())
 }
 
 fn mark_unhealthy(shared: &SharedRuntime, error: String) {
@@ -638,6 +730,24 @@ fn mark_unhealthy(shared: &SharedRuntime, error: String) {
         status.retries = shared.retries.load(Ordering::Relaxed);
         status.dropped_frames = shared.dropped_frames.load(Ordering::Relaxed);
     }
+}
+
+fn mark_terminal(shared: &SharedRuntime, error: String) {
+    if let Ok(mut terminal_error) = shared.terminal_error.lock() {
+        *terminal_error = Some(error.clone());
+    }
+    mark_unhealthy(shared, error);
+    shared.stop.store(true, Ordering::Release);
+    wake_worker(shared);
+    let _ = shared.shutdown.send(());
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_string())
 }
 
 fn recycle_frame(pool: &ArrayQueue<AudioFrame>, frame: AudioFrame) {
@@ -703,7 +813,12 @@ fn control_server(
                         }
                     }
                 }
-                Err(_) => break,
+                Err(error) => {
+                    if !shared.stop.load(Ordering::Acquire) {
+                        mark_terminal(&shared, format!("control socket accept failed: {error}"));
+                    }
+                    break;
+                }
             }
         }
         let _ = fs::remove_file(path);
@@ -902,7 +1017,9 @@ fn apply_toggle(
 
 fn update_status_from_state(shared: &Arc<SharedRuntime>, state: &crate::state::StateSnapshot) {
     shared.active.store(
-        state.noise_suppression() || state.echo_cancellation(),
+        (state.noise_suppression() || state.echo_cancellation())
+            && shared.capture_connected.load(Ordering::Acquire)
+            && shared.render_connected.load(Ordering::Acquire),
         Ordering::Release,
     );
     if let Ok(mut status) = shared.status.lock() {

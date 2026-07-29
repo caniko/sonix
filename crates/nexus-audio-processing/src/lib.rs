@@ -27,4 +27,4 @@ pub use state::{
 };
 
 #[cfg(feature = "pipewire-runtime")]
-pub use runtime::{ProcessingRuntime, RuntimeError};
+pub use runtime::{ProcessingRuntime, ProcessingRuntimeShutdown, RuntimeError};

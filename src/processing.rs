@@ -1,9 +1,9 @@
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, anyhow};
 use clap::{Subcommand, ValueEnum};
 use nexus_audio_processing::{
-    ControlClient, EchoDelay, NoiseSuppressionLevel, ProcessingConfig, ProcessingRuntime,
-    RuntimeConfig, StateStore, Toggle, VirtualSourceConfig, default_control_socket,
-    default_state_path, offline_status,
+    ControlClient, EchoDelay, NoiseSuppressionLevel, ProcessingConfig, RuntimeConfig, StateStore,
+    StreamFormat, Toggle, VirtualSourceConfig, default_control_socket, default_state_path,
+    offline_status,
 };
 
 #[derive(Subcommand)]
@@ -19,9 +19,6 @@ pub(crate) enum ProcessingCommand {
     },
     /// Clear persisted feature overrides.
     Reset,
-    /// Run the PipeWire processor service.
-    #[command(hide = true)]
-    Daemon,
     /// Restore the raw microphone as the default source.
     #[command(hide = true)]
     FailOpen,
@@ -36,7 +33,8 @@ pub(crate) enum ProcessingState {
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct ProcessingSettings {
-    pub(crate) enable: bool,
+    /// Accepted for compatibility with pre-embedded GoXLR configurations.
+    pub(crate) enable: Option<bool>,
     pub(crate) source_name: String,
     pub(crate) source_description: String,
     pub(crate) noise_suppression: bool,
@@ -48,7 +46,7 @@ pub(crate) struct ProcessingSettings {
 impl Default for ProcessingSettings {
     fn default() -> Self {
         Self {
-            enable: true,
+            enable: None,
             source_name: "goxlr_nexus.processed_mic".to_string(),
             source_description: "GoXLR Nexus processed microphone".to_string(),
             noise_suppression: true,
@@ -68,27 +66,33 @@ pub(crate) fn processing_runtime_config(config: &super::Config) -> Result<Runtim
     )
     .map_err(|error| anyhow!(error))?;
     let processing = ProcessingConfig {
-        noise_suppression: config.processing.noise_suppression,
-        echo_cancellation: config.processing.echo_cancellation,
+        noise_suppression: config.processing.enable.unwrap_or(true)
+            && config.processing.noise_suppression,
+        echo_cancellation: config.processing.enable.unwrap_or(true)
+            && config.processing.echo_cancellation,
         noise_level: config.processing.noise_level,
         echo_delay: config.processing.echo_delay,
     };
-    let runtime = RuntimeConfig::new(
-        nexus_audio_processing::StreamFormat::default(),
-        source,
-        processing,
+    let capture_format = StreamFormat::new(
+        config.profile.capture_sample_rate,
+        config.profile.capture_channels,
     )
-    .map_err(|error| anyhow!(error))?
-    .with_state_path(default_state_path().map_err(|error| anyhow!(error))?)
-    .with_control_socket(default_control_socket().map_err(|error| anyhow!(error))?);
+    .map_err(|error| anyhow!(error))?;
+    let render_format = StreamFormat::new(
+        config.profile.render_sample_rate,
+        config.profile.render_channels,
+    )
+    .map_err(|error| anyhow!(error))?;
+    let runtime =
+        RuntimeConfig::new_with_formats(capture_format, render_format, source, processing)
+            .map_err(|error| anyhow!(error))?
+            .with_state_path(default_state_path().map_err(|error| anyhow!(error))?)
+            .with_control_socket(default_control_socket().map_err(|error| anyhow!(error))?);
     Ok(runtime)
 }
 
 pub(crate) fn processing_command(config: &super::Config, command: ProcessingCommand) -> Result<()> {
     let runtime = processing_runtime_config(config)?;
-    if !config.processing.enable && !matches!(command, ProcessingCommand::Status { .. }) {
-        bail!("processing runtime is disabled in the GoXLR Nexus configuration")
-    }
     match command {
         ProcessingCommand::Noise { state } => processing_toggle(
             config,
@@ -102,7 +106,7 @@ pub(crate) fn processing_command(config: &super::Config, command: ProcessingComm
             Toggle::Echo,
             matches!(state, ProcessingState::On),
         ),
-        ProcessingCommand::Status { json } => processing_status(config, &runtime, json),
+        ProcessingCommand::Status { json } => processing_status(&runtime, json),
         ProcessingCommand::Reset => {
             let client =
                 ControlClient::new(default_control_socket().map_err(|error| anyhow!(error))?);
@@ -128,15 +132,7 @@ pub(crate) fn processing_command(config: &super::Config, command: ProcessingComm
             }
             Ok(())
         }
-        ProcessingCommand::Daemon => {
-            let runtime = ProcessingRuntime::new(runtime)?;
-            runtime.run().map_err(|error| anyhow!(error))
-        }
-        ProcessingCommand::FailOpen => super::run_or_print(
-            false,
-            "pactl",
-            &["set-default-source", runtime.source().capture_source()],
-        ),
+        ProcessingCommand::FailOpen => restore_raw_microphone(config),
     }
 }
 
@@ -173,11 +169,7 @@ fn processing_toggle(
     Ok(())
 }
 
-fn processing_status(
-    config: &super::Config,
-    runtime: &RuntimeConfig,
-    json_output: bool,
-) -> Result<()> {
+fn processing_status(runtime: &RuntimeConfig, json_output: bool) -> Result<()> {
     let client = ControlClient::new(default_control_socket().map_err(|error| anyhow!(error))?);
     let status = match client.status() {
         Ok(status) => status,
@@ -198,10 +190,15 @@ fn processing_status(
     } else {
         print_processing_status(&status, true);
     }
-    if !config.processing.enable {
-        eprintln!("processing runtime disabled in configuration");
-    }
     Ok(())
+}
+
+pub(crate) fn restore_raw_microphone(config: &super::Config) -> Result<()> {
+    super::run_or_print(
+        false,
+        "pactl",
+        &["set-default-source", &config.profile.default_source],
+    )
 }
 
 fn print_processing_status(status: &nexus_audio_processing::RuntimeStatus, queried: bool) {

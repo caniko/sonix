@@ -1,9 +1,11 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Read;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::process::{Command, Output, Stdio};
+use std::sync::{Arc, mpsc};
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -11,15 +13,13 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use nexus_audio_processing::{
-    ControlClient, ProcessingRuntime, RuntimeConfig, StateStore, default_control_socket,
-    default_state_path, offline_status,
+    ControlClient, ProcessingRuntime, ProcessingRuntimeShutdown, RuntimeError, StateStore,
+    StreamFormat, default_control_socket, default_state_path, offline_status,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncBufReadExt, BufReader as AsyncBufReader};
-use tokio::process::Command as TokioCommand;
-use tokio::time::{Instant, sleep, sleep_until};
+use tokio::time::Instant;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket, connect};
 use zeroize::Zeroizing;
@@ -32,6 +32,7 @@ use observation::{
 };
 use processing::{
     ProcessingCommand, ProcessingSettings, processing_command, processing_runtime_config,
+    restore_raw_microphone,
 };
 
 const GOXLR_SYSTEM: &str = "alsa_output.usb-TC-Helicon_GoXLR-00.HiFi__Speaker__sink";
@@ -142,6 +143,9 @@ impl Config {
         {
             bail!("profile sink and source names must not be empty");
         }
+        if self.profile.default_sink == "default" || self.profile.default_source == "default" {
+            bail!("GoXLR Nexus requires concrete profile sink and source node names");
+        }
         if self.output_sinks.iter().any(|sink| sink.trim().is_empty()) {
             bail!("outputSinks must not contain empty node names");
         }
@@ -163,6 +167,16 @@ impl Config {
         {
             bail!("processing sourceName and sourceDescription must not be empty");
         }
+        StreamFormat::new(
+            self.profile.capture_sample_rate,
+            self.profile.capture_channels,
+        )
+        .map_err(|error| anyhow!("invalid capture format: {error}"))?;
+        StreamFormat::new(
+            self.profile.render_sample_rate,
+            self.profile.render_channels,
+        )
+        .map_err(|error| anyhow!("invalid render format: {error}"))?;
         if self.obs.enable && self.obs.host.trim().is_empty() {
             bail!("OBS host must not be empty when OBS integration is enabled");
         }
@@ -185,6 +199,10 @@ struct ProfileConfig {
     default_sink: String,
     default_source: String,
     monitor_source: String,
+    capture_sample_rate: u32,
+    render_sample_rate: u32,
+    capture_channels: u16,
+    render_channels: u16,
 }
 
 impl Default for ProfileConfig {
@@ -193,6 +211,10 @@ impl Default for ProfileConfig {
             default_sink: GOXLR_SYSTEM.to_string(),
             default_source: GOXLR_CHAT_MIC.to_string(),
             monitor_source: GOXLR_STREAM_MIX.to_string(),
+            capture_sample_rate: 48_000,
+            render_sample_rate: 48_000,
+            capture_channels: 2,
+            render_channels: 2,
         }
     }
 }
@@ -437,19 +459,11 @@ fn main() -> Result<()> {
         .enable_all()
         .build()
         .context("failed to create command runtime")?;
-    let outcome = runtime.block_on(run_cli(Cli::parse()))?;
-    drop(runtime);
-
-    if let Some(config) = outcome {
-        ProcessingRuntime::new(config)
-            .map_err(|error| anyhow!(error))?
-            .run()
-            .map_err(|error| anyhow!(error))?;
-    }
+    runtime.block_on(run_cli(Cli::parse()))?;
     Ok(())
 }
 
-async fn run_cli(cli: Cli) -> Result<Option<RuntimeConfig>> {
+async fn run_cli(cli: Cli) -> Result<()> {
     let config_path = cli.config;
     match cli.command {
         CommandKind::Discover { json } => {
@@ -481,19 +495,11 @@ async fn run_cli(cli: Cli) -> Result<Option<RuntimeConfig>> {
                 CommandKind::Obs {
                     command: ObsCommand::Sync { dry_run },
                 } => obs_sync(&config, dry_run)?,
-                CommandKind::Processing {
-                    command: ProcessingCommand::Daemon,
-                } => {
-                    if !config.processing.enable {
-                        bail!("processing runtime is disabled in the GoXLR Nexus configuration")
-                    }
-                    return Ok(Some(processing_runtime_config(&config)?));
-                }
                 CommandKind::Processing { command } => processing_command(&config, command)?,
             }
         }
     }
-    Ok(None)
+    Ok(())
 }
 
 fn discover(config: Config, json_output: bool) -> Result<()> {
@@ -1691,102 +1697,189 @@ fn print_plan(plan: &ReconciliationPlan) {
     );
 }
 
-async fn follow(config: &Config, observe_only: bool) -> Result<()> {
-    let observe_only = observe_only || config.observe_only;
-    loop {
-        if let Err(err) = follow_once(config, observe_only).await {
-            tracing::warn!(error = %err, "GoXLR Nexus watcher unavailable; retrying in 5s");
+struct ProcessingTask {
+    shutdown: ProcessingRuntimeShutdown,
+    result: mpsc::Receiver<Result<(), RuntimeError>>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl ProcessingTask {
+    fn start(config: &Config) -> Result<Self> {
+        let runtime = ProcessingRuntime::new(processing_runtime_config(config)?)
+            .map_err(|error| anyhow!(error))?;
+        let shutdown = runtime.shutdown_handle();
+        let (sender, result) = mpsc::channel();
+        let join = thread::Builder::new()
+            .name("sonix-processing".into())
+            .spawn(move || {
+                let _ = sender.send(runtime.run());
+            })
+            .context("failed to start embedded Sonix processing")?;
+        Ok(Self {
+            shutdown,
+            result,
+            join: Some(join),
+        })
+    }
+
+    fn poll(&mut self) -> Result<Option<Result<(), RuntimeError>>> {
+        match self.result.try_recv() {
+            Ok(result) => {
+                self.join
+                    .take()
+                    .ok_or_else(|| anyhow!("Sonix processing thread result was consumed twice"))?
+                    .join()
+                    .map_err(|_| anyhow!("Sonix processing thread panicked"))?;
+                Ok(Some(result))
+            }
+            Err(mpsc::TryRecvError::Empty) => Ok(None),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.join
+                    .take()
+                    .ok_or_else(|| anyhow!("Sonix processing thread result was consumed twice"))?
+                    .join()
+                    .map_err(|_| anyhow!("Sonix processing thread panicked"))?;
+                bail!("Sonix processing thread exited without a result")
+            }
         }
-        sleep(Duration::from_secs(5)).await;
+    }
+
+    fn stop(mut self) -> Result<()> {
+        self.shutdown.shutdown();
+        let result = self
+            .result
+            .recv_timeout(Duration::from_secs(5))
+            .context("timed out waiting for embedded Sonix processing to stop")?;
+        self.join
+            .take()
+            .ok_or_else(|| anyhow!("Sonix processing thread result was consumed twice"))?
+            .join()
+            .map_err(|_| anyhow!("Sonix processing thread panicked"))?;
+        result.map_err(|error| anyhow!(error))
     }
 }
 
-async fn follow_once(config: &Config, observe_only: bool) -> Result<()> {
+async fn processing_targets_present(config: &Config) -> Result<bool> {
+    let config = config.clone();
+    tokio::task::spawn_blocking(move || {
+        let graph = pipewire_graph(false)?;
+        Ok(graph
+            .nodes
+            .iter()
+            .any(|node| node.name == config.profile.default_source)
+            && graph
+                .nodes
+                .iter()
+                .any(|node| node.name == config.profile.default_sink))
+    })
+    .await
+    .context("processing endpoint inspection task failed")?
+}
+
+async fn follow(config: &Config, observe_only: bool) -> Result<()> {
+    let observe_only = observe_only || config.observe_only;
+    let mut shutdown = Box::pin(watch_shutdown_signal());
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
     let mut goxlr_cache = None;
-    if let Err(err) = reconcile_for_follow_async(config, observe_only, &mut goxlr_cache).await {
-        tracing::warn!(error = %err, "initial GoXLR Nexus sync failed");
+    let mut goxlr_cache_updated = Instant::now() - Duration::from_secs(31);
+    let mut processing: Option<ProcessingTask> = None;
+    let mut last_targets_present = None;
+
+    if !observe_only && let Err(error) = restore_raw_microphone(config) {
+        tracing::warn!(error = %error, "cannot restore raw microphone before startup");
     }
 
-    let mut child = tokio_audio_command("pactl")
-        .args(["subscribe"])
-        .stdout(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .context("failed to run pactl subscribe")?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow!("pactl subscribe did not expose stdout"))?;
-    let mut lines = AsyncBufReader::new(stdout).lines();
-    let mut shutdown = Box::pin(watch_shutdown_signal());
-
-    let debounce = Duration::from_millis(250);
-    let maximum_batch = Duration::from_secs(1);
-    let periodic_resync = Duration::from_secs(30);
-    let mut pending_since: Option<Instant> = None;
-    let mut last_event: Option<Instant> = None;
-    let mut refresh_goxlr = false;
-    let mut next_resync = Instant::now() + periodic_resync;
-
     loop {
-        let deadline = if let Some(started) = pending_since {
-            let trailing = last_event.unwrap_or(started) + debounce;
-            let maximum = started + maximum_batch;
-            next_resync.min(trailing).min(maximum)
-        } else {
-            next_resync
-        };
-
         tokio::select! {
-            result = lines.next_line() => match result? {
-                Some(line) => {
-                    if let Some(kind) = subscription_event_kind(&line) {
-                        let now = Instant::now();
-                        pending_since.get_or_insert(now);
-                        last_event = Some(now);
-                        refresh_goxlr |= kind == SubscriptionEventKind::ServerOrCard;
-                    }
-                }
-                None => break,
-            },
-            _ = sleep_until(deadline) => {
-                let now = Instant::now();
-                let batch_due = pending_since.is_some_and(|started| {
-                    now.duration_since(last_event.unwrap_or(started)) >= debounce
-                        || now.duration_since(started) >= maximum_batch
-                });
-                let periodic_due = now >= next_resync;
-                if batch_due || periodic_due {
-                    if refresh_goxlr {
-                        goxlr_cache = None;
-                    }
-                    if let Err(err) =
-                        reconcile_for_follow_async(config, observe_only, &mut goxlr_cache).await
-                    {
-                        tracing::warn!(error = %err, "GoXLR Nexus sync failed after coalesced event");
-                    }
-                    pending_since = None;
-                    last_event = None;
-                    refresh_goxlr = false;
-                    next_resync = now + periodic_resync;
-                }
-            }
             result = &mut shutdown => {
                 result?;
-                let _ = child.kill().await;
+                if !observe_only {
+                    if let Err(error) = restore_raw_microphone(config) {
+                        tracing::warn!(error = %error, "cannot restore raw microphone during shutdown");
+                    }
+                    if let Some(task) = processing.take() {
+                        task.stop()?;
+                    }
+                }
                 return Ok(());
+            }
+            _ = tick.tick() => {
+                if !observe_only {
+                    let target_presence = match tokio::time::timeout(
+                        Duration::from_secs(3),
+                        processing_targets_present(config),
+                    )
+                    .await
+                    {
+                        Ok(Ok(present)) => Some(present),
+                        Ok(Err(error)) => {
+                            tracing::warn!(error = %error, "cannot inspect Sonix processing endpoints");
+                            None
+                        }
+                        Err(_) => {
+                            tracing::warn!("timed out inspecting Sonix processing endpoints");
+                            None
+                        }
+                    };
+                    if let Some(targets_present) = target_presence {
+                        if last_targets_present != Some(targets_present) {
+                            goxlr_cache = None;
+                            goxlr_cache_updated = Instant::now() - Duration::from_secs(31);
+                            last_targets_present = Some(targets_present);
+                        }
+                        if targets_present && processing.is_none() {
+                            match ProcessingTask::start(config) {
+                                Ok(task) => processing = Some(task),
+                                Err(error) => tracing::warn!(error = %error, "cannot start embedded Sonix processing"),
+                            }
+                        } else if !targets_present
+                            && let Some(task) = processing.take()
+                        {
+                            if let Err(error) = restore_raw_microphone(config) {
+                                tracing::warn!(error = %error, "cannot restore raw microphone after endpoint loss");
+                            }
+                            if let Err(error) = task.stop() {
+                                tracing::warn!(error = %error, "embedded Sonix processing did not stop cleanly");
+                            }
+                        }
+                    }
+
+                    if let Some(task) = processing.as_mut() {
+                        match task.poll() {
+                            Ok(Some(result)) => {
+                                processing.take();
+                                if let Err(error) = restore_raw_microphone(config) {
+                                    tracing::warn!(error = %error, "cannot restore raw microphone after processing failure");
+                                }
+                                return match result {
+                                    Ok(()) => Err(anyhow!("embedded Sonix processing exited unexpectedly")),
+                                    Err(error) => Err(anyhow::Error::new(error)),
+                                };
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                processing.take();
+                                if let Err(restore_error) = restore_raw_microphone(config) {
+                                    tracing::warn!(error = %restore_error, "cannot restore raw microphone after processing failure");
+                                }
+                                return Err(error);
+                            }
+                        }
+                    }
+                }
+
+                if goxlr_cache_updated.elapsed() >= Duration::from_secs(30) {
+                    goxlr_cache = None;
+                    goxlr_cache_updated = Instant::now();
+                }
+                if let Err(error) =
+                    reconcile_for_follow_async(config, observe_only, &mut goxlr_cache).await
+                {
+                    tracing::warn!(error = %error, "GoXLR Nexus sync failed during periodic reconciliation");
+                }
             }
         }
     }
-
-    let status = child
-        .wait()
-        .await
-        .context("failed to wait for pactl subscribe")?;
-    if !status.success() {
-        bail!("pactl subscribe exited with status {status}");
-    }
-    Ok(())
 }
 
 async fn reconcile_for_follow_async(
@@ -1918,27 +2011,6 @@ fn write_runtime_status(
     fs::rename(&temporary, directory.join("status.json"))
         .context("atomically publish GoXLR Nexus runtime status")?;
     Ok(())
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SubscriptionEventKind {
-    Audio,
-    ServerOrCard,
-}
-
-fn subscription_event_kind(line: &str) -> Option<SubscriptionEventKind> {
-    if line.contains(" on server ") || line.contains(" on card ") {
-        Some(SubscriptionEventKind::ServerOrCard)
-    } else if line.contains(" on sink ") || line.contains(" on source ") {
-        Some(SubscriptionEventKind::Audio)
-    } else {
-        None
-    }
-}
-
-#[cfg(test)]
-fn relevant_subscription_event(line: &str) -> bool {
-    subscription_event_kind(line).is_some()
 }
 
 fn usable_goxlr_status(config: &Config, snapshot: &Snapshot) -> Result<()> {
@@ -2245,6 +2317,11 @@ fn sha256_base64(bytes: &[u8]) -> String {
 }
 
 fn obs_source_plan(config: &Config) -> Vec<ObsSourcePlan> {
+    let microphone = effective_microphone_name(config);
+    obs_source_plan_for_microphone(config, &microphone)
+}
+
+fn obs_source_plan_for_microphone(config: &Config, microphone: &str) -> Vec<ObsSourcePlan> {
     config
         .obs
         .sources
@@ -2254,7 +2331,7 @@ fn obs_source_plan(config: &Config) -> Vec<ObsSourcePlan> {
             name: source.name.clone(),
             input_kind: OBS_INPUT_KIND.to_string(),
             device_id: if source.name == "GoXLR Mic" {
-                effective_microphone_name(config)
+                microphone.to_string()
             } else {
                 source.device_id.clone()
             },
@@ -2306,8 +2383,7 @@ fn pipewire_nodes() -> Result<Vec<Node>> {
 }
 
 fn pipewire_graph(include_properties: bool) -> Result<PipewireGraph> {
-    let output = audio_command("pw-dump")
-        .output()
+    let output = command_output_with_timeout(audio_command("pw-dump"), Duration::from_secs(2))
         .context("failed to run pw-dump")?;
     if !output.status.success() {
         bail!(
@@ -2317,6 +2393,57 @@ fn pipewire_graph(include_properties: bool) -> Result<PipewireGraph> {
         );
     }
     parse_pw_graph_with_properties(&output.stdout, include_properties)
+}
+
+fn command_output_with_timeout(mut command: Command, timeout: Duration) -> Result<Output> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to spawn command")?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("command stdout was not piped"))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("command stderr was not piped"))?;
+    let stdout_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait().context("failed to poll command")? {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            bail!("command timed out after {}s", timeout.as_secs());
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| anyhow!("command stdout reader panicked"))?
+        .context("failed to read command stdout")?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| anyhow!("command stderr reader panicked"))?
+        .context("failed to read command stderr")?;
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 #[cfg(test)]
@@ -2488,9 +2615,6 @@ fn validate_goxlr_status(config: &Config, status: &Value) -> Result<()> {
 }
 
 fn effective_microphone_name(config: &Config) -> String {
-    if !config.processing.enable {
-        return config.profile.default_source.clone();
-    }
     let Some(socket) = default_control_socket().ok() else {
         return config.profile.default_source.clone();
     };
@@ -2639,10 +2763,6 @@ fn audio_command(program: &str) -> Command {
     Command::new(program)
 }
 
-fn tokio_audio_command(program: &str) -> TokioCommand {
-    TokioCommand::new(program)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2757,6 +2877,45 @@ mod tests {
     }
 
     #[test]
+    fn accepts_legacy_processing_enable_field() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "processing": {"enable": false}
+        }))
+        .unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.processing.enable, Some(false));
+    }
+
+    #[test]
+    fn embedded_processing_uses_configured_stream_formats() {
+        let mut config = Config::default();
+        config.profile.capture_sample_rate = 44_100;
+        config.profile.capture_channels = 1;
+        config.profile.render_sample_rate = 96_000;
+        config.profile.render_channels = 2;
+        let runtime = processing_runtime_config(&config).unwrap();
+        assert_eq!(runtime.format().sample_rate_hz(), 44_100);
+        assert_eq!(runtime.format().channels(), 1);
+        assert_eq!(runtime.render_format().sample_rate_hz(), 96_000);
+        assert_eq!(runtime.render_format().channels(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pipewire_probe_has_a_hard_timeout() {
+        let error = command_output_with_timeout(
+            {
+                let mut command = Command::new("sh");
+                command.args(["-c", "sleep 1"]);
+                command
+            },
+            Duration::from_millis(20),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+    }
+
+    #[test]
     fn evaluates_checked_in_pkl_config() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config.example.pkl");
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -2768,6 +2927,8 @@ mod tests {
         assert_eq!(config.goxlr_serial.as_deref(), Some("S200805412CQK"));
         assert_eq!(config.output_sinks.len(), 2);
         assert_eq!(config.obs.sources.len(), 4);
+        assert_eq!(config.profile.capture_sample_rate, 48_000);
+        assert_eq!(config.profile.capture_channels, 2);
     }
 
     #[test]
@@ -2789,14 +2950,6 @@ mod tests {
             )
             .is_none()
         );
-    }
-
-    #[test]
-    fn subscription_events_are_relevant_without_reconciling_inline() {
-        assert!(relevant_subscription_event("Event 'change' on sink #4"));
-        assert!(relevant_subscription_event("Event 'new' on server #0"));
-        assert!(relevant_subscription_event("Event 'remove' on card #2"));
-        assert!(!relevant_subscription_event("Event 'change' on client #4"));
     }
 
     #[test]
@@ -2888,7 +3041,7 @@ mod tests {
     fn builds_default_obs_source_plan() {
         let mut config = Config::default();
         config.obs.enable = true;
-        let plan = obs_source_plan(&config);
+        let plan = obs_source_plan_for_microphone(&config, GOXLR_CHAT_MIC);
         assert_eq!(plan.len(), 4);
         assert_eq!(plan[0].name, "GoXLR Mic");
         assert_eq!(plan[0].input_kind, OBS_INPUT_KIND);
