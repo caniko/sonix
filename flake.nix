@@ -2,7 +2,7 @@
   description = "Sonix generic PipeWire echo/noise processing with GoXLR routing";
 
   inputs = {
-    rs-harbor.url = "git+https://codeberg.org/caniko/rs-harbor.git?ref=trunk&rev=9bfa8bdb0ecb22d7bc11448665f7fbaebae7a759";
+    rs-harbor.url = "git+https://codeberg.org/caniko/rs-harbor.git?ref=trunk&rev=c26b735eede8078f795651c4a9cbf0be8733b221";
     nixpkgs.follows = "rs-harbor/nixpkgs";
     rust-overlay.follows = "rs-harbor/rust-overlay";
     crane.follows = "rs-harbor/crane";
@@ -23,10 +23,7 @@
         inherit system;
         overlays = [(import rust-overlay)];
       };
-      msrvToolchain = pkgs.rust-bin.stable."1.91.0".default.override {
-        extensions = ["clippy" "rustfmt"];
-      };
-      msrvCraneLib = (crane.mkLib pkgs).overrideToolchain (_: msrvToolchain);
+      craneLib = (crane.mkLib pkgs).overrideToolchain (_: rs-harbor.lib.mkToolchain { toolchainProfile = "nightly"; });
       src = pkgs.lib.cleanSourceWith {
         src = pkgs.lib.cleanSource ./.;
         filter = path: type:
@@ -48,11 +45,20 @@
         LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
         BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.glibc.dev}/include -include ${spaBindgenHeader}";
       };
-      package = msrvCraneLib.buildPackage (commonArgs
-        // {
-          cargoArtifacts = null;
-          cargoExtraArgs = "--locked --bins";
-        });
+      buildCache = rs-harbor.lib.mkBuildCachePolicy {
+        inherit pkgs;
+        sccachePackage = rs-harbor.packages.${system}.sccache;
+        cacheRoot = null;
+        namespaceScope = "canix-rust";
+        namespaceGeneration = 5;
+      };
+      package = buildCache.withRustCache {
+        package = craneLib.buildPackage (commonArgs
+          // {
+            cargoArtifacts = null;
+            cargoExtraArgs = "--locked --bins";
+          });
+      };
     in {
       packages = {
         default = package;
@@ -69,7 +75,7 @@
           program = "${package}/bin/goxlr-config";
         };
       };
-      devShells.default = msrvCraneLib.devShell {
+      devShells.default = craneLib.devShell {
         packages = with pkgs; [
           pipewire
           pulseaudio
