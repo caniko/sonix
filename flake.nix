@@ -23,7 +23,8 @@
         inherit system;
         overlays = [(import rust-overlay)];
       };
-      craneLib = (crane.mkLib pkgs).overrideToolchain (_: rs-harbor.lib.mkToolchain { toolchainProfile = "nightly"; });
+      toolchain = rs-harbor.lib.mkToolchain { inherit pkgs; toolchainProfile = "nightly"; };
+      craneLib = toolchain.craneLib;
       src = pkgs.lib.cleanSourceWith {
         src = pkgs.lib.cleanSource ./.;
         filter = path: type:
