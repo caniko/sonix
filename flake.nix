@@ -2,7 +2,7 @@
   description = "Sonix generic PipeWire echo/noise processing with GoXLR routing";
 
   inputs = {
-    rs-harbor.url = "git+https://codeberg.org/caniko/rs-harbor.git?ref=trunk&rev=c26b735eede8078f795651c4a9cbf0be8733b221";
+    rs-harbor.url = "github:caniko/rs-harbor/e2778ff3beca1bd4c1f5183313251d1fb5b46dd6";
     nixpkgs.follows = "rs-harbor/nixpkgs";
     rust-overlay.follows = "rs-harbor/rust-overlay";
     crane.follows = "rs-harbor/crane";
@@ -53,6 +53,12 @@
         namespaceScope = "canix-rust";
         namespaceGeneration = 5;
       };
+      atticAdapter = rs-harbor.lib.mkAdapter {
+        attic = {
+          endpoint = "https://attic.candee.baby";
+          cache = "canix";
+        };
+      };
       package = buildCache.withRustCache {
         package = craneLib.buildPackage (commonArgs
           // {
@@ -74,6 +80,11 @@
         goxlr-config = {
           type = "app";
           program = "${package}/bin/goxlr-config";
+        };
+        push-flake-inputs = rs-harbor.lib.mkAtticPush {
+          inherit pkgs;
+          adapter = atticAdapter;
+          flake = ".";
         };
       };
       devShells.default = craneLib.devShell {
