@@ -2,7 +2,7 @@
   description = "Sonix generic PipeWire echo/noise processing with GoXLR routing";
 
   inputs = {
-    rs-harbor.url = "git+https://codeberg.org/caniko/rs-harbor.git?ref=trunk&rev=c26b735eede8078f795651c4a9cbf0be8733b221";
+    rs-harbor.url = "git+ssh://git@codeberg.org/caniko/rs-harbor.git?ref=trunk&rev=f209ddbca3fdbb0dc31fa3886ccc2ff7369c18ac";
     nixpkgs.follows = "rs-harbor/nixpkgs";
     rust-overlay.follows = "rs-harbor/rust-overlay";
     crane.follows = "rs-harbor/crane";
@@ -53,10 +53,13 @@
         namespaceScope = "canix-rust";
         namespaceGeneration = 5;
       };
+      cargoArtifacts = buildCache.withRustCache {
+        package = craneLib.buildDepsOnly commonArgs;
+      };
       package = buildCache.withRustCache {
         package = craneLib.buildPackage (commonArgs
           // {
-            cargoArtifacts = null;
+            inherit cargoArtifacts;
             cargoExtraArgs = "--locked --bins";
           });
       };
