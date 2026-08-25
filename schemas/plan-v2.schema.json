@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://codeberg.org/caniko/sonix/schemas/plan-v2.schema.json",
+  "$id": "https://github.com/caniko/sonix/schemas/plan-v2.schema.json",
   "title": "GoXLR Nexus reconciliation plan v2",
   "type": "object",
   "required": [
