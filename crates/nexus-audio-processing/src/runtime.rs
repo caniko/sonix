@@ -211,17 +211,13 @@ impl ProcessingRuntime {
         let capture_params = audio_params(capture_format)?;
         let render_params = audio_params(render_format)?;
 
+        let mut render_properties = input_stream_properties(source.render_target());
+        render_properties.insert(*pw::keys::STREAM_CAPTURE_SINK, "true");
         let render = make_input_stream(
             &core,
             InputStreamSpec {
                 name: "nexus-audio-render-reference".into(),
-                properties: properties! {
-                    *pw::keys::MEDIA_TYPE => "Audio",
-                    *pw::keys::MEDIA_CATEGORY => "Capture",
-                    *pw::keys::MEDIA_ROLE => "Communication",
-                    "target.object" => source.render_target(),
-                    *pw::keys::STREAM_CAPTURE_SINK => "true",
-                },
+                properties: render_properties,
                 format: render_format,
                 shared: Arc::clone(&shared),
                 role: StreamRole::Render,
@@ -232,12 +228,7 @@ impl ProcessingRuntime {
             &core,
             InputStreamSpec {
                 name: "nexus-audio-capture".into(),
-                properties: properties! {
-                    *pw::keys::MEDIA_TYPE => "Audio",
-                    *pw::keys::MEDIA_CATEGORY => "Capture",
-                    *pw::keys::MEDIA_ROLE => "Communication",
-                    "target.object" => source.capture_source(),
-                },
+                properties: input_stream_properties(source.capture_source()),
                 format: capture_format,
                 shared: Arc::clone(&shared),
                 role: StreamRole::Capture,
@@ -403,6 +394,17 @@ struct InputStreamSpec {
     shared: Arc<SharedRuntime>,
     role: StreamRole,
     params: Vec<u8>,
+}
+
+fn input_stream_properties(target: &str) -> pw::properties::PropertiesBox {
+    properties! {
+        *pw::keys::MEDIA_TYPE => "Audio",
+        *pw::keys::MEDIA_CATEGORY => "Capture",
+        *pw::keys::MEDIA_ROLE => "Communication",
+        "target.object" => target,
+        "node.dont-fallback" => "true",
+        "node.linger" => "true",
+    }
 }
 
 fn make_input_stream<'a>(
@@ -1037,4 +1039,18 @@ fn status_snapshot(shared: &SharedRuntime) -> Option<RuntimeStatus> {
     status.retries = shared.retries.load(Ordering::Relaxed);
     status.dropped_frames = shared.dropped_frames.load(Ordering::Relaxed);
     Some(status)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::input_stream_properties;
+
+    #[test]
+    fn input_streams_wait_for_their_configured_target() {
+        let properties = input_stream_properties("configured-node");
+
+        assert_eq!(properties.get("target.object"), Some("configured-node"));
+        assert_eq!(properties.get("node.dont-fallback"), Some("true"));
+        assert_eq!(properties.get("node.linger"), Some("true"));
+    }
 }

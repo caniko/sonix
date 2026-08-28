@@ -252,12 +252,12 @@ fn run_daemon(runtime_config: RuntimeConfig) -> Result<()> {
 }
 
 fn set_default_source(source: &str) -> Result<()> {
-    let status = Command::new("pactl")
+    let output = Command::new("pactl")
         .args(["set-default-source", source])
-        .status()
+        .output()
         .context("run pactl set-default-source")?;
-    if !status.success() {
-        bail!("pactl set-default-source failed with {status}");
+    if !output.status.success() {
+        bail!("pactl set-default-source failed with {}", output.status);
     }
     Ok(())
 }
