@@ -49,7 +49,7 @@
       buildCache = rs-harbor.lib.mkBuildCachePolicy {
         inherit pkgs;
         sccachePackage = rs-harbor.packages.${system}.sccache;
-        cacheRoot = null;
+        cacheRoot = "/build/sccache";
         namespaceScope = "canix-rust";
         namespaceGeneration = 5;
       };
