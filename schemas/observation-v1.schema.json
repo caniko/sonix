@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://codeberg.org/caniko/sonix/schemas/observation-v1.schema.json",
+  "$id": "https://github.com/caniko/sonix/schemas/observation-v1.schema.json",
   "title": "GoXLR Nexus observation v1",
   "type": "object",
   "required": ["schema", "producer", "capturedAt", "host", "sources", "facts", "factsDigest"],
