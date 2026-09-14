@@ -42,6 +42,9 @@ pub enum ControlCommand {
     Reset,
     /// Return current state without changing it.
     Status,
+    /// Toggle both effects: both enabled becomes disabled, otherwise enable both.
+    // Append variants: existing v2 discriminants and payload layout are shipped.
+    ToggleCombined,
 }
 
 /// A versioned legacy JSON control request.
@@ -205,6 +208,11 @@ impl ControlClient {
     /// Sets echo cancellation and returns the daemon status.
     pub fn set_echo(&self, enabled: bool) -> Result<RuntimeStatus, ControlError> {
         self.send(ControlCommand::SetEcho { enabled })
+    }
+
+    /// Toggles both noise suppression and echo cancellation together and returns the daemon status.
+    pub fn toggle_combined(&self) -> Result<RuntimeStatus, ControlError> {
+        self.send(ControlCommand::ToggleCombined)
     }
 
     /// Clears persisted overrides and returns the daemon status.
@@ -540,6 +548,45 @@ mod tests {
         .unwrap();
         assert_eq!(decoded.processed_source, "processed");
         assert_eq!(decoded.format, StreamFormat::default());
+    }
+
+    #[test]
+    fn combined_toggle_preserves_v2_command_layout() {
+        #[derive(rkyv::Archive, rkyv::Serialize)]
+        enum LegacyCommand {
+            SetNoise { enabled: bool },
+            SetEcho { enabled: bool },
+            Reset,
+            Status,
+        }
+        for (old, current) in [
+            (
+                LegacyCommand::SetNoise { enabled: true },
+                ControlCommand::SetNoise { enabled: true },
+            ),
+            (
+                LegacyCommand::SetEcho { enabled: false },
+                ControlCommand::SetEcho { enabled: false },
+            ),
+            (LegacyCommand::Reset, ControlCommand::Reset),
+            (LegacyCommand::Status, ControlCommand::Status),
+        ] {
+            assert_eq!(
+                rkyv::to_bytes::<rkyv::rancor::Error>(&old)
+                    .unwrap()
+                    .as_slice(),
+                rkyv::to_bytes::<rkyv::rancor::Error>(&current)
+                    .unwrap()
+                    .as_slice()
+            );
+        }
+        let mut frame = Vec::new();
+        write_v2_request(&mut frame, 43, ControlCommand::ToggleCombined).unwrap();
+        let payload = read_frame(&mut Cursor::new(frame)).unwrap();
+        assert!(matches!(
+            access_request(&payload).unwrap().command,
+            ArchivedControlCommand::ToggleCombined
+        ));
     }
 
     #[test]

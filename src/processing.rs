@@ -12,6 +12,12 @@ pub(crate) enum ProcessingCommand {
     Noise { state: ProcessingState },
     /// Toggle echo cancellation.
     Echo { state: ProcessingState },
+    /// Toggle both noise suppression and echo cancellation together.
+    /// Both on => both off; any other => both on.
+    Toggle {
+        #[arg(long)]
+        json: bool,
+    },
     /// Show processor health and effective routing.
     Status {
         #[arg(long)]
@@ -103,6 +109,19 @@ pub(crate) fn processing_command(config: &super::Config, command: ProcessingComm
             matches!(state, ProcessingState::On),
         ),
         ProcessingCommand::Status { json } => processing_status(&runtime, json),
+        ProcessingCommand::Toggle { json } => {
+            let client =
+                ControlClient::new(default_control_socket().map_err(|error| anyhow!(error))?);
+            // A physical control must not report a saved offline preference as applied.
+            let status = client.toggle_combined()?;
+            reconcile_processing_source(&status);
+            if json {
+                println!("{}", serde_json::to_string(&status)?);
+            } else {
+                print_processing_status(&status, false);
+            }
+            Ok(())
+        }
         ProcessingCommand::Reset => {
             let client =
                 ControlClient::new(default_control_socket().map_err(|error| anyhow!(error))?);

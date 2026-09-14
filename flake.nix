@@ -93,6 +93,10 @@
         BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.glibc.dev}/include -include ${spaBindgenHeader}";
       };
       checks.default = package;
+      checks.processing = craneLib.cargoTest (commonArgs // {
+        inherit cargoArtifacts;
+        cargoExtraArgs = "--locked -p nexus-audio-processing --lib";
+      });
       formatter = pkgs.alejandra;
     })
     // {

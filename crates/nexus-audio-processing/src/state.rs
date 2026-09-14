@@ -185,6 +185,29 @@ impl StateStore {
         Ok(snapshot(defaults, persisted))
     }
 
+    /// Toggles both effects under one lock and persists the pair in one write.
+    pub fn toggle_combined(
+        &self,
+        defaults: &ProcessingConfig,
+    ) -> Result<StateSnapshot, StateError> {
+        let _lock = LockFile::acquire(&self.lock_path())?;
+        let mut persisted = self.read_persisted_unlocked()?;
+
+        let noise_on = persisted
+            .noise_suppression
+            .unwrap_or(defaults.noise_suppression);
+        let echo_on = persisted
+            .echo_cancellation
+            .unwrap_or(defaults.echo_cancellation);
+        let target = !(noise_on && echo_on);
+
+        persisted.noise_suppression = Some(target);
+        persisted.echo_cancellation = Some(target);
+        persisted.version = SCHEMA_VERSION;
+        self.write_persisted(&persisted)?;
+        Ok(snapshot(defaults, persisted))
+    }
+
     fn lock_path(&self) -> PathBuf {
         self.path.with_extension("json.lock")
     }
@@ -407,6 +430,44 @@ mod tests {
         assert!(!snapshot.echo_cancellation());
         assert!(snapshot.noise_persisted());
         assert!(!snapshot.echo_persisted());
+    }
+
+    #[test]
+    fn combined_toggle_handles_all_states_and_write_failure() {
+        for noise in [false, true] {
+            for echo in [false, true] {
+                let (directory, store) = store();
+                let defaults = ProcessingConfig {
+                    noise_suppression: noise,
+                    echo_cancellation: echo,
+                    ..Default::default()
+                };
+                let expected = !(noise && echo);
+                let state = store.toggle_combined(&defaults).unwrap();
+                assert_eq!(
+                    (state.noise_suppression(), state.echo_cancellation()),
+                    (expected, expected)
+                );
+                let reloaded = store.load(&defaults).unwrap();
+                assert_eq!(
+                    (reloaded.noise_suppression(), reloaded.echo_cancellation()),
+                    (expected, expected)
+                );
+                assert!(reloaded.noise_persisted() && reloaded.echo_persisted());
+                std::fs::create_dir(
+                    directory
+                        .path()
+                        .join(format!(".processing.json.tmp-{}", std::process::id())),
+                )
+                .unwrap();
+                assert!(store.toggle_combined(&defaults).is_err());
+                let preserved = store.load(&defaults).unwrap();
+                assert_eq!(
+                    (preserved.noise_suppression(), preserved.echo_cancellation()),
+                    (expected, expected)
+                );
+            }
+        }
     }
 
     #[test]

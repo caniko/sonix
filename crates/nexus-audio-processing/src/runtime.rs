@@ -967,6 +967,9 @@ fn apply_archived_command(
         crate::control::ArchivedControlCommand::SetEcho { enabled } => {
             apply_command(&ControlCommand::SetEcho { enabled: *enabled }, shared)
         }
+        crate::control::ArchivedControlCommand::ToggleCombined => {
+            apply_command(&ControlCommand::ToggleCombined, shared)
+        }
         crate::control::ArchivedControlCommand::Reset => {
             apply_command(&ControlCommand::Reset, shared)
         }
@@ -983,6 +986,17 @@ fn apply_command(
     match command {
         ControlCommand::SetNoise { enabled } => apply_toggle(shared, Toggle::Noise, *enabled)?,
         ControlCommand::SetEcho { enabled } => apply_toggle(shared, Toggle::Echo, *enabled)?,
+        ControlCommand::ToggleCombined => {
+            let state = shared.state_store.toggle_combined(&shared.defaults)?;
+            *shared
+                .config
+                .lock()
+                .map_err(|_| RuntimeError::ConfigLockPoisoned)? =
+                state.processing(&shared.defaults);
+            shared.config_revision.fetch_add(1, Ordering::Release);
+            wake_worker(shared);
+            update_status_from_state(shared, &state);
+        }
         ControlCommand::Reset => {
             let state = shared.state_store.reset(&shared.defaults)?;
             *shared
