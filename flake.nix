@@ -2,16 +2,16 @@
   description = "Sonix generic PipeWire echo/noise processing with GoXLR routing";
 
   inputs = {
-    rs-harbor.url = "git+https://github.com/caniko/harbor-rs.git?ref=trunk&rev=05cc4f162b55fa904b687db1821e2463fa813e50";
-    nixpkgs.follows = "rs-harbor/nixpkgs";
-    rust-overlay.follows = "rs-harbor/rust-overlay";
-    crane.follows = "rs-harbor/crane";
+    harbor-rs.url = "git+https://github.com/caniko/harbor-rs.git?ref=trunk&rev=05cc4f162b55fa904b687db1821e2463fa813e50";
+    nixpkgs.follows = "harbor-rs/nixpkgs";
+    rust-overlay.follows = "harbor-rs/rust-overlay";
+    crane.follows = "harbor-rs/crane";
     flake-utils.url = "github:numtide/flake-utils";
   };
 
   outputs = {
     self,
-    rs-harbor,
+    harbor-rs,
     nixpkgs,
     flake-utils,
     crane,
@@ -23,7 +23,7 @@
         inherit system;
         overlays = [(import rust-overlay)];
       };
-      toolchain = rs-harbor.lib.mkToolchain { inherit pkgs; toolchainProfile = "nightly"; };
+      toolchain = harbor-rs.lib.mkToolchain { inherit pkgs; toolchainProfile = "nightly"; };
       craneLib = toolchain.craneLib;
       src = pkgs.lib.cleanSourceWith {
         src = pkgs.lib.cleanSource ./.;
@@ -46,9 +46,9 @@
         LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
         BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.glibc.dev}/include -include ${spaBindgenHeader}";
       };
-      buildCache = rs-harbor.lib.mkBuildCachePolicy {
+      buildCache = harbor-rs.lib.mkBuildCachePolicy {
         inherit pkgs;
-        sccachePackage = rs-harbor.packages.${system}.sccache;
+        sccachePackage = harbor-rs.packages.${system}.sccache;
         cacheRoot = "/build/sccache";
         namespaceScope = "canix-rust";
         namespaceGeneration = 5;
