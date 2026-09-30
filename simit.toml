@@ -4,3 +4,4 @@ platform = "github"
 runtime = "nix"
 runner = "ubuntu-24.04"
 workspace = true
+all_features = false
