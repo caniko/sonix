@@ -1,0 +1,10 @@
+tree-root-file = "Cargo.toml"
+
+[formatter.nix]
+command = "alejandra"
+includes = ["*.nix"]
+
+[formatter.rust]
+command = "rustfmt"
+options = ["--edition", "2024"]
+includes = ["*.rs"]
