@@ -23,7 +23,10 @@
         inherit system;
         overlays = [(import rust-overlay)];
       };
-      toolchain = harbor-rs.lib.mkToolchain { inherit pkgs; toolchainProfile = "nightly"; };
+      toolchain = harbor-rs.lib.mkToolchain {
+        inherit pkgs;
+        toolchainProfile = "nightly";
+      };
       craneLib = toolchain.craneLib;
       src = pkgs.lib.cleanSourceWith {
         src = pkgs.lib.cleanSource ./.;
@@ -63,6 +66,13 @@
             cargoExtraArgs = "--locked --bins";
           });
       };
+      formatter = pkgs.writeShellApplication {
+        name = "treefmt";
+        runtimeInputs = [pkgs.treefmt pkgs.alejandra toolchain.rustToolchain];
+        text = ''
+          exec treefmt --config-file ${./treefmt.toml} "$@"
+        '';
+      };
     in {
       packages = {
         default = package;
@@ -92,11 +102,19 @@
         BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.glibc.dev}/include -include ${spaBindgenHeader}";
       };
       checks.default = package;
-      checks.processing = craneLib.cargoTest (commonArgs // {
-        inherit cargoArtifacts;
-        cargoExtraArgs = "--locked -p nexus-audio-processing --lib";
-      });
-      formatter = pkgs.alejandra;
+      checks.processing = craneLib.cargoTest (commonArgs
+        // {
+          inherit cargoArtifacts;
+          cargoExtraArgs = "--locked -p nexus-audio-processing --lib";
+        });
+      checks.formatter =
+        pkgs.runCommand "sonix-formatter-check" {
+          nativeBuildInputs = [pkgs.python3];
+        } ''
+          python ${./tests/check_formatter.py} ${formatter}/bin/treefmt
+          touch "$out"
+        '';
+      inherit formatter;
     })
     // {
       goxlr-nexus = {

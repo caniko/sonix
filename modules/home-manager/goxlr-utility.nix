@@ -4,8 +4,7 @@
   pkgs,
   self,
   ...
-}:
-let
+}: let
   cfg = config.programs.goxlr-utility;
   inherit (lib) mkEnableOption mkIf mkOption types;
   system = pkgs.stdenv.hostPlatform.system;
@@ -16,14 +15,13 @@ let
   dataRoot = "${config.xdg.dataHome}/goxlr-utility";
   configRoot = "${config.xdg.configHome}/goxlr-utility";
   daemonUnit = "app-goxlr\\x2ddaemon@autostart.service";
-  servicePath = lib.makeBinPath [ package pkgs.goxlr-utility ];
+  servicePath = lib.makeBinPath [package pkgs.goxlr-utility];
 
-  mkFile =
-    kind: name: source: {
-      path = "${kind}/${name}";
-      inherit source;
-      target = "${dataRoot}/${kind}/${name}";
-    };
+  mkFile = kind: name: source: {
+    path = "${kind}/${name}";
+    inherit source;
+    target = "${dataRoot}/${kind}/${name}";
+  };
 
   files =
     (lib.mapAttrsToList (mkFile "profiles") cfg.profileFiles)
@@ -44,8 +42,7 @@ let
   });
 
   applyFlag = lib.optionalString cfg.applyOnActivation " --apply";
-in
-{
+in {
   options.programs.goxlr-utility = {
     enable = mkEnableOption "declarative GoXLR Utility artifacts";
 
@@ -106,21 +103,23 @@ in
   };
 
   config = mkIf cfg.enable {
-    home.packages = [ package pkgs.goxlr-utility ];
+    home.packages = [package pkgs.goxlr-utility];
 
     assertions =
-      (lib.concatLists (lib.mapAttrsToList (kind: values:
-        lib.mapAttrsToList (name: _source: {
-          assertion = name != "" && !(lib.hasInfix "/" name);
-          message = "programs.goxlr-utility.${kind} keys must be simple filenames: ${name}";
-        }) values
-      ) {
-        profileFiles = cfg.profileFiles;
-        micProfileFiles = cfg.micProfileFiles;
-        presetFiles = cfg.presetFiles;
-        sampleFiles = cfg.sampleFiles;
-        iconFiles = cfg.iconFiles;
-      }))
+      (lib.concatLists (lib.mapAttrsToList (
+          kind: values:
+            lib.mapAttrsToList (name: _source: {
+              assertion = name != "" && !(lib.hasInfix "/" name);
+              message = "programs.goxlr-utility.${kind} keys must be simple filenames: ${name}";
+            })
+            values
+        ) {
+          profileFiles = cfg.profileFiles;
+          micProfileFiles = cfg.micProfileFiles;
+          presetFiles = cfg.presetFiles;
+          sampleFiles = cfg.sampleFiles;
+          iconFiles = cfg.iconFiles;
+        }))
       ++ [
         {
           assertion = files != [];
@@ -131,8 +130,8 @@ in
     systemd.user.services.goxlr-utility-config = {
       Unit = {
         Description = "Reconcile declared GoXLR Utility configuration";
-        After = [ daemonUnit ];
-        Before = [ "goxlr-nexus.service" ];
+        After = [daemonUnit];
+        Before = ["goxlr-nexus.service"];
       };
       Service = {
         Type = "oneshot";
