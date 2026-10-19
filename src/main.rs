@@ -1081,8 +1081,10 @@ async fn load_config(explicit: Option<&Path>) -> Result<Config> {
         return Ok(Config::default());
     }
 
-    let value = pklr::eval_to_json(&path)
+    let evaluation_path = path.clone();
+    let value = tokio::task::spawn_blocking(move || pklr::eval_to_json(&evaluation_path))
         .await
+        .context("Pkl config evaluation task failed")?
         .map_err(|error| anyhow!("failed to evaluate Pkl config {}: {error}", path.display()))?;
     let config: Config = serde_json::from_value(value)
         .with_context(|| format!("failed to decode Pkl config {}", path.display()))?;
