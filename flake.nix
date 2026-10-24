@@ -80,15 +80,33 @@
         goxlr-nexus = package;
         goxlr-config = package;
       };
-      apps = {
-        default = flake-utils.lib.mkApp {drv = package;};
-        sonix = flake-utils.lib.mkApp {drv = package;};
-        goxlr-nexus = flake-utils.lib.mkApp {drv = package;};
-        goxlr-config = {
-          type = "app";
-          program = "${package}/bin/goxlr-config";
+      apps =
+        {
+          default = flake-utils.lib.mkApp {drv = package;};
+          sonix = flake-utils.lib.mkApp {drv = package;};
+          goxlr-nexus = flake-utils.lib.mkApp {drv = package;};
+          goxlr-config = {
+            type = "app";
+            program = "${package}/bin/goxlr-config";
+          };
+        }
+        // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+          # Simit prebuild publication on trunk (secret ATTIC_TOKEN). Linux
+          # outputs only: the package canix consumes, pushed to the public
+          # canix cache.
+          push-flake-inputs = harbor-rs.lib.mkAtticPush {
+            inherit pkgs;
+            flake = ".";
+            paths = [package];
+            adapter = harbor-rs.lib.mkAdapter {
+              attic = {
+                endpoint = "https://attic.candee.baby";
+                cache = "canix";
+                tokenEnvVar = "ATTIC_TOKEN";
+              };
+            };
+          };
         };
-      };
       devShells.default = craneLib.devShell {
         packages = with pkgs; [
           pipewire
