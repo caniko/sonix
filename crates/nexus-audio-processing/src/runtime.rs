@@ -553,6 +553,16 @@ fn make_output_stream<'a>(
                     primed,
                     ..
                 } = data;
+                // Bound latency: a consumer attaching to a full queue (or a
+                // burst) would otherwise keep the whole backlog as delay.
+                let keep = samples + (PRIME_FRAMES + 2) * frame_len;
+                while pending.len() + shared.output.len() * frame_len > keep {
+                    let Some(stale) = shared.output.pop() else {
+                        break;
+                    };
+                    recycle_frame(&shared.output_free, stale);
+                    shared.dropped_frames.fetch_add(1, Ordering::Relaxed);
+                }
                 let complete = fill_output(
                     pending,
                     primed,
@@ -763,9 +773,10 @@ fn processing_worker(
                 recycle_frame(&shared.output_free, output);
                 return Err(error);
             }
-            if let Err(output) = shared.output.push(output) {
-                shared.dropped_frames.fetch_add(1, Ordering::Relaxed);
-                recycle_frame(&shared.output_free, output);
+            // With no consumer linked the queue fills; keep the newest audio
+            // instead of counting every frame as dropped.
+            if let Some(stale) = shared.output.force_push(output) {
+                recycle_frame(&shared.output_free, stale);
             }
             Ok(())
         })();
