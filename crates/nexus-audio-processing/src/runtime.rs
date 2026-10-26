@@ -23,7 +23,12 @@ use crate::control::{
 use crate::dsp::{AudioFrame, DspError, DuplexProcessor};
 use crate::state::{StateStore, Toggle, default_control_socket, default_state_path};
 
-const QUEUE_CAPACITY: usize = 8;
+// 16 × 10 ms frames hold a full 2048-frame quantum plus jitter headroom.
+const QUEUE_CAPACITY: usize = 16;
+/// Frames buffered beyond one output cycle before the processed source plays.
+const PRIME_FRAMES: usize = 2;
+/// PipeWire's default `default.clock.quantum-limit`, bounding one output cycle.
+const MAX_QUANTUM_FRAMES: usize = 8192;
 
 /// Errors returned by the PipeWire runtime.
 #[derive(Debug, Error)]
@@ -211,7 +216,8 @@ impl ProcessingRuntime {
         let capture_params = audio_params(capture_format)?;
         let render_params = audio_params(render_format)?;
 
-        let mut render_properties = input_stream_properties(source.render_target());
+        let group = source.source_name();
+        let mut render_properties = input_stream_properties(source.render_target(), group);
         render_properties.insert(*pw::keys::STREAM_CAPTURE_SINK, "true");
         let render = make_input_stream(
             &core,
@@ -228,7 +234,7 @@ impl ProcessingRuntime {
             &core,
             InputStreamSpec {
                 name: "nexus-audio-capture".into(),
-                properties: input_stream_properties(source.capture_source()),
+                properties: input_stream_properties(source.capture_source(), group),
                 format: capture_format,
                 shared: Arc::clone(&shared),
                 role: StreamRole::Capture,
@@ -245,6 +251,8 @@ impl ProcessingRuntime {
                 *pw::keys::MEDIA_CLASS => "Audio/Source",
                 *pw::keys::NODE_NAME => source.source_name(),
                 *pw::keys::NODE_DESCRIPTION => source.source_description(),
+                "node.group" => group,
+                "node.link-group" => group,
             },
             capture_format,
             Arc::clone(&shared),
@@ -385,6 +393,8 @@ struct StreamData {
     shared: Arc<SharedRuntime>,
     pending: Vec<f32>,
     scratch: Vec<f32>,
+    out: Vec<f32>,
+    primed: bool,
 }
 
 struct InputStreamSpec {
@@ -396,8 +406,12 @@ struct InputStreamSpec {
     params: Vec<u8>,
 }
 
-fn input_stream_properties(target: &str) -> pw::properties::PropertiesBox {
+/// Every runtime stream shares `group` so PipeWire schedules capture, render
+/// and the processed source from one driver; follower devices rate-match.
+fn input_stream_properties(target: &str, group: &str) -> pw::properties::PropertiesBox {
     properties! {
+        "node.group" => group,
+        "node.link-group" => group,
         *pw::keys::MEDIA_TYPE => "Audio",
         *pw::keys::MEDIA_CATEGORY => "Capture",
         *pw::keys::MEDIA_ROLE => "Communication",
@@ -427,6 +441,8 @@ fn make_input_stream<'a>(
                 spec.format.frame_samples() * spec.format.channels() as usize,
             ),
             scratch: Vec::new(),
+            out: Vec::new(),
+            primed: false,
         })
         .state_changed(|_, data, _, new| {
             let connected = matches!(new, pw::stream::StreamState::Streaming);
@@ -454,12 +470,14 @@ fn make_input_stream<'a>(
                 return;
             };
             for datum in buffer.datas_mut() {
+                let offset = datum.chunk().offset() as usize;
                 let size = datum.chunk().size() as usize;
                 let Some(bytes) = datum.data() else {
                     continue;
                 };
-                let size = size.min(bytes.len());
-                enqueue_input_frames(data, &bytes[..size]);
+                let start = offset.min(bytes.len());
+                let end = start.saturating_add(size).min(bytes.len());
+                enqueue_input_frames(data, &bytes[start..end]);
                 break;
             }
         })
@@ -497,8 +515,13 @@ fn make_output_stream<'a>(
             format,
             role: StreamRole::Output,
             shared,
-            pending: Vec::with_capacity(format.frame_samples() * format.channels() as usize * 4),
+            pending: Vec::with_capacity(
+                (MAX_QUANTUM_FRAMES + (PRIME_FRAMES + 1) * format.frame_samples())
+                    * format.channels() as usize,
+            ),
             scratch: vec![0.0; format.frame_samples() * format.channels() as usize],
+            out: vec![0.0; MAX_QUANTUM_FRAMES * format.channels() as usize],
+            primed: false,
         })
         .state_changed(|_, data, _, new| {
             if matches!(new, pw::stream::StreamState::Error(_)) {
@@ -510,41 +533,57 @@ fn make_output_stream<'a>(
                 data.shared.dropped_frames.fetch_add(1, Ordering::Relaxed);
                 return;
             };
+            let channels = data.format.channels() as usize;
+            let frame_len = data.format.frame_samples() * channels;
+            // `requested` is the cycle's frame count; 0 means unknown.
+            let requested = match buffer.requested() as usize {
+                0 => data.format.frame_samples(),
+                frames => frames.min(MAX_QUANTUM_FRAMES),
+            };
             for datum in buffer.datas_mut() {
                 let Some(bytes) = datum.data() else {
                     continue;
                 };
-                let capacity = bytes.len() / std::mem::size_of::<f32>();
-                while data.pending.len() < capacity {
-                    let Some(frame) = data.shared.output.pop() else {
-                        break;
-                    };
-                    let expected = data.format.frame_samples() * data.format.channels() as usize;
-                    let written = data.pending.len() + expected <= data.pending.capacity();
-                    if written {
-                        frame.write_interleaved_unchecked(&mut data.scratch);
-                        data.pending.extend_from_slice(&data.scratch);
-                    } else {
-                        data.shared.dropped_frames.fetch_add(1, Ordering::Relaxed);
-                    }
-                    recycle_frame(&data.shared.output_free, frame);
+                let samples = (requested * channels).min(bytes.len() / std::mem::size_of::<f32>());
+                let StreamData {
+                    shared,
+                    pending,
+                    scratch,
+                    out,
+                    primed,
+                    ..
+                } = data;
+                let complete = fill_output(
+                    pending,
+                    primed,
+                    &mut out[..samples],
+                    PRIME_FRAMES * frame_len,
+                    |pending| {
+                        let Some(frame) = shared.output.pop() else {
+                            return false;
+                        };
+                        if pending.len() + frame_len <= pending.capacity() {
+                            frame.write_interleaved_unchecked(scratch);
+                            pending.extend_from_slice(scratch);
+                        } else {
+                            shared.dropped_frames.fetch_add(1, Ordering::Relaxed);
+                        }
+                        recycle_frame(&shared.output_free, frame);
+                        true
+                    },
+                );
+                if !complete {
+                    // Underruns share the drop counter so status stays schema-stable.
+                    shared.dropped_frames.fetch_add(1, Ordering::Relaxed);
                 }
-                let written = data.pending.len().min(capacity);
-                for (chunk, sample) in bytes
-                    .as_chunks_mut::<4>()
-                    .0
-                    .iter_mut()
-                    .zip(data.pending.iter().take(written))
+                for (chunk, sample) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(&out[..samples])
                 {
                     chunk.copy_from_slice(&sample.to_le_bytes());
                 }
-                for chunk in bytes.as_chunks_mut::<4>().0.iter_mut().skip(written) {
-                    chunk.fill(0);
-                }
-                let remaining = data.pending.len() - written;
-                data.pending.copy_within(written.., 0);
-                data.pending.truncate(remaining);
-                *datum.chunk_mut().size_mut() = (capacity * std::mem::size_of::<f32>()) as u32;
+                let chunk = datum.chunk_mut();
+                *chunk.offset_mut() = 0;
+                *chunk.stride_mut() = (channels * std::mem::size_of::<f32>()) as i32;
+                *chunk.size_mut() = (samples * std::mem::size_of::<f32>()) as u32;
                 break;
             }
         })
@@ -559,6 +598,39 @@ fn make_output_stream<'a>(
         &mut param_refs,
     )?;
     Ok((stream, listener))
+}
+
+/// Writes exactly `out.len()` samples, pulling 10 ms frames into `pending`.
+///
+/// Playback waits until `prime_samples` beyond this cycle are buffered, so
+/// scheduling jitter between the DSP worker and the output cycle is absorbed.
+/// Returns `false` on an underrun: the missing tail is zero-filled and the
+/// buffer re-primes instead of emitting fragments every cycle.
+fn fill_output(
+    pending: &mut Vec<f32>,
+    primed: &mut bool,
+    out: &mut [f32],
+    prime_samples: usize,
+    mut pull: impl FnMut(&mut Vec<f32>) -> bool,
+) -> bool {
+    let target = out.len() + if *primed { 0 } else { prime_samples };
+    while pending.len() < target && pull(pending) {}
+    if !*primed {
+        if pending.len() < target {
+            out.fill(0.0);
+            return true;
+        }
+        *primed = true;
+    }
+    let written = pending.len().min(out.len());
+    out[..written].copy_from_slice(&pending[..written]);
+    out[written..].fill(0.0);
+    pending.drain(..written);
+    if written < out.len() {
+        *primed = false;
+        return false;
+    }
+    true
 }
 
 fn enqueue_input_frames(data: &mut StreamData, bytes: &[u8]) {
@@ -1061,10 +1133,55 @@ mod tests {
 
     #[test]
     fn input_streams_wait_for_their_configured_target() {
-        let properties = input_stream_properties("configured-node");
+        let properties = input_stream_properties("configured-node", "nexus-group");
 
         assert_eq!(properties.get("target.object"), Some("configured-node"));
         assert_eq!(properties.get("node.dont-fallback"), Some("true"));
         assert_eq!(properties.get("node.linger"), Some("true"));
+        assert_eq!(properties.get("node.group"), Some("nexus-group"));
+    }
+
+    #[test]
+    fn output_fill_primes_writes_requested_and_reprimes_after_underrun() {
+        use super::fill_output;
+        use std::collections::VecDeque;
+
+        // 4-sample frames, 6-sample cycles, 4-sample prime.
+        let mut frames: VecDeque<Vec<f32>> = (0..3).map(|f| vec![f as f32 + 1.0; 4]).collect();
+        let pull = |frames: &mut VecDeque<Vec<f32>>, pending: &mut Vec<f32>| {
+            frames.pop_front().map(|f| pending.extend(f)).is_some()
+        };
+        let (mut pending, mut primed, mut out) = (Vec::new(), false, [9.0_f32; 6]);
+
+        // Two frames (8) < 6 + 4: still priming, silence, nothing consumed.
+        frames.truncate(2);
+        assert!(fill_output(&mut pending, &mut primed, &mut out, 4, |p| {
+            pull(&mut frames, p)
+        }));
+        assert_eq!((out, primed, pending.len()), ([0.0; 6], false, 8));
+
+        // A third frame primes: exactly 6 samples out, surplus kept.
+        frames.push_back(vec![3.0; 4]);
+        assert!(fill_output(&mut pending, &mut primed, &mut out, 4, |p| {
+            pull(&mut frames, p)
+        }));
+        assert_eq!(out, [1.0, 1.0, 1.0, 1.0, 2.0, 2.0]);
+        assert_eq!((primed, pending.len()), (true, 6));
+
+        // Six buffered samples cover the next cycle without pulling.
+        assert!(fill_output(&mut pending, &mut primed, &mut out, 4, |p| {
+            pull(&mut frames, p)
+        }));
+        assert_eq!(out, [2.0, 2.0, 3.0, 3.0, 3.0, 3.0]);
+
+        // Empty queue: underrun zero-fills and re-primes.
+        frames.push_back(vec![4.0; 4]);
+        assert!(!fill_output(&mut pending, &mut primed, &mut out, 4, |p| {
+            pull(&mut frames, p)
+        }));
+        assert_eq!(
+            (out, primed, pending.len()),
+            ([4.0, 4.0, 4.0, 4.0, 0.0, 0.0], false, 0)
+        );
     }
 }
