@@ -540,9 +540,11 @@ fn make_output_stream<'a>(
             };
             let channels = data.format.channels() as usize;
             let frame_len = data.format.frame_samples() * channels;
-            // `requested` is the cycle's frame count; 0 means unknown.
+            // `requested` is the cycle's frame count; 0 means no suggestion, in
+            // which case (as in PipeWire's audio-src example) the mapped
+            // capacity bounds the write below.
             let requested = match buffer.requested() as usize {
-                0 => data.format.frame_samples(),
+                0 => MAX_QUANTUM_FRAMES,
                 frames => frames.min(MAX_QUANTUM_FRAMES),
             };
             for datum in buffer.datas_mut() {

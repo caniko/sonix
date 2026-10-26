@@ -1234,14 +1234,21 @@ fn obs_health(config: &Config, snapshot: &Snapshot) -> Vec<Check> {
             default_source.as_deref(),
         ));
         for source in obs_source_plan(config) {
-            if !inputs.contains(&source.name) {
-                checks.push(Check::Fail(format!(
-                    "OBS source {} is missing; run `goxlr-nexus obs sync`",
-                    source.name
-                )));
+            let Some((_, device)) = live.iter().find(|(name, _)| *name == source.name) else {
+                checks.push(Check::Fail(if inputs.contains(&source.name) {
+                    format!(
+                        "OBS source {} is not a {OBS_INPUT_KIND} input; remove or rename it",
+                        source.name
+                    )
+                } else {
+                    format!(
+                        "OBS source {} is missing; run `goxlr-nexus obs sync`",
+                        source.name
+                    )
+                }));
                 continue;
-            }
-            let device = client.input_device(&source.name)?;
+            };
+            let device = device.clone();
             if device != source.device_id {
                 checks.push(Check::Fail(format!(
                     "OBS source {} captures {device}, expected {}; run `goxlr-nexus obs sync`",
@@ -2320,14 +2327,27 @@ fn retired_obs_sources(config: &Config) -> impl Iterator<Item = &'static str> + 
 }
 
 fn obs_ready(config: &Config) -> Result<()> {
-    let addr = (config.obs.host.as_str(), config.obs.port)
+    obs_tcp_connect(config, Duration::from_millis(300)).map(drop)
+}
+
+/// Connects to the first reachable resolved OBS address (dual-stack hosts may
+/// listen on only one family), bounding each attempt.
+fn obs_tcp_connect(config: &Config, timeout: Duration) -> Result<TcpStream> {
+    let mut last_error = None;
+    for addr in (config.obs.host.as_str(), config.obs.port)
         .to_socket_addrs()
         .context("failed to resolve OBS websocket address")?
-        .next()
-        .ok_or_else(|| anyhow!("OBS websocket address did not resolve"))?;
-    TcpStream::connect_timeout(&addr, Duration::from_millis(300))
-        .with_context(|| format!("OBS websocket is not reachable at {addr}"))?;
-    Ok(())
+    {
+        match TcpStream::connect_timeout(&addr, timeout) {
+            Ok(stream) => return Ok(stream),
+            Err(error) => {
+                last_error = Some(
+                    anyhow!(error).context(format!("OBS websocket is not reachable at {addr}")),
+                )
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow!("OBS websocket address did not resolve")))
 }
 
 type ObsSocket = WebSocket<MaybeTlsStream<TcpStream>>;
@@ -2340,14 +2360,9 @@ struct ObsClient {
 impl ObsClient {
     fn connect(config: &Config) -> Result<Self> {
         let url = format!("ws://{}:{}", config.obs.host, config.obs.port);
-        let addr = (config.obs.host.as_str(), config.obs.port)
-            .to_socket_addrs()
-            .context("failed to resolve OBS websocket address")?
-            .next()
-            .ok_or_else(|| anyhow!("OBS websocket address did not resolve"))?;
         // Bound every read and write, including the HTTP upgrade, so a stalled
         // OBS cannot hang doctor, status, or sync.
-        let stream = TcpStream::connect_timeout(&addr, OBS_IO_TIMEOUT)
+        let stream = obs_tcp_connect(config, OBS_IO_TIMEOUT)
             .with_context(|| format!("failed to connect to OBS websocket at {url}"))?;
         stream.set_read_timeout(Some(OBS_IO_TIMEOUT))?;
         stream.set_write_timeout(Some(OBS_IO_TIMEOUT))?;
