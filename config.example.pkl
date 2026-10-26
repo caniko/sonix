@@ -28,6 +28,12 @@ processing = new {
   // echoDelay = new { mode = "fixed"; milliseconds = 80 }
 }
 
+telemetry = new {
+  // Local-only GoXLR FX telemetry for crackling/distortion triage.
+  // No audio is recorded and nothing leaves the host.
+  enable = false
+}
+
 obs = new {
   enable = true
   host = "127.0.0.1"

@@ -128,6 +128,26 @@ directories must be absolute; there is no shared `/tmp` fallback. The state
 file is written atomically under an advisory lock, and the control socket is
 created with user-only permissions.
 
+## FX telemetry for crackling/distortion
+
+Local-only diagnostics for audio issues fixed by toggling the physical GoXLR
+FX button, off by default:
+
+```sh
+# Nix: programs.sonix.goxlr.telemetry.enable = true
+# Pkl: telemetry = new { enable = true }
+```
+
+`follow` samples GoXLR FX/button state and Sonix health/counters once per
+second, and defaults plus PipeWire presence every 5 s. It writes a `sample`
+event when the state changes (and a heartbeat every 60 s), `fxTransition` on
+every FX enable/button change, and `topology` when defaults or PipeWire
+presence change, to
+`$XDG_STATE_HOME/sonix/telemetry/telemetry.jsonl` (2×16 MiB rotation, 0600
+files). Serials, profile/preset names and USB topology are redacted. No audio
+is recorded and nothing leaves the host. Compare the distorted state with the
+state after a manual FX cycle; telemetry never toggles FX itself.
+
 ## Declarative GoXLR Utility artifacts
 
 The `goxlr-config` companion binary and `homeModules.goxlr-utility` module keep

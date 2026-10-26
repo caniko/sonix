@@ -26,6 +26,7 @@ use zeroize::Zeroizing;
 
 mod observation;
 mod processing;
+mod telemetry;
 use observation::{
     Facts, GoxlrFacts, ObsFacts, Observation, PipewireFacts, PipewireNode, Producer, SCHEMA,
     SourceStatus, facts_digest,
@@ -34,6 +35,7 @@ use processing::{
     ProcessingCommand, ProcessingSettings, processing_command, processing_runtime_config,
     restore_raw_microphone,
 };
+use telemetry::{TelemetryCollector, TelemetrySettings};
 
 const GOXLR_SYSTEM: &str = "alsa_output.usb-TC-Helicon_GoXLR-00.HiFi__Speaker__sink";
 const GOXLR_CHAT: &str = "alsa_output.usb-TC-Helicon_GoXLR-00.HiFi__Headphones__sink";
@@ -138,6 +140,7 @@ struct Config {
     profile: ProfileConfig,
     obs: ObsConfig,
     processing: ProcessingSettings,
+    telemetry: TelemetrySettings,
 }
 
 impl Config {
@@ -2048,6 +2051,7 @@ async fn follow(config: &Config, observe_only: bool) -> Result<()> {
     let mut processing: Option<ProcessingTask> = None;
     let mut last_targets_present = None;
     let mut last_diagnostics = Vec::new();
+    let mut telemetry = TelemetryCollector::start(config.telemetry.enable)?;
     let mut events = spawn_graph_events();
     let mut last_watch_attempt = Instant::now();
     let mut dirty = true;
@@ -2103,6 +2107,10 @@ async fn follow(config: &Config, observe_only: bool) -> Result<()> {
                             return Err(error);
                         }
                     }
+                }
+
+                if let Some(collector) = telemetry.as_mut() {
+                    telemetry_sample(config, collector).await;
                 }
 
                 // A dead watcher degrades to per-tick polling; retry it on its
@@ -2269,6 +2277,131 @@ fn reconcile_for_follow(
         return Ok(());
     }
     execute_audio_operations(&operations, false)
+}
+
+async fn telemetry_sample(config: &Config, collector: &mut TelemetryCollector) {
+    let tick = collector.next_tick();
+    let probe_config = config.clone();
+    let probe = tokio::task::spawn_blocking(move || telemetry_probe_blocking(&probe_config, tick))
+        .await
+        .unwrap_or_else(|error| telemetry::TelemetryProbe::failed(format!("{error:#}")));
+    let serial = config.goxlr_serial.as_deref();
+    let fx = probe
+        .goxlr
+        .as_ref()
+        .and_then(|status| telemetry::summarize_goxlr(status, serial));
+    let (fx_enabled, fx_button, fx_detail) = match &fx {
+        Some(state) => (
+            state.fx_enabled,
+            state.fx_button,
+            serde_json::to_value(state).unwrap_or(Value::Null),
+        ),
+        None => (None, None, Value::Null),
+    };
+    let changed = collector.fx_changed(fx_enabled, fx_button);
+    let (processing_summary, retry_delta, dropped_delta) = match &probe.processing {
+        Some(status) => {
+            let (retry_delta, dropped_delta) =
+                collector.counter_deltas(Some(status.retries), Some(status.dropped_frames));
+            (
+                Some(telemetry::summarize_processing(status)),
+                retry_delta,
+                dropped_delta,
+            )
+        }
+        None => {
+            let _ = collector.counter_deltas(None, None);
+            (None, None, None)
+        }
+    };
+    let diagnostics: Vec<String> = [
+        ("goxlr", &probe.goxlr_error),
+        ("defaults", &probe.defaults_error),
+        ("pipewire", &probe.pipewire_error),
+    ]
+    .into_iter()
+    .filter_map(|(probe, error)| {
+        error
+            .as_ref()
+            .map(|error| format!("{probe} probe: {error}"))
+    })
+    .collect();
+    let detail = json!({
+        "fx": fx_detail,
+        "fxChanged": changed,
+        "processing": processing_summary,
+        "retryDelta": retry_delta,
+        "droppedDelta": dropped_delta,
+        "gap": probe.goxlr.is_none(),
+        "diagnostics": diagnostics,
+    });
+    if collector.sample_due(&detail)
+        && let Err(error) = collector.record("sample", detail.clone())
+    {
+        tracing::warn!(error = %format!("{error:#}"), "goxlr telemetry write failed");
+        return;
+    }
+    if changed
+        && fx.is_some()
+        && let Err(error) = collector.record("fxTransition", detail)
+    {
+        tracing::warn!(error = %format!("{error:#}"), "goxlr telemetry transition write failed");
+    }
+    // Defaults and topology are probed every 5th tick; keep them out of
+    // `sample` so unchanged samples deduplicate, and log them on change.
+    if probe.defaults.is_some() || probe.pipewire.is_some() {
+        let topology = json!({"defaults": probe.defaults, "pipewire": probe.pipewire});
+        if collector.topology_changed(&topology)
+            && let Err(error) = collector.record("topology", topology)
+        {
+            tracing::warn!(error = %format!("{error:#}"), "goxlr telemetry topology write failed");
+        }
+    }
+}
+
+/// FX state needs a fresh `goxlr-client` status every tick to catch button
+/// presses; the control socket is in-process. Defaults and topology change
+/// rarely, so `pactl` and `pw-dump` run only every 5th tick.
+fn telemetry_probe_blocking(config: &Config, tick: u64) -> telemetry::TelemetryProbe {
+    let (goxlr, goxlr_error) = match goxlr_status() {
+        Ok(status) => (Some(status), None),
+        Err(error) => (None, Some(format!("{error:#}"))),
+    };
+    let processing = default_control_socket()
+        .ok()
+        .and_then(|path| ControlClient::new(path).status().ok());
+    let mut probe = telemetry::TelemetryProbe {
+        goxlr,
+        goxlr_error,
+        processing,
+        ..Default::default()
+    };
+    if !tick.is_multiple_of(5) {
+        return probe;
+    }
+    match current_defaults() {
+        Ok((sink, source)) => {
+            probe.defaults = Some(json!({"defaultSink": sink, "defaultSource": source}));
+        }
+        Err(error) => probe.defaults_error = Some(format!("{error:#}")),
+    }
+    match pipewire_graph(false) {
+        Ok(graph) => {
+            let present = |name: &str| graph.nodes.iter().any(|node| node.name == name);
+            probe.pipewire = Some(json!({
+                "nodeCount": graph.nodes.len(),
+                "linkCount": graph.links.len(),
+                "present": {
+                    "defaultSource": present(&config.profile.default_source),
+                    "defaultSink": present(&config.profile.default_sink),
+                    "monitorSource": present(&config.profile.monitor_source),
+                    "processedSource": present(&config.processing.source_name),
+                },
+            }));
+        }
+        Err(error) => probe.pipewire_error = Some(format!("{error:#}")),
+    }
+    probe
 }
 
 #[derive(Debug, Serialize)]

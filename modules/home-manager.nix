@@ -161,6 +161,10 @@
         noiseLevel = ${pklString effectiveProcessing.noiseLevel}
         ${lib.optionalString (effectiveProcessing.echoDelayMs != null) ''echoDelay = new { mode = "fixed"; milliseconds = ${toString effectiveProcessing.echoDelayMs} }''}
         }
+
+        telemetry = new {
+        enable = ${lib.boolToString cfg.telemetry.enable}
+        }
   '';
 in {
   options.programs.sonix.goxlr = {
@@ -216,6 +220,11 @@ in {
       type = types.bool;
       default = false;
       description = "Observe and report routing drift without applying audio mutations.";
+    };
+    telemetry.enable = mkOption {
+      type = types.bool;
+      default = false;
+      description = "Record local-only GoXLR FX telemetry for crackling/distortion triage. No audio is recorded and nothing leaves the host.";
     };
     monitorSource = mkOption {
       type = types.str;
