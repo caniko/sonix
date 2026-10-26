@@ -570,7 +570,7 @@ fn make_output_stream<'a>(
                     recycle_frame(&shared.output_free, stale);
                     shared.dropped_frames.fetch_add(1, Ordering::Relaxed);
                 }
-                let complete = fill_output(
+                let missing = fill_output(
                     pending,
                     primed,
                     &mut out[..samples],
@@ -589,10 +589,11 @@ fn make_output_stream<'a>(
                         true
                     },
                 );
-                if !complete {
-                    // Underruns share the drop counter so status stays schema-stable.
-                    shared.dropped_frames.fetch_add(1, Ordering::Relaxed);
-                }
+                // Underruns share the drop counter (in 10 ms frames) so status
+                // stays schema-stable.
+                shared
+                    .dropped_frames
+                    .fetch_add(missing.div_ceil(frame_len) as u64, Ordering::Relaxed);
                 for (chunk, sample) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(&out[..samples])
                 {
                     chunk.copy_from_slice(&sample.to_le_bytes());
@@ -621,21 +622,22 @@ fn make_output_stream<'a>(
 ///
 /// Playback waits until `prime_samples` beyond this cycle are buffered, so
 /// scheduling jitter between the DSP worker and the output cycle is absorbed.
-/// Returns `false` on an underrun: the missing tail is zero-filled and the
-/// buffer re-primes instead of emitting fragments every cycle.
+/// Returns the samples missing on an underrun (0 otherwise): the missing tail
+/// is zero-filled and the buffer re-primes instead of emitting fragments every
+/// cycle.
 fn fill_output(
     pending: &mut Vec<f32>,
     primed: &mut bool,
     out: &mut [f32],
     prime_samples: usize,
     mut pull: impl FnMut(&mut Vec<f32>) -> bool,
-) -> bool {
+) -> usize {
     let target = out.len() + if *primed { 0 } else { prime_samples };
     while pending.len() < target && pull(pending) {}
     if !*primed {
         if pending.len() < target {
             out.fill(0.0);
-            return true;
+            return 0;
         }
         *primed = true;
     }
@@ -645,9 +647,8 @@ fn fill_output(
     pending.drain(..written);
     if written < out.len() {
         *primed = false;
-        return false;
     }
-    true
+    out.len() - written
 }
 
 fn enqueue_input_frames(data: &mut StreamData, bytes: &[u8]) {
@@ -1173,30 +1174,42 @@ mod tests {
 
         // Two frames (8) < 6 + 4: still priming, silence, nothing consumed.
         frames.truncate(2);
-        assert!(fill_output(&mut pending, &mut primed, &mut out, 4, |p| {
-            pull(&mut frames, p)
-        }));
+        assert_eq!(
+            0,
+            fill_output(&mut pending, &mut primed, &mut out, 4, |p| {
+                pull(&mut frames, p)
+            })
+        );
         assert_eq!((out, primed, pending.len()), ([0.0; 6], false, 8));
 
         // A third frame primes: exactly 6 samples out, surplus kept.
         frames.push_back(vec![3.0; 4]);
-        assert!(fill_output(&mut pending, &mut primed, &mut out, 4, |p| {
-            pull(&mut frames, p)
-        }));
+        assert_eq!(
+            0,
+            fill_output(&mut pending, &mut primed, &mut out, 4, |p| {
+                pull(&mut frames, p)
+            })
+        );
         assert_eq!(out, [1.0, 1.0, 1.0, 1.0, 2.0, 2.0]);
         assert_eq!((primed, pending.len()), (true, 6));
 
         // Six buffered samples cover the next cycle without pulling.
-        assert!(fill_output(&mut pending, &mut primed, &mut out, 4, |p| {
-            pull(&mut frames, p)
-        }));
+        assert_eq!(
+            0,
+            fill_output(&mut pending, &mut primed, &mut out, 4, |p| {
+                pull(&mut frames, p)
+            })
+        );
         assert_eq!(out, [2.0, 2.0, 3.0, 3.0, 3.0, 3.0]);
 
         // Empty queue: underrun zero-fills and re-primes.
         frames.push_back(vec![4.0; 4]);
-        assert!(!fill_output(&mut pending, &mut primed, &mut out, 4, |p| {
-            pull(&mut frames, p)
-        }));
+        assert_eq!(
+            2,
+            fill_output(&mut pending, &mut primed, &mut out, 4, |p| {
+                pull(&mut frames, p)
+            })
+        );
         assert_eq!(
             (out, primed, pending.len()),
             ([4.0, 4.0, 4.0, 4.0, 0.0, 0.0], false, 0)

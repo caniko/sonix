@@ -2013,6 +2013,8 @@ impl ProcessingTask {
 
 /// Full resynchronization interval; `pactl subscribe` events wake earlier.
 const FOLLOW_RESYNC: Duration = Duration::from_secs(30);
+/// Delay before retrying a failed reconciliation pass.
+const FOLLOW_RETRY: Duration = Duration::from_secs(5);
 
 /// Whether a `pactl subscribe` line can change routing: device, default or
 /// card changes. Stream (sink-input/source-output) and client churn cannot.
@@ -2051,7 +2053,26 @@ async fn follow(config: &Config, observe_only: bool) -> Result<()> {
     let mut processing: Option<ProcessingTask> = None;
     let mut last_targets_present = None;
     let mut last_diagnostics = Vec::new();
-    let mut telemetry = TelemetryCollector::start(config.telemetry.enable)?;
+    // Telemetry is optional diagnostics: it never blocks follow from starting,
+    // and its probes (up to ~9 s on timeout) run in their own task so they
+    // cannot delay routing.
+    // Detached: the task ends with the follow runtime.
+    let _telemetry = match TelemetryCollector::start(config.telemetry.enable) {
+        Ok(collector) => collector.map(|mut collector| {
+            let config = config.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(1));
+                loop {
+                    tick.tick().await;
+                    telemetry_sample(&config, &mut collector).await;
+                }
+            })
+        }),
+        Err(error) => {
+            tracing::warn!(error = %format!("{error:#}"), "goxlr telemetry disabled");
+            None
+        }
+    };
     let mut events = spawn_graph_events();
     let mut last_watch_attempt = Instant::now();
     let mut dirty = true;
@@ -2109,10 +2130,6 @@ async fn follow(config: &Config, observe_only: bool) -> Result<()> {
                     }
                 }
 
-                if let Some(collector) = telemetry.as_mut() {
-                    telemetry_sample(config, collector).await;
-                }
-
                 // A dead watcher degrades to per-tick polling; retry it on its
                 // own clock because polling keeps resetting `last_sync`.
                 if events.is_none() && last_watch_attempt.elapsed() >= FOLLOW_RESYNC {
@@ -2139,6 +2156,8 @@ async fn follow(config: &Config, observe_only: bool) -> Result<()> {
                 }
                 if let Err(error) = result {
                     tracing::warn!(error = %error, "GoXLR Nexus sync failed during periodic reconciliation");
+                    // Retry soon instead of waiting for the next full resync.
+                    last_sync = Instant::now() - FOLLOW_RESYNC + FOLLOW_RETRY;
                 }
 
                 if !observe_only && let Some(targets_present) = targets_present {
