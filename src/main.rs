@@ -43,6 +43,8 @@ const GOXLR_SAMPLE: &str = "alsa_output.usb-TC-Helicon_GoXLR-00.HiFi__Line3__sin
 const GOXLR_CHAT_MIC: &str = "alsa_input.usb-TC-Helicon_GoXLR-00.HiFi__Headset__source";
 const GOXLR_STREAM_MIX: &str = "alsa_input.usb-TC-Helicon_GoXLR-00.HiFi__Line4__source";
 const GOXLR_SAMPLER: &str = "alsa_input.usb-TC-Helicon_GoXLR-00.HiFi__Line5__source";
+/// OBS PulseAudio device id that follows the server's default source.
+const OBS_DEFAULT_DEVICE: &str = "default";
 const OBS_INPUT_KIND: &str = "pulse_input_capture";
 const PLAN_SCHEMA: &str = "sonix.goxlr.plan/v2";
 const ADOPT_SCHEMA: &str = "sonix.goxlr.adopt/v1";
@@ -709,19 +711,15 @@ fn adopt(json_output: bool) -> Result<()> {
     }
     config.default_source = default_source.as_ref().map(|node| node.name.clone());
     config.monitor_source = monitor_source.as_ref().map(|node| node.name.clone());
-    if let Some(node) = default_source {
+    if default_source.is_some() {
         config.obs_sources.push(AdoptObsSource {
             name: "GoXLR Mic".to_string(),
-            device_id: node.name,
+            device_id: OBS_DEFAULT_DEVICE.to_string(),
         });
     }
     if let Some(node) = monitor_source.as_ref() {
         config.obs_sources.push(AdoptObsSource {
             name: "GoXLR Stream Mix".to_string(),
-            device_id: node.name.clone(),
-        });
-        config.obs_sources.push(AdoptObsSource {
-            name: "GoXLR Desktop Mix".to_string(),
             device_id: node.name.clone(),
         });
     }
@@ -1094,7 +1092,25 @@ async fn load_config(explicit: Option<&Path>) -> Result<Config> {
 
 fn doctor(config: &Config) -> Result<()> {
     let snapshot = snapshot()?;
-    let required = required_nodes(config, &snapshot)?;
+    let mut failed = false;
+    if let Err(err) = doctor_goxlr(config, &snapshot) {
+        println!("fail: {err:#}");
+        failed = true;
+    }
+    if config.obs.enable {
+        for check in obs_health(config, &snapshot) {
+            failed |= matches!(check, Check::Fail(_));
+            println!("{check}");
+        }
+    }
+    if failed {
+        bail!("doctor found failures");
+    }
+    Ok(())
+}
+
+fn doctor_goxlr(config: &Config, snapshot: &Snapshot) -> Result<()> {
+    let required = required_nodes(config, snapshot)?;
     let status = snapshot
         .goxlr_status
         .as_ref()
@@ -1110,18 +1126,115 @@ fn doctor(config: &Config) -> Result<()> {
         "ok: GoXLR serial {}",
         config.goxlr_serial.as_deref().unwrap_or("not configured")
     );
+    Ok(())
+}
 
-    if config.obs.enable {
-        match obs_ready(config) {
-            Ok(()) => println!(
-                "ok: OBS websocket reachable at {}:{}",
-                config.obs.host, config.obs.port
-            ),
-            Err(err) => println!("warn: OBS degraded: {err:#}"),
+/// One health finding; only `Fail` makes `doctor` exit non-zero.
+#[derive(Debug, PartialEq, Eq)]
+enum Check {
+    Ok(String),
+    Warn(String),
+    Fail(String),
+}
+
+impl std::fmt::Display for Check {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ok(message) => write!(f, "ok: {message}"),
+            Self::Warn(message) => write!(f, "warn: {message}"),
+            Self::Fail(message) => write!(f, "fail: {message}"),
         }
     }
+}
 
-    Ok(())
+impl Check {
+    fn to_json(&self) -> Value {
+        let (level, message) = match self {
+            Self::Ok(message) => ("ok", message),
+            Self::Warn(message) => ("warn", message),
+            Self::Fail(message) => ("fail", message),
+        };
+        json!({"level": level, "message": message})
+    }
+}
+
+/// Configuration-only OBS checks: two sources on one device double its audio.
+fn obs_config_checks(config: &Config) -> Vec<Check> {
+    let mut seen = BTreeMap::new();
+    let mut checks = Vec::new();
+    for source in &config.obs.sources {
+        if let Some(previous) = seen.insert(source.device_id.as_str(), source.name.as_str()) {
+            checks.push(Check::Fail(format!(
+                "OBS sources {previous} and {} both capture {}; the audio is doubled",
+                source.name, source.device_id
+            )));
+        }
+    }
+    checks
+}
+
+/// Live OBS checks: websocket handshake, configured inputs, and that every
+/// input's actual device exists in PipeWire (a missing device is an errored,
+/// silent OBS source). OBS not running is only a warning.
+fn obs_health(config: &Config, snapshot: &Snapshot) -> Vec<Check> {
+    let mut checks = obs_config_checks(config);
+    if let Err(err) = obs_ready(config) {
+        checks.push(Check::Warn(format!("OBS is not running: {err:#}")));
+        return checks;
+    }
+    let mut client = match ObsClient::connect(config) {
+        Ok(client) => client,
+        Err(err) => {
+            checks.push(Check::Fail(format!(
+                "OBS websocket handshake failed: {err:#}"
+            )));
+            return checks;
+        }
+    };
+    checks.push(Check::Ok(format!(
+        "OBS websocket identified at {}:{}",
+        config.obs.host, config.obs.port
+    )));
+    let result = (|| -> Result<()> {
+        let scene = client.target_scene()?;
+        let inputs = client.input_names()?;
+        let scene_items = client.scene_source_names(&scene)?;
+        for source in obs_source_plan(config) {
+            if !inputs.contains(&source.name) {
+                checks.push(Check::Fail(format!(
+                    "OBS source {} is missing; run `goxlr-nexus obs sync`",
+                    source.name
+                )));
+                continue;
+            }
+            let device = client.input_device(&source.name)?;
+            if device != source.device_id {
+                checks.push(Check::Fail(format!(
+                    "OBS source {} captures {device}, expected {}; run `goxlr-nexus obs sync`",
+                    source.name, source.device_id
+                )));
+            } else if device != OBS_DEFAULT_DEVICE
+                && !snapshot.nodes.iter().any(|node| node.name == device)
+            {
+                checks.push(Check::Fail(format!(
+                    "OBS source {} captures missing PipeWire node {device}",
+                    source.name
+                )));
+            } else if !scene_items.contains(&source.name) {
+                checks.push(Check::Warn(format!(
+                    "OBS source {} is not in the current scene {scene}",
+                    source.name
+                )));
+            } else {
+                checks.push(Check::Ok(format!("OBS source {} -> {device}", source.name)));
+            }
+        }
+        Ok(())
+    })();
+    if let Err(err) = result {
+        checks.push(Check::Fail(format!("OBS inspection failed: {err:#}")));
+    }
+    checks
 }
 
 fn status(config: &Config, json: bool) -> Result<()> {
@@ -1181,6 +1294,14 @@ fn status(config: &Config, json: bool) -> Result<()> {
         out.insert("doctorOk", Value::Bool(required.is_ok() && goxlr_ok));
         out.insert("goxlrOk", Value::Bool(goxlr_ok));
         out.insert("obsEnabled", Value::Bool(config.obs.enable));
+        if config.obs.enable {
+            let checks = obs_health(config, &snapshot);
+            out.insert(
+                "obsOk",
+                Value::Bool(!checks.iter().any(|check| matches!(check, Check::Fail(_)))),
+            );
+            out.insert("obs", checks.iter().map(Check::to_json).collect());
+        }
         out.insert(
             "effectiveMicrophone",
             Value::String(effective_microphone_name(config)),
@@ -1761,21 +1882,36 @@ impl ProcessingTask {
     }
 }
 
-async fn processing_targets_present(config: &Config) -> Result<bool> {
-    let config = config.clone();
-    tokio::task::spawn_blocking(move || {
-        let graph = pipewire_graph(false)?;
-        Ok(graph
-            .nodes
-            .iter()
-            .any(|node| node.name == config.profile.default_source)
-            && graph
-                .nodes
-                .iter()
-                .any(|node| node.name == config.profile.default_sink))
-    })
-    .await
-    .context("processing endpoint inspection task failed")?
+/// Full resynchronization interval; `pactl subscribe` events wake earlier.
+const FOLLOW_RESYNC: Duration = Duration::from_secs(30);
+
+/// Whether a `pactl subscribe` line can change routing: device, default or
+/// card changes. Stream (sink-input/source-output) and client churn cannot.
+fn graph_event_relevant(line: &str) -> bool {
+    [" on sink #", " on source #", " on card #", " on server"]
+        .iter()
+        .any(|needle| line.contains(needle))
+}
+
+fn spawn_graph_events()
+-> Option<tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>> {
+    use tokio::io::AsyncBufReadExt;
+
+    let mut child = tokio::process::Command::new("pactl")
+        .arg("subscribe")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|error| tracing::warn!(error = %error, "cannot watch PipeWire events; polling every tick"))
+        .ok()?;
+    let stdout = child.stdout.take()?;
+    // The reader keeps the pipe; the detached child exits on EOF of its server.
+    tokio::spawn(async move {
+        let _ = child.wait().await;
+    });
+    Some(tokio::io::BufReader::new(stdout).lines())
 }
 
 async fn follow(config: &Config, observe_only: bool) -> Result<()> {
@@ -1783,9 +1919,12 @@ async fn follow(config: &Config, observe_only: bool) -> Result<()> {
     let mut shutdown = Box::pin(watch_shutdown_signal());
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let mut goxlr_cache = None;
-    let mut goxlr_cache_updated = Instant::now() - Duration::from_secs(31);
     let mut processing: Option<ProcessingTask> = None;
     let mut last_targets_present = None;
+    let mut last_diagnostics = Vec::new();
+    let mut events = spawn_graph_events();
+    let mut dirty = true;
+    let mut last_sync = Instant::now();
 
     if !observe_only && let Err(error) = restore_raw_microphone(config) {
         tracing::warn!(error = %error, "cannot restore raw microphone before startup");
@@ -1805,101 +1944,127 @@ async fn follow(config: &Config, observe_only: bool) -> Result<()> {
                 }
                 return Ok(());
             }
+            line = async { events.as_mut().expect("guarded by select precondition").next_line().await }, if events.is_some() => {
+                match line {
+                    Ok(Some(line)) => dirty |= graph_event_relevant(&line),
+                    Ok(None) | Err(_) => {
+                        tracing::warn!("PipeWire event watcher ended; respawning on next resync");
+                        events = None;
+                        dirty = true;
+                    }
+                }
+            }
             _ = tick.tick() => {
-                if !observe_only {
-                    let target_presence = match tokio::time::timeout(
-                        Duration::from_secs(3),
-                        processing_targets_present(config),
-                    )
-                    .await
-                    {
-                        Ok(Ok(present)) => Some(present),
-                        Ok(Err(error)) => {
-                            tracing::warn!(error = %error, "cannot inspect Sonix processing endpoints");
-                            None
-                        }
-                        Err(_) => {
-                            tracing::warn!("timed out inspecting Sonix processing endpoints");
-                            None
-                        }
-                    };
-                    if let Some(targets_present) = target_presence {
-                        if last_targets_present != Some(targets_present) {
-                            goxlr_cache = None;
-                            goxlr_cache_updated = Instant::now() - Duration::from_secs(31);
-                            last_targets_present = Some(targets_present);
-                        }
-                        if targets_present && processing.is_none() {
-                            match ProcessingTask::start(config) {
-                                Ok(task) => processing = Some(task),
-                                Err(error) => tracing::warn!(error = %error, "cannot start embedded Sonix processing"),
-                            }
-                        } else if !targets_present
-                            && let Some(task) = processing.take()
-                        {
+                if !observe_only && let Some(task) = processing.as_mut() {
+                    match task.poll() {
+                        Ok(Some(result)) => {
+                            processing.take();
                             if let Err(error) = restore_raw_microphone(config) {
-                                tracing::warn!(error = %error, "cannot restore raw microphone after endpoint loss");
+                                tracing::warn!(error = %error, "cannot restore raw microphone after processing failure");
                             }
-                            if let Err(error) = task.stop() {
-                                tracing::warn!(error = %error, "embedded Sonix processing did not stop cleanly");
-                            }
+                            return match result {
+                                Ok(()) => Err(anyhow!("embedded Sonix processing exited unexpectedly")),
+                                Err(error) => Err(anyhow::Error::new(error)),
+                            };
                         }
-                    }
-
-                    if let Some(task) = processing.as_mut() {
-                        match task.poll() {
-                            Ok(Some(result)) => {
-                                processing.take();
-                                if let Err(error) = restore_raw_microphone(config) {
-                                    tracing::warn!(error = %error, "cannot restore raw microphone after processing failure");
-                                }
-                                return match result {
-                                    Ok(()) => Err(anyhow!("embedded Sonix processing exited unexpectedly")),
-                                    Err(error) => Err(anyhow::Error::new(error)),
-                                };
+                        Ok(None) => {}
+                        Err(error) => {
+                            processing.take();
+                            if let Err(restore_error) = restore_raw_microphone(config) {
+                                tracing::warn!(error = %restore_error, "cannot restore raw microphone after processing failure");
                             }
-                            Ok(None) => {}
-                            Err(error) => {
-                                processing.take();
-                                if let Err(restore_error) = restore_raw_microphone(config) {
-                                    tracing::warn!(error = %restore_error, "cannot restore raw microphone after processing failure");
-                                }
-                                return Err(error);
-                            }
+                            return Err(error);
                         }
                     }
                 }
 
-                if goxlr_cache_updated.elapsed() >= Duration::from_secs(30) {
+                let resync = last_sync.elapsed() >= FOLLOW_RESYNC;
+                if !(dirty || resync || events.is_none()) {
+                    continue;
+                }
+                if resync {
                     goxlr_cache = None;
-                    goxlr_cache_updated = Instant::now();
+                    if events.is_none() {
+                        events = spawn_graph_events();
+                    }
                 }
-                if let Err(error) =
-                    reconcile_for_follow_async(config, observe_only, &mut goxlr_cache).await
-                {
+                dirty = false;
+                last_sync = Instant::now();
+
+                let (targets_present, diagnostics, result) =
+                    reconcile_for_follow_async(config, observe_only, &mut goxlr_cache).await;
+                if diagnostics != last_diagnostics {
+                    for diagnostic in &diagnostics {
+                        tracing::warn!(diagnostic = %diagnostic, "audio reconciliation diagnostic");
+                    }
+                    last_diagnostics = diagnostics;
+                }
+                if let Err(error) = result {
                     tracing::warn!(error = %error, "GoXLR Nexus sync failed during periodic reconciliation");
+                }
+
+                if !observe_only && let Some(targets_present) = targets_present {
+                    if last_targets_present != Some(targets_present) {
+                        goxlr_cache = None;
+                        last_targets_present = Some(targets_present);
+                        // The processed source appears after startup; route it promptly.
+                        dirty = true;
+                    }
+                    if targets_present && processing.is_none() {
+                        match ProcessingTask::start(config) {
+                            Ok(task) => processing = Some(task),
+                            Err(error) => tracing::warn!(error = %error, "cannot start embedded Sonix processing"),
+                        }
+                    } else if !targets_present
+                        && let Some(task) = processing.take()
+                    {
+                        if let Err(error) = restore_raw_microphone(config) {
+                            tracing::warn!(error = %error, "cannot restore raw microphone after endpoint loss");
+                        }
+                        if let Err(error) = task.stop() {
+                            tracing::warn!(error = %error, "embedded Sonix processing did not stop cleanly");
+                        }
+                    }
                 }
             }
         }
     }
 }
 
+type GoxlrCache = Option<(Instant, Result<Arc<Value>, String>)>;
+
 async fn reconcile_for_follow_async(
     config: &Config,
     observe_only: bool,
-    goxlr_cache: &mut Option<(Instant, Result<Arc<Value>, String>)>,
-) -> Result<()> {
+    goxlr_cache: &mut GoxlrCache,
+) -> (Option<bool>, Vec<String>, Result<()>) {
     let config = config.clone();
     let cached_status = goxlr_cache.take();
-    let (cached_status, result) = tokio::task::spawn_blocking(move || {
+    match tokio::task::spawn_blocking(move || {
         let mut goxlr_cache = cached_status;
-        let result = reconcile_for_follow(&config, observe_only, &mut goxlr_cache);
-        (goxlr_cache, result)
+        let mut targets_present = None;
+        let mut diagnostics = Vec::new();
+        let result = reconcile_for_follow(
+            &config,
+            observe_only,
+            &mut goxlr_cache,
+            &mut targets_present,
+            &mut diagnostics,
+        );
+        (goxlr_cache, targets_present, diagnostics, result)
     })
     .await
-    .context("follow reconciliation task failed")?;
-    *goxlr_cache = cached_status;
-    result
+    {
+        Ok((cached_status, targets_present, diagnostics, result)) => {
+            *goxlr_cache = cached_status;
+            (targets_present, diagnostics, result)
+        }
+        Err(error) => (
+            None,
+            Vec::new(),
+            Err(anyhow::Error::new(error).context("follow reconciliation task failed")),
+        ),
+    }
 }
 
 async fn watch_shutdown_signal() -> Result<()> {
@@ -1927,12 +2092,14 @@ async fn watch_shutdown_signal() -> Result<()> {
 fn reconcile_for_follow(
     config: &Config,
     observe_only: bool,
-    goxlr_cache: &mut Option<(Instant, Result<Arc<Value>, String>)>,
+    goxlr_cache: &mut GoxlrCache,
+    targets_present: &mut Option<bool>,
+    diagnostics_out: &mut Vec<String>,
 ) -> Result<()> {
     let now = Instant::now();
     if goxlr_cache
         .as_ref()
-        .is_none_or(|(updated, _)| now.duration_since(*updated) >= Duration::from_secs(30))
+        .is_none_or(|(updated, _)| now.duration_since(*updated) >= FOLLOW_RESYNC)
     {
         *goxlr_cache = Some((
             now,
@@ -1942,6 +2109,9 @@ fn reconcile_for_follow(
         ));
     }
     let snapshot = snapshot_with_goxlr_status(goxlr_cache.as_ref().map(|(_, status)| status))?;
+    let has_node = |name: &str| snapshot.nodes.iter().any(|node| node.name == name);
+    *targets_present =
+        Some(has_node(&config.profile.default_source) && has_node(&config.profile.default_sink));
     let (current_sink, current_source) = current_defaults()?;
     let (operations, status, diagnostics) =
         reconcile_operations(config, &snapshot, &current_sink, &current_source)?;
@@ -1957,9 +2127,7 @@ fn reconcile_for_follow(
     ) {
         tracing::warn!(error = %error, "failed to write GoXLR Nexus runtime status");
     }
-    for diagnostic in &diagnostics {
-        tracing::warn!(diagnostic = %diagnostic, "audio reconciliation diagnostic");
-    }
+    *diagnostics_out = diagnostics;
     if observe_only {
         if !operations.is_empty() {
             tracing::warn!(
@@ -2224,6 +2392,16 @@ impl ObsClient {
             .collect())
     }
 
+    /// The input's PulseAudio device; OBS omits `device_id` when it is the default.
+    fn input_device(&mut self, input: &str) -> Result<String> {
+        let response = self.request("GetInputSettings", json!({"inputName": input}))?;
+        Ok(response
+            .pointer("/inputSettings/device_id")
+            .and_then(Value::as_str)
+            .unwrap_or(OBS_DEFAULT_DEVICE)
+            .to_string())
+    }
+
     fn create_input(&mut self, scene: &str, source: &ObsSourcePlan) -> Result<()> {
         self.request(
             "CreateInput",
@@ -2319,11 +2497,6 @@ fn sha256_base64(bytes: &[u8]) -> String {
 }
 
 fn obs_source_plan(config: &Config) -> Vec<ObsSourcePlan> {
-    let microphone = effective_microphone_name(config);
-    obs_source_plan_for_microphone(config, &microphone)
-}
-
-fn obs_source_plan_for_microphone(config: &Config, microphone: &str) -> Vec<ObsSourcePlan> {
     config
         .obs
         .sources
@@ -2332,11 +2505,7 @@ fn obs_source_plan_for_microphone(config: &Config, microphone: &str) -> Vec<ObsS
         .map(|source| ObsSourcePlan {
             name: source.name.clone(),
             input_kind: OBS_INPUT_KIND.to_string(),
-            device_id: if source.name == "GoXLR Mic" {
-                microphone.to_string()
-            } else {
-                source.device_id.clone()
-            },
+            device_id: source.device_id.clone(),
         })
         .collect()
 }
@@ -2347,10 +2516,9 @@ fn obs_input_settings(source: &ObsSourcePlan) -> Value {
 
 fn default_obs_sources() -> Vec<ObsSourceConfig> {
     [
-        ("GoXLR Mic", GOXLR_CHAT_MIC),
+        ("GoXLR Mic", OBS_DEFAULT_DEVICE),
         ("GoXLR Stream Mix", GOXLR_STREAM_MIX),
         ("GoXLR Sampler", GOXLR_SAMPLER),
-        ("GoXLR Desktop Mix", GOXLR_STREAM_MIX),
     ]
     .into_iter()
     .map(|(name, device_id)| ObsSourceConfig {
@@ -2578,9 +2746,9 @@ fn checked_pipewire_id(value: Option<&Value>, field: &str) -> Result<u32> {
 }
 
 fn goxlr_status() -> Result<Value> {
-    let output = audio_command("goxlr-client")
-        .args(["--status-json"])
-        .output()
+    let mut command = audio_command("goxlr-client");
+    command.args(["--status-json"]);
+    let output = command_output_with_timeout(command, Duration::from_secs(5))
         .context("failed to run goxlr-client --status-json")?;
     if !output.status.success() {
         bail!(
@@ -2701,9 +2869,9 @@ fn find_node(snapshot: &Snapshot, name: &str) -> Result<Node> {
 }
 
 fn current_defaults() -> Result<(String, String)> {
-    let output = audio_command("pactl")
-        .args(["--format=json", "info"])
-        .output()
+    let mut command = audio_command("pactl");
+    command.args(["--format=json", "info"]);
+    let output = command_output_with_timeout(command, Duration::from_secs(2))
         .context("failed to inspect PipeWire default audio nodes")?;
     if !output.status.success() {
         bail!(
@@ -2768,6 +2936,25 @@ fn audio_command(program: &str) -> Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn follow_wakes_only_for_routing_events() {
+        for line in [
+            "Event 'new' on source #91",
+            "Event 'remove' on sink #56",
+            "Event 'change' on card #58",
+            "Event 'change' on server #-1",
+        ] {
+            assert!(graph_event_relevant(line), "{line}");
+        }
+        for line in [
+            "Event 'change' on sink-input #142",
+            "Event 'new' on source-output #7",
+            "Event 'remove' on client #113",
+        ] {
+            assert!(!graph_event_relevant(line), "{line}");
+        }
+    }
 
     #[test]
     fn parses_pipewire_nodes() {
@@ -2928,7 +3115,7 @@ mod tests {
 
         assert_eq!(config.goxlr_serial.as_deref(), Some("S200805412CQK"));
         assert_eq!(config.output_sinks.len(), 2);
-        assert_eq!(config.obs.sources.len(), 4);
+        assert_eq!(config.obs.sources.len(), 3);
         assert_eq!(config.profile.capture_sample_rate, 48_000);
         assert_eq!(config.profile.capture_channels, 2);
     }
@@ -3043,12 +3230,20 @@ mod tests {
     fn builds_default_obs_source_plan() {
         let mut config = Config::default();
         config.obs.enable = true;
-        let plan = obs_source_plan_for_microphone(&config, GOXLR_CHAT_MIC);
-        assert_eq!(plan.len(), 4);
+        let plan = obs_source_plan(&config);
+        assert_eq!(plan.len(), 3);
         assert_eq!(plan[0].name, "GoXLR Mic");
         assert_eq!(plan[0].input_kind, OBS_INPUT_KIND);
-        assert_eq!(plan[0].device_id, GOXLR_CHAT_MIC);
-        assert_eq!(plan[3].device_id, GOXLR_STREAM_MIX);
+        assert_eq!(plan[0].device_id, OBS_DEFAULT_DEVICE);
+        assert_eq!(plan[1].device_id, GOXLR_STREAM_MIX);
+        assert!(obs_config_checks(&config).is_empty());
+        config.obs.sources.push(ObsSourceConfig {
+            name: "GoXLR Desktop Mix".to_string(),
+            device_id: GOXLR_STREAM_MIX.to_string(),
+        });
+        assert!(
+            matches!(&obs_config_checks(&config)[..], [Check::Fail(message)] if message.contains("doubled"))
+        );
     }
 
     #[test]

@@ -300,7 +300,8 @@ in {
         default = [
           {
             name = "GoXLR Mic";
-            deviceId = "alsa_input.usb-TC-Helicon_GoXLR-00.HiFi__Headset__source";
+            # Follows the default source: processed when healthy, raw otherwise.
+            deviceId = "default";
           }
           {
             name = "GoXLR Stream Mix";
@@ -309,10 +310,6 @@ in {
           {
             name = "GoXLR Sampler";
             deviceId = "alsa_input.usb-TC-Helicon_GoXLR-00.HiFi__Line5__source";
-          }
-          {
-            name = "GoXLR Desktop Mix";
-            deviceId = "alsa_input.usb-TC-Helicon_GoXLR-00.HiFi__Line4__source";
           }
         ];
       };

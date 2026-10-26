@@ -93,7 +93,10 @@ profile.
 
 `obs sync` uses obs-websocket v5 to create or update dedicated GoXLR audio
 sources in the active OBS scene. It does not rewrite OBS global Desktop Audio or
-Mic/Aux devices.
+Mic/Aux devices. "GoXLR Mic" uses the `default` device, so OBS follows the
+source `follow` selects: processed when healthy, raw otherwise. `doctor` checks
+the websocket handshake, that each configured input exists, and that its
+device exists in PipeWire; two sources on one device fail as doubled audio.
 
 ## Embedded microphone processing
 
