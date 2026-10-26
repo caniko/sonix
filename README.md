@@ -93,7 +93,10 @@ profile.
 
 `obs sync` uses obs-websocket v5 to create or update dedicated GoXLR audio
 sources in the active OBS scene. It does not rewrite OBS global Desktop Audio or
-Mic/Aux devices.
+Mic/Aux devices. "GoXLR Mic" uses the `default` device, so OBS follows the
+source `follow` selects: processed when healthy, raw otherwise. `doctor` checks
+the websocket handshake, that each configured input exists, and that its
+device exists in PipeWire; two sources on one device fail as doubled audio.
 
 ## Embedded microphone processing
 
@@ -124,6 +127,26 @@ The processor stores its state at
 directories must be absolute; there is no shared `/tmp` fallback. The state
 file is written atomically under an advisory lock, and the control socket is
 created with user-only permissions.
+
+## FX telemetry for crackling/distortion
+
+Local-only diagnostics for audio issues fixed by toggling the physical GoXLR
+FX button, off by default:
+
+```sh
+# Nix: programs.sonix.goxlr.telemetry.enable = true
+# Pkl: telemetry = new { enable = true }
+```
+
+`follow` samples GoXLR FX/button state and Sonix health/counters once per
+second, and defaults plus PipeWire presence every 5 s. It writes a `sample`
+event when the state changes (and a heartbeat every 60 s), `fxTransition` on
+every FX enable/button change, and `topology` when defaults or PipeWire
+presence change, to
+`$XDG_STATE_HOME/sonix/telemetry/telemetry.jsonl` (2×16 MiB rotation, 0600
+files). Serials, profile/preset names and USB topology are redacted. No audio
+is recorded and nothing leaves the host. Compare the distorted state with the
+state after a manual FX cycle; telemetry never toggles FX itself.
 
 ## Declarative GoXLR Utility artifacts
 

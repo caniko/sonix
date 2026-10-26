@@ -161,6 +161,10 @@
         noiseLevel = ${pklString effectiveProcessing.noiseLevel}
         ${lib.optionalString (effectiveProcessing.echoDelayMs != null) ''echoDelay = new { mode = "fixed"; milliseconds = ${toString effectiveProcessing.echoDelayMs} }''}
         }
+
+        telemetry = new {
+        enable = ${lib.boolToString cfg.telemetry.enable}
+        }
   '';
 in {
   options.programs.sonix.goxlr = {
@@ -216,6 +220,11 @@ in {
       type = types.bool;
       default = false;
       description = "Observe and report routing drift without applying audio mutations.";
+    };
+    telemetry.enable = mkOption {
+      type = types.bool;
+      default = false;
+      description = "Record local-only GoXLR FX telemetry for crackling/distortion triage. No audio is recorded and nothing leaves the host.";
     };
     monitorSource = mkOption {
       type = types.str;
@@ -300,7 +309,8 @@ in {
         default = [
           {
             name = "GoXLR Mic";
-            deviceId = "alsa_input.usb-TC-Helicon_GoXLR-00.HiFi__Headset__source";
+            # Follows the default source: processed when healthy, raw otherwise.
+            deviceId = "default";
           }
           {
             name = "GoXLR Stream Mix";
@@ -309,10 +319,6 @@ in {
           {
             name = "GoXLR Sampler";
             deviceId = "alsa_input.usb-TC-Helicon_GoXLR-00.HiFi__Line5__source";
-          }
-          {
-            name = "GoXLR Desktop Mix";
-            deviceId = "alsa_input.usb-TC-Helicon_GoXLR-00.HiFi__Line4__source";
           }
         ];
       };

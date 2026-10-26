@@ -21,11 +21,12 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::time::Instant;
 use tungstenite::stream::MaybeTlsStream;
-use tungstenite::{Message, WebSocket, connect};
+use tungstenite::{Message, WebSocket};
 use zeroize::Zeroizing;
 
 mod observation;
 mod processing;
+mod telemetry;
 use observation::{
     Facts, GoxlrFacts, ObsFacts, Observation, PipewireFacts, PipewireNode, Producer, SCHEMA,
     SourceStatus, facts_digest,
@@ -34,6 +35,7 @@ use processing::{
     ProcessingCommand, ProcessingSettings, processing_command, processing_runtime_config,
     restore_raw_microphone,
 };
+use telemetry::{TelemetryCollector, TelemetrySettings};
 
 const GOXLR_SYSTEM: &str = "alsa_output.usb-TC-Helicon_GoXLR-00.HiFi__Speaker__sink";
 const GOXLR_CHAT: &str = "alsa_output.usb-TC-Helicon_GoXLR-00.HiFi__Headphones__sink";
@@ -43,6 +45,11 @@ const GOXLR_SAMPLE: &str = "alsa_output.usb-TC-Helicon_GoXLR-00.HiFi__Line3__sin
 const GOXLR_CHAT_MIC: &str = "alsa_input.usb-TC-Helicon_GoXLR-00.HiFi__Headset__source";
 const GOXLR_STREAM_MIX: &str = "alsa_input.usb-TC-Helicon_GoXLR-00.HiFi__Line4__source";
 const GOXLR_SAMPLER: &str = "alsa_input.usb-TC-Helicon_GoXLR-00.HiFi__Line5__source";
+/// OBS PulseAudio device id that follows the server's default source.
+const OBS_DEFAULT_DEVICE: &str = "default";
+/// Sources earlier defaults created that `obs sync` now removes.
+const RETIRED_OBS_SOURCES: &[&str] = &["GoXLR Desktop Mix"];
+const OBS_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const OBS_INPUT_KIND: &str = "pulse_input_capture";
 const PLAN_SCHEMA: &str = "sonix.goxlr.plan/v2";
 const ADOPT_SCHEMA: &str = "sonix.goxlr.adopt/v1";
@@ -133,6 +140,7 @@ struct Config {
     profile: ProfileConfig,
     obs: ObsConfig,
     processing: ProcessingSettings,
+    telemetry: TelemetrySettings,
 }
 
 impl Config {
@@ -709,19 +717,15 @@ fn adopt(json_output: bool) -> Result<()> {
     }
     config.default_source = default_source.as_ref().map(|node| node.name.clone());
     config.monitor_source = monitor_source.as_ref().map(|node| node.name.clone());
-    if let Some(node) = default_source {
+    if default_source.is_some() {
         config.obs_sources.push(AdoptObsSource {
             name: "GoXLR Mic".to_string(),
-            device_id: node.name,
+            device_id: OBS_DEFAULT_DEVICE.to_string(),
         });
     }
     if let Some(node) = monitor_source.as_ref() {
         config.obs_sources.push(AdoptObsSource {
             name: "GoXLR Stream Mix".to_string(),
-            device_id: node.name.clone(),
-        });
-        config.obs_sources.push(AdoptObsSource {
-            name: "GoXLR Desktop Mix".to_string(),
             device_id: node.name.clone(),
         });
     }
@@ -1094,7 +1098,25 @@ async fn load_config(explicit: Option<&Path>) -> Result<Config> {
 
 fn doctor(config: &Config) -> Result<()> {
     let snapshot = snapshot()?;
-    let required = required_nodes(config, &snapshot)?;
+    let mut failed = false;
+    if let Err(err) = doctor_goxlr(config, &snapshot) {
+        println!("fail: {err:#}");
+        failed = true;
+    }
+    if config.obs.enable {
+        for check in obs_health(config, &snapshot) {
+            failed |= matches!(check, Check::Fail(_));
+            println!("{check}");
+        }
+    }
+    if failed {
+        bail!("doctor found failures");
+    }
+    Ok(())
+}
+
+fn doctor_goxlr(config: &Config, snapshot: &Snapshot) -> Result<()> {
+    let required = required_nodes(config, snapshot)?;
     let status = snapshot
         .goxlr_status
         .as_ref()
@@ -1110,18 +1132,256 @@ fn doctor(config: &Config) -> Result<()> {
         "ok: GoXLR serial {}",
         config.goxlr_serial.as_deref().unwrap_or("not configured")
     );
+    Ok(())
+}
 
-    if config.obs.enable {
-        match obs_ready(config) {
-            Ok(()) => println!(
-                "ok: OBS websocket reachable at {}:{}",
-                config.obs.host, config.obs.port
-            ),
-            Err(err) => println!("warn: OBS degraded: {err:#}"),
+/// One health finding; only `Fail` makes `doctor` exit non-zero.
+#[derive(Debug, PartialEq, Eq)]
+enum Check {
+    Ok(String),
+    Warn(String),
+    Fail(String),
+}
+
+impl std::fmt::Display for Check {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ok(message) => write!(f, "ok: {message}"),
+            Self::Warn(message) => write!(f, "warn: {message}"),
+            Self::Fail(message) => write!(f, "fail: {message}"),
         }
     }
+}
 
-    Ok(())
+impl Check {
+    fn to_json(&self) -> Value {
+        let (level, message) = match self {
+            Self::Ok(message) => ("ok", message),
+            Self::Warn(message) => ("warn", message),
+            Self::Fail(message) => ("fail", message),
+        };
+        json!({"level": level, "message": message})
+    }
+}
+
+/// Two sources capturing one device double its audio. `default` is resolved
+/// to the live default source when known, so it collides with that node too.
+fn duplicate_device_checks<'a>(
+    sources: impl IntoIterator<Item = (&'a str, &'a str)>,
+    default_source: Option<&'a str>,
+) -> Vec<Check> {
+    let mut seen = BTreeMap::new();
+    let mut checks = Vec::new();
+    for (name, device) in sources {
+        let device = match default_source {
+            Some(resolved) if device == OBS_DEFAULT_DEVICE => resolved,
+            _ => device,
+        };
+        if let Some(previous) = seen.insert(device, name) {
+            checks.push(Check::Fail(format!(
+                "OBS sources {previous} and {name} both capture {device}; the audio is doubled"
+            )));
+        }
+    }
+    checks
+}
+
+/// A `default` OBS input must land on the microphone `follow` selected
+/// (processed when healthy, raw otherwise), not whatever the system default is.
+fn default_microphone_check(
+    input: &str,
+    default_source: Option<&str>,
+    effective: &str,
+) -> Option<Check> {
+    match default_source {
+        Some(current) if current == effective => None,
+        Some(current) => Some(Check::Fail(format!(
+            "OBS source {input} follows the default source {current}, but the selected microphone is {effective}; is `goxlr-nexus follow` running?"
+        ))),
+        None => Some(Check::Fail(format!(
+            "OBS source {input} follows the default source, which cannot be read"
+        ))),
+    }
+}
+
+/// Sinks the Stream Mix is linked into right now (only the selected output).
+fn stream_mix_sinks(config: &Config, snapshot: &Snapshot) -> Vec<String> {
+    let Some(mix) = snapshot
+        .nodes
+        .iter()
+        .find(|node| node.name == config.profile.monitor_source)
+    else {
+        return Vec::new();
+    };
+    snapshot
+        .links
+        .iter()
+        .filter(|link| link.output_node_id == mix.id)
+        .filter_map(|link| {
+            snapshot
+                .nodes
+                .iter()
+                .find(|node| node.id == link.input_node_id)
+        })
+        .map(|node| node.name.clone())
+        .collect()
+}
+
+fn desktop_doubling_checks(
+    config: &Config,
+    desktops: &[(String, String)],
+    inputs: &[(String, String)],
+    default_sink: Option<&str>,
+    mix_sinks: &[String],
+) -> Vec<Check> {
+    let Some((mix, _)) = inputs
+        .iter()
+        .find(|(_, device)| *device == config.profile.monitor_source)
+    else {
+        return Vec::new();
+    };
+    desktops
+        .iter()
+        .filter_map(|(name, device)| {
+            let sink = match default_sink {
+                Some(resolved) if device == OBS_DEFAULT_DEVICE => resolved,
+                _ => device.as_str(),
+            };
+            mix_sinks.iter().any(|output| output == sink).then(|| {
+                Check::Fail(format!(
+                    "OBS {name} records {sink}, which plays the Stream Mix {mix} already captures; the audio is doubled"
+                ))
+            })
+        })
+        .collect()
+}
+
+fn obs_config_checks(config: &Config, default_source: Option<&str>) -> Vec<Check> {
+    duplicate_device_checks(
+        config
+            .obs
+            .sources
+            .iter()
+            .map(|source| (source.name.as_str(), source.device_id.as_str())),
+        default_source,
+    )
+}
+
+/// Live OBS checks: websocket handshake, configured inputs, and that every
+/// input's actual device exists in PipeWire (a missing device is an errored,
+/// silent OBS source). OBS not running is only a warning.
+fn obs_health(config: &Config, snapshot: &Snapshot) -> Vec<Check> {
+    let defaults = current_defaults().ok();
+    let default_sink = defaults.as_ref().map(|(sink, _)| sink.clone());
+    let default_source = defaults.map(|(_, source)| source);
+    let mut checks = obs_config_checks(config, default_source.as_deref());
+    if let Err(err) = obs_ready(config) {
+        checks.push(Check::Warn(format!("OBS is not running: {err:#}")));
+        return checks;
+    }
+    let mut client = match ObsClient::connect(config) {
+        Ok(client) => client,
+        Err(err) => {
+            checks.push(Check::Fail(format!(
+                "OBS websocket handshake failed: {err:#}"
+            )));
+            return checks;
+        }
+    };
+    checks.push(Check::Ok(format!(
+        "OBS websocket identified at {}:{}",
+        config.obs.host, config.obs.port
+    )));
+    let result = (|| -> Result<()> {
+        let scene = client.target_scene()?;
+        let inputs = client.input_names()?;
+        let scene_items = client.scene_source_names(&scene)?;
+        let effective = effective_microphone_name(config);
+        // Every live PulseAudio input counts, including ones no longer
+        // configured (e.g. a Desktop Mix left by an older default).
+        let mut live = Vec::new();
+        for name in client.input_names_of_kind(OBS_INPUT_KIND)? {
+            let device = client.input_device(&name)?;
+            live.push((name, device));
+        }
+        // OBS's global Mic/Aux channels capture sources too. Its global
+        // Desktop Audio captures a sink; on a sink `follow` feeds from the
+        // Stream Mix it records that mix a second time.
+        let mut microphones = live.clone();
+        let mut desktops = Vec::new();
+        let specials = client.request("GetSpecialInputs", json!({}))?;
+        for (channel, name) in specials.as_object().into_iter().flatten() {
+            let Some(name) = name.as_str() else {
+                continue;
+            };
+            let device = client.input_device(name)?;
+            if channel.starts_with("desktop") {
+                desktops.push((name.to_string(), device));
+            } else {
+                microphones.push((name.to_string(), device));
+            }
+        }
+        checks.extend(duplicate_device_checks(
+            microphones
+                .iter()
+                .map(|(name, device)| (name.as_str(), device.as_str())),
+            default_source.as_deref(),
+        ));
+        checks.extend(desktop_doubling_checks(
+            config,
+            &desktops,
+            &live,
+            default_sink.as_deref(),
+            &stream_mix_sinks(config, snapshot),
+        ));
+        for source in obs_source_plan(config) {
+            let Some((_, device)) = live.iter().find(|(name, _)| *name == source.name) else {
+                checks.push(Check::Fail(if inputs.contains(&source.name) {
+                    format!(
+                        "OBS source {} is not a {OBS_INPUT_KIND} input; remove or rename it",
+                        source.name
+                    )
+                } else {
+                    format!(
+                        "OBS source {} is missing; run `goxlr-nexus obs sync`",
+                        source.name
+                    )
+                }));
+                continue;
+            };
+            let device = device.clone();
+            if device != source.device_id {
+                checks.push(Check::Fail(format!(
+                    "OBS source {} captures {device}, expected {}; run `goxlr-nexus obs sync`",
+                    source.name, source.device_id
+                )));
+            } else if device == OBS_DEFAULT_DEVICE
+                && let Some(check) =
+                    default_microphone_check(&source.name, default_source.as_deref(), &effective)
+            {
+                checks.push(check);
+            } else if device != OBS_DEFAULT_DEVICE
+                && !snapshot.nodes.iter().any(|node| node.name == device)
+            {
+                checks.push(Check::Fail(format!(
+                    "OBS source {} captures missing PipeWire node {device}",
+                    source.name
+                )));
+            } else if !scene_items.contains(&source.name) {
+                checks.push(Check::Warn(format!(
+                    "OBS source {} is not in the current scene {scene}",
+                    source.name
+                )));
+            } else {
+                checks.push(Check::Ok(format!("OBS source {} -> {device}", source.name)));
+            }
+        }
+        Ok(())
+    })();
+    if let Err(err) = result {
+        checks.push(Check::Fail(format!("OBS inspection failed: {err:#}")));
+    }
+    checks
 }
 
 fn status(config: &Config, json: bool) -> Result<()> {
@@ -1181,6 +1441,14 @@ fn status(config: &Config, json: bool) -> Result<()> {
         out.insert("doctorOk", Value::Bool(required.is_ok() && goxlr_ok));
         out.insert("goxlrOk", Value::Bool(goxlr_ok));
         out.insert("obsEnabled", Value::Bool(config.obs.enable));
+        if config.obs.enable {
+            let checks = obs_health(config, &snapshot);
+            out.insert(
+                "obsOk",
+                Value::Bool(!checks.iter().any(|check| matches!(check, Check::Fail(_)))),
+            );
+            out.insert("obs", checks.iter().map(Check::to_json).collect());
+        }
         out.insert(
             "effectiveMicrophone",
             Value::String(effective_microphone_name(config)),
@@ -1761,21 +2029,38 @@ impl ProcessingTask {
     }
 }
 
-async fn processing_targets_present(config: &Config) -> Result<bool> {
-    let config = config.clone();
-    tokio::task::spawn_blocking(move || {
-        let graph = pipewire_graph(false)?;
-        Ok(graph
-            .nodes
-            .iter()
-            .any(|node| node.name == config.profile.default_source)
-            && graph
-                .nodes
-                .iter()
-                .any(|node| node.name == config.profile.default_sink))
-    })
-    .await
-    .context("processing endpoint inspection task failed")?
+/// Full resynchronization interval; `pactl subscribe` events wake earlier.
+const FOLLOW_RESYNC: Duration = Duration::from_secs(30);
+/// Delay before retrying a failed reconciliation pass.
+const FOLLOW_RETRY: Duration = Duration::from_secs(5);
+
+/// Whether a `pactl subscribe` line can change routing: device, default or
+/// card changes. Stream (sink-input/source-output) and client churn cannot.
+fn graph_event_relevant(line: &str) -> bool {
+    [" on sink #", " on source #", " on card #", " on server"]
+        .iter()
+        .any(|needle| line.contains(needle))
+}
+
+fn spawn_graph_events()
+-> Option<tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>> {
+    use tokio::io::AsyncBufReadExt;
+
+    let mut child = tokio::process::Command::new("pactl")
+        .arg("subscribe")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|error| tracing::warn!(error = %error, "cannot watch PipeWire events; polling every tick"))
+        .ok()?;
+    let stdout = child.stdout.take()?;
+    // The reader keeps the pipe; the detached child exits on EOF of its server.
+    tokio::spawn(async move {
+        let _ = child.wait().await;
+    });
+    Some(tokio::io::BufReader::new(stdout).lines())
 }
 
 async fn follow(config: &Config, observe_only: bool) -> Result<()> {
@@ -1783,9 +2068,34 @@ async fn follow(config: &Config, observe_only: bool) -> Result<()> {
     let mut shutdown = Box::pin(watch_shutdown_signal());
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let mut goxlr_cache = None;
-    let mut goxlr_cache_updated = Instant::now() - Duration::from_secs(31);
     let mut processing: Option<ProcessingTask> = None;
     let mut last_targets_present = None;
+    let mut last_diagnostics = Vec::new();
+    // Telemetry is optional diagnostics: it never blocks follow from starting,
+    // and its probes (up to ~9 s on timeout) run in their own task so they
+    // cannot delay routing.
+    // Detached: the task ends with the follow runtime.
+    let _telemetry = match TelemetryCollector::start(config.telemetry.enable) {
+        Ok(collector) => collector.map(|mut collector| {
+            let config = config.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(1));
+                loop {
+                    tick.tick().await;
+                    telemetry_sample(&config, &mut collector).await;
+                }
+            })
+        }),
+        Err(error) => {
+            tracing::warn!(error = %format!("{error:#}"), "goxlr telemetry disabled");
+            None
+        }
+    };
+    let mut events = spawn_graph_events();
+    let mut last_watch_attempt = Instant::now();
+    let mut dirty = true;
+    let mut last_sync = Instant::now();
+    let mut retry_at: Option<Instant> = None;
 
     if !observe_only && let Err(error) = restore_raw_microphone(config) {
         tracing::warn!(error = %error, "cannot restore raw microphone before startup");
@@ -1805,101 +2115,134 @@ async fn follow(config: &Config, observe_only: bool) -> Result<()> {
                 }
                 return Ok(());
             }
+            line = async { events.as_mut().expect("guarded by select precondition").next_line().await }, if events.is_some() => {
+                match line {
+                    Ok(Some(line)) => dirty |= graph_event_relevant(&line),
+                    Ok(None) | Err(_) => {
+                        tracing::warn!("PipeWire event watcher ended; respawning on next resync");
+                        events = None;
+                        dirty = true;
+                    }
+                }
+            }
             _ = tick.tick() => {
-                if !observe_only {
-                    let target_presence = match tokio::time::timeout(
-                        Duration::from_secs(3),
-                        processing_targets_present(config),
-                    )
-                    .await
-                    {
-                        Ok(Ok(present)) => Some(present),
-                        Ok(Err(error)) => {
-                            tracing::warn!(error = %error, "cannot inspect Sonix processing endpoints");
-                            None
-                        }
-                        Err(_) => {
-                            tracing::warn!("timed out inspecting Sonix processing endpoints");
-                            None
-                        }
-                    };
-                    if let Some(targets_present) = target_presence {
-                        if last_targets_present != Some(targets_present) {
-                            goxlr_cache = None;
-                            goxlr_cache_updated = Instant::now() - Duration::from_secs(31);
-                            last_targets_present = Some(targets_present);
-                        }
-                        if targets_present && processing.is_none() {
-                            match ProcessingTask::start(config) {
-                                Ok(task) => processing = Some(task),
-                                Err(error) => tracing::warn!(error = %error, "cannot start embedded Sonix processing"),
-                            }
-                        } else if !targets_present
-                            && let Some(task) = processing.take()
-                        {
+                if !observe_only && let Some(task) = processing.as_mut() {
+                    match task.poll() {
+                        Ok(Some(result)) => {
+                            processing.take();
                             if let Err(error) = restore_raw_microphone(config) {
-                                tracing::warn!(error = %error, "cannot restore raw microphone after endpoint loss");
+                                tracing::warn!(error = %error, "cannot restore raw microphone after processing failure");
                             }
-                            if let Err(error) = task.stop() {
-                                tracing::warn!(error = %error, "embedded Sonix processing did not stop cleanly");
-                            }
+                            return match result {
+                                Ok(()) => Err(anyhow!("embedded Sonix processing exited unexpectedly")),
+                                Err(error) => Err(anyhow::Error::new(error)),
+                            };
                         }
-                    }
-
-                    if let Some(task) = processing.as_mut() {
-                        match task.poll() {
-                            Ok(Some(result)) => {
-                                processing.take();
-                                if let Err(error) = restore_raw_microphone(config) {
-                                    tracing::warn!(error = %error, "cannot restore raw microphone after processing failure");
-                                }
-                                return match result {
-                                    Ok(()) => Err(anyhow!("embedded Sonix processing exited unexpectedly")),
-                                    Err(error) => Err(anyhow::Error::new(error)),
-                                };
+                        Ok(None) => {}
+                        Err(error) => {
+                            processing.take();
+                            if let Err(restore_error) = restore_raw_microphone(config) {
+                                tracing::warn!(error = %restore_error, "cannot restore raw microphone after processing failure");
                             }
-                            Ok(None) => {}
-                            Err(error) => {
-                                processing.take();
-                                if let Err(restore_error) = restore_raw_microphone(config) {
-                                    tracing::warn!(error = %restore_error, "cannot restore raw microphone after processing failure");
-                                }
-                                return Err(error);
-                            }
+                            return Err(error);
                         }
                     }
                 }
 
-                if goxlr_cache_updated.elapsed() >= Duration::from_secs(30) {
+                // A dead watcher degrades to per-tick polling; retry it on its
+                // own clock because polling keeps resetting `last_sync`.
+                if events.is_none() && last_watch_attempt.elapsed() >= FOLLOW_RESYNC {
+                    last_watch_attempt = Instant::now();
+                    events = spawn_graph_events();
+                }
+                let resync = last_sync.elapsed() >= FOLLOW_RESYNC
+                    || retry_at.is_some_and(|at| Instant::now() >= at);
+                if !(dirty || resync || events.is_none()) {
+                    continue;
+                }
+                if resync {
                     goxlr_cache = None;
-                    goxlr_cache_updated = Instant::now();
                 }
-                if let Err(error) =
-                    reconcile_for_follow_async(config, observe_only, &mut goxlr_cache).await
-                {
+                dirty = false;
+                retry_at = None;
+                last_sync = Instant::now();
+
+                let (targets_present, diagnostics, result) =
+                    reconcile_for_follow_async(config, observe_only, &mut goxlr_cache).await;
+                if diagnostics != last_diagnostics {
+                    for diagnostic in &diagnostics {
+                        tracing::warn!(diagnostic = %diagnostic, "audio reconciliation diagnostic");
+                    }
+                    last_diagnostics = diagnostics;
+                }
+                if let Err(error) = result {
                     tracing::warn!(error = %error, "GoXLR Nexus sync failed during periodic reconciliation");
+                    // Retry soon instead of waiting for the next full resync.
+                    retry_at = Some(Instant::now() + FOLLOW_RETRY);
+                }
+
+                if !observe_only && let Some(targets_present) = targets_present {
+                    if last_targets_present != Some(targets_present) {
+                        goxlr_cache = None;
+                        last_targets_present = Some(targets_present);
+                        // The processed source appears after startup; route it promptly.
+                        dirty = true;
+                    }
+                    if targets_present && processing.is_none() {
+                        match ProcessingTask::start(config) {
+                            Ok(task) => processing = Some(task),
+                            Err(error) => tracing::warn!(error = %error, "cannot start embedded Sonix processing"),
+                        }
+                    } else if !targets_present
+                        && let Some(task) = processing.take()
+                    {
+                        if let Err(error) = restore_raw_microphone(config) {
+                            tracing::warn!(error = %error, "cannot restore raw microphone after endpoint loss");
+                        }
+                        if let Err(error) = task.stop() {
+                            tracing::warn!(error = %error, "embedded Sonix processing did not stop cleanly");
+                        }
+                    }
                 }
             }
         }
     }
 }
 
+type GoxlrCache = Option<(Instant, Result<Arc<Value>, String>)>;
+
 async fn reconcile_for_follow_async(
     config: &Config,
     observe_only: bool,
-    goxlr_cache: &mut Option<(Instant, Result<Arc<Value>, String>)>,
-) -> Result<()> {
+    goxlr_cache: &mut GoxlrCache,
+) -> (Option<bool>, Vec<String>, Result<()>) {
     let config = config.clone();
     let cached_status = goxlr_cache.take();
-    let (cached_status, result) = tokio::task::spawn_blocking(move || {
+    match tokio::task::spawn_blocking(move || {
         let mut goxlr_cache = cached_status;
-        let result = reconcile_for_follow(&config, observe_only, &mut goxlr_cache);
-        (goxlr_cache, result)
+        let mut targets_present = None;
+        let mut diagnostics = Vec::new();
+        let result = reconcile_for_follow(
+            &config,
+            observe_only,
+            &mut goxlr_cache,
+            &mut targets_present,
+            &mut diagnostics,
+        );
+        (goxlr_cache, targets_present, diagnostics, result)
     })
     .await
-    .context("follow reconciliation task failed")?;
-    *goxlr_cache = cached_status;
-    result
+    {
+        Ok((cached_status, targets_present, diagnostics, result)) => {
+            *goxlr_cache = cached_status;
+            (targets_present, diagnostics, result)
+        }
+        Err(error) => (
+            None,
+            Vec::new(),
+            Err(anyhow::Error::new(error).context("follow reconciliation task failed")),
+        ),
+    }
 }
 
 async fn watch_shutdown_signal() -> Result<()> {
@@ -1927,12 +2270,14 @@ async fn watch_shutdown_signal() -> Result<()> {
 fn reconcile_for_follow(
     config: &Config,
     observe_only: bool,
-    goxlr_cache: &mut Option<(Instant, Result<Arc<Value>, String>)>,
+    goxlr_cache: &mut GoxlrCache,
+    targets_present: &mut Option<bool>,
+    diagnostics_out: &mut Vec<String>,
 ) -> Result<()> {
     let now = Instant::now();
     if goxlr_cache
         .as_ref()
-        .is_none_or(|(updated, _)| now.duration_since(*updated) >= Duration::from_secs(30))
+        .is_none_or(|(updated, _)| now.duration_since(*updated) >= FOLLOW_RESYNC)
     {
         *goxlr_cache = Some((
             now,
@@ -1942,6 +2287,9 @@ fn reconcile_for_follow(
         ));
     }
     let snapshot = snapshot_with_goxlr_status(goxlr_cache.as_ref().map(|(_, status)| status))?;
+    let has_node = |name: &str| snapshot.nodes.iter().any(|node| node.name == name);
+    *targets_present =
+        Some(has_node(&config.profile.default_source) && has_node(&config.profile.default_sink));
     let (current_sink, current_source) = current_defaults()?;
     let (operations, status, diagnostics) =
         reconcile_operations(config, &snapshot, &current_sink, &current_source)?;
@@ -1957,9 +2305,7 @@ fn reconcile_for_follow(
     ) {
         tracing::warn!(error = %error, "failed to write GoXLR Nexus runtime status");
     }
-    for diagnostic in &diagnostics {
-        tracing::warn!(diagnostic = %diagnostic, "audio reconciliation diagnostic");
-    }
+    *diagnostics_out = diagnostics;
     if observe_only {
         if !operations.is_empty() {
             tracing::warn!(
@@ -1971,6 +2317,135 @@ fn reconcile_for_follow(
         return Ok(());
     }
     execute_audio_operations(&operations, false)
+}
+
+async fn telemetry_sample(config: &Config, collector: &mut TelemetryCollector) {
+    let tick = collector.next_tick();
+    let probe_config = config.clone();
+    let probe = tokio::task::spawn_blocking(move || telemetry_probe_blocking(&probe_config, tick))
+        .await
+        .unwrap_or_else(|error| telemetry::TelemetryProbe::failed(format!("{error:#}")));
+    let serial = config.goxlr_serial.as_deref();
+    let fx = probe
+        .goxlr
+        .as_ref()
+        .and_then(|status| telemetry::summarize_goxlr(status, serial));
+    let (fx_enabled, fx_button, fx_detail) = match &fx {
+        Some(state) => (
+            state.fx_enabled,
+            state.fx_button,
+            serde_json::to_value(state).unwrap_or(Value::Null),
+        ),
+        None => (None, None, Value::Null),
+    };
+    let fx_baseline = collector.fx_baseline();
+    let changed = collector.fx_changed(fx_enabled, fx_button);
+    let (processing_summary, retry_delta, dropped_delta) = match &probe.processing {
+        Some(status) => {
+            let (retry_delta, dropped_delta) =
+                collector.counter_deltas(Some(status.retries), Some(status.dropped_frames));
+            (
+                Some(telemetry::summarize_processing(status)),
+                retry_delta,
+                dropped_delta,
+            )
+        }
+        None => {
+            let _ = collector.counter_deltas(None, None);
+            (None, None, None)
+        }
+    };
+    let diagnostics: Vec<String> = [
+        ("goxlr", &probe.goxlr_error),
+        ("defaults", &probe.defaults_error),
+        ("pipewire", &probe.pipewire_error),
+    ]
+    .into_iter()
+    .filter_map(|(probe, error)| {
+        error
+            .as_ref()
+            .map(|error| format!("{probe} probe: {error}"))
+    })
+    .collect();
+    let detail = json!({
+        "fx": fx_detail,
+        "fxChanged": changed,
+        "processing": processing_summary,
+        "retryDelta": retry_delta,
+        "droppedDelta": dropped_delta,
+        "gap": probe.goxlr.is_none(),
+        "diagnostics": diagnostics,
+    });
+    if collector.sample_due(&detail)
+        && let Err(error) = collector.record("sample", detail.clone())
+    {
+        tracing::warn!(error = %format!("{error:#}"), "goxlr telemetry write failed");
+        collector.write_failed(fx_baseline);
+        return;
+    }
+    if changed
+        && fx.is_some()
+        && let Err(error) = collector.record("fxTransition", detail)
+    {
+        tracing::warn!(error = %format!("{error:#}"), "goxlr telemetry transition write failed");
+        collector.write_failed(fx_baseline);
+    }
+    // Defaults and topology are probed every 5th tick; keep them out of
+    // `sample` so unchanged samples deduplicate, and log them on change.
+    if probe.defaults.is_some() || probe.pipewire.is_some() {
+        let topology = json!({"defaults": probe.defaults, "pipewire": probe.pipewire});
+        if collector.topology_changed(&topology)
+            && let Err(error) = collector.record("topology", topology)
+        {
+            tracing::warn!(error = %format!("{error:#}"), "goxlr telemetry topology write failed");
+            collector.topology_write_failed();
+        }
+    }
+}
+
+/// FX state needs a fresh `goxlr-client` status every tick to catch button
+/// presses; the control socket is in-process. Defaults and topology change
+/// rarely, so `pactl` and `pw-dump` run only every 5th tick.
+fn telemetry_probe_blocking(config: &Config, tick: u64) -> telemetry::TelemetryProbe {
+    let (goxlr, goxlr_error) = match goxlr_status() {
+        Ok(status) => (Some(status), None),
+        Err(error) => (None, Some(format!("{error:#}"))),
+    };
+    let processing = default_control_socket()
+        .ok()
+        .and_then(|path| ControlClient::new(path).status().ok());
+    let mut probe = telemetry::TelemetryProbe {
+        goxlr,
+        goxlr_error,
+        processing,
+        ..Default::default()
+    };
+    if !tick.is_multiple_of(5) {
+        return probe;
+    }
+    match current_defaults() {
+        Ok((sink, source)) => {
+            probe.defaults = Some(json!({"defaultSink": sink, "defaultSource": source}));
+        }
+        Err(error) => probe.defaults_error = Some(format!("{error:#}")),
+    }
+    match pipewire_graph(false) {
+        Ok(graph) => {
+            let present = |name: &str| graph.nodes.iter().any(|node| node.name == name);
+            probe.pipewire = Some(json!({
+                "nodeCount": graph.nodes.len(),
+                "linkCount": graph.links.len(),
+                "present": {
+                    "defaultSource": present(&config.profile.default_source),
+                    "defaultSink": present(&config.profile.default_sink),
+                    "monitorSource": present(&config.profile.monitor_source),
+                    "processedSource": present(&config.processing.source_name),
+                },
+            }));
+        }
+        Err(error) => probe.pipewire_error = Some(format!("{error:#}")),
+    }
+    probe
 }
 
 #[derive(Debug, Serialize)]
@@ -2073,6 +2548,9 @@ fn obs_sync(config: &Config, dry_run: bool) -> Result<()> {
         for source in sources {
             println!("  {}: {}", source.name, source.device_id);
         }
+        for name in retired_obs_sources(config) {
+            println!("  remove retired {name} if present");
+        }
         return Ok(());
     }
 
@@ -2094,18 +2572,44 @@ fn obs_sync(config: &Config, dry_run: bool) -> Result<()> {
             }
         }
     }
+    for name in retired_obs_sources(config) {
+        if existing_inputs.iter().any(|input| input == name) {
+            client.remove_input(name)?;
+            println!("removed retired OBS source {name}");
+        }
+    }
     Ok(())
 }
 
+fn retired_obs_sources(config: &Config) -> impl Iterator<Item = &'static str> + '_ {
+    RETIRED_OBS_SOURCES
+        .iter()
+        .copied()
+        .filter(|name| !config.obs.sources.iter().any(|source| source.name == *name))
+}
+
 fn obs_ready(config: &Config) -> Result<()> {
-    let addr = (config.obs.host.as_str(), config.obs.port)
+    obs_tcp_connect(config, Duration::from_millis(300)).map(drop)
+}
+
+/// Connects to the first reachable resolved OBS address (dual-stack hosts may
+/// listen on only one family), bounding each attempt.
+fn obs_tcp_connect(config: &Config, timeout: Duration) -> Result<TcpStream> {
+    let mut last_error = None;
+    for addr in (config.obs.host.as_str(), config.obs.port)
         .to_socket_addrs()
         .context("failed to resolve OBS websocket address")?
-        .next()
-        .ok_or_else(|| anyhow!("OBS websocket address did not resolve"))?;
-    TcpStream::connect_timeout(&addr, Duration::from_millis(300))
-        .with_context(|| format!("OBS websocket is not reachable at {addr}"))?;
-    Ok(())
+    {
+        match TcpStream::connect_timeout(&addr, timeout) {
+            Ok(stream) => return Ok(stream),
+            Err(error) => {
+                last_error = Some(
+                    anyhow!(error).context(format!("OBS websocket is not reachable at {addr}")),
+                )
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow!("OBS websocket address did not resolve")))
 }
 
 type ObsSocket = WebSocket<MaybeTlsStream<TcpStream>>;
@@ -2118,7 +2622,13 @@ struct ObsClient {
 impl ObsClient {
     fn connect(config: &Config) -> Result<Self> {
         let url = format!("ws://{}:{}", config.obs.host, config.obs.port);
-        let (mut socket, _) = connect(&url)
+        // Bound every read and write, including the HTTP upgrade, so a stalled
+        // OBS cannot hang doctor, status, or sync.
+        let stream = obs_tcp_connect(config, OBS_IO_TIMEOUT)
+            .with_context(|| format!("failed to connect to OBS websocket at {url}"))?;
+        stream.set_read_timeout(Some(OBS_IO_TIMEOUT))?;
+        stream.set_write_timeout(Some(OBS_IO_TIMEOUT))?;
+        let (mut socket, _) = tungstenite::client(url.as_str(), MaybeTlsStream::Plain(stream))
             .with_context(|| format!("failed to connect to OBS websocket at {url}"))?;
         let hello = read_obs_message(&mut socket, 0).context("OBS did not send a Hello message")?;
         let hello_data: ObsHello = serde_json::from_value(
@@ -2201,7 +2711,15 @@ impl ObsClient {
     }
 
     fn input_names(&mut self) -> Result<Vec<String>> {
-        let response = self.request("GetInputList", json!({}))?;
+        self.input_names_filtered(json!({}))
+    }
+
+    fn input_names_of_kind(&mut self, kind: &str) -> Result<Vec<String>> {
+        self.input_names_filtered(json!({"inputKind": kind}))
+    }
+
+    fn input_names_filtered(&mut self, filter: Value) -> Result<Vec<String>> {
+        let response = self.request("GetInputList", filter)?;
         Ok(response
             .get("inputs")
             .and_then(Value::as_array)
@@ -2222,6 +2740,16 @@ impl ObsClient {
             .filter_map(|item| item.get("sourceName").and_then(Value::as_str))
             .map(ToOwned::to_owned)
             .collect())
+    }
+
+    /// The input's PulseAudio device; OBS omits `device_id` when it is the default.
+    fn input_device(&mut self, input: &str) -> Result<String> {
+        let response = self.request("GetInputSettings", json!({"inputName": input}))?;
+        Ok(response
+            .pointer("/inputSettings/device_id")
+            .and_then(Value::as_str)
+            .unwrap_or(OBS_DEFAULT_DEVICE)
+            .to_string())
     }
 
     fn create_input(&mut self, scene: &str, source: &ObsSourcePlan) -> Result<()> {
@@ -2247,6 +2775,11 @@ impl ObsClient {
                 "overlay": true,
             }),
         )?;
+        Ok(())
+    }
+
+    fn remove_input(&mut self, input: &str) -> Result<()> {
+        self.request("RemoveInput", json!({"inputName": input}))?;
         Ok(())
     }
 
@@ -2319,11 +2852,6 @@ fn sha256_base64(bytes: &[u8]) -> String {
 }
 
 fn obs_source_plan(config: &Config) -> Vec<ObsSourcePlan> {
-    let microphone = effective_microphone_name(config);
-    obs_source_plan_for_microphone(config, &microphone)
-}
-
-fn obs_source_plan_for_microphone(config: &Config, microphone: &str) -> Vec<ObsSourcePlan> {
     config
         .obs
         .sources
@@ -2332,11 +2860,7 @@ fn obs_source_plan_for_microphone(config: &Config, microphone: &str) -> Vec<ObsS
         .map(|source| ObsSourcePlan {
             name: source.name.clone(),
             input_kind: OBS_INPUT_KIND.to_string(),
-            device_id: if source.name == "GoXLR Mic" {
-                microphone.to_string()
-            } else {
-                source.device_id.clone()
-            },
+            device_id: source.device_id.clone(),
         })
         .collect()
 }
@@ -2347,10 +2871,9 @@ fn obs_input_settings(source: &ObsSourcePlan) -> Value {
 
 fn default_obs_sources() -> Vec<ObsSourceConfig> {
     [
-        ("GoXLR Mic", GOXLR_CHAT_MIC),
+        ("GoXLR Mic", OBS_DEFAULT_DEVICE),
         ("GoXLR Stream Mix", GOXLR_STREAM_MIX),
         ("GoXLR Sampler", GOXLR_SAMPLER),
-        ("GoXLR Desktop Mix", GOXLR_STREAM_MIX),
     ]
     .into_iter()
     .map(|(name, device_id)| ObsSourceConfig {
@@ -2578,9 +3101,9 @@ fn checked_pipewire_id(value: Option<&Value>, field: &str) -> Result<u32> {
 }
 
 fn goxlr_status() -> Result<Value> {
-    let output = audio_command("goxlr-client")
-        .args(["--status-json"])
-        .output()
+    let mut command = audio_command("goxlr-client");
+    command.args(["--status-json"]);
+    let output = command_output_with_timeout(command, Duration::from_secs(5))
         .context("failed to run goxlr-client --status-json")?;
     if !output.status.success() {
         bail!(
@@ -2701,9 +3224,9 @@ fn find_node(snapshot: &Snapshot, name: &str) -> Result<Node> {
 }
 
 fn current_defaults() -> Result<(String, String)> {
-    let output = audio_command("pactl")
-        .args(["--format=json", "info"])
-        .output()
+    let mut command = audio_command("pactl");
+    command.args(["--format=json", "info"]);
+    let output = command_output_with_timeout(command, Duration::from_secs(2))
         .context("failed to inspect PipeWire default audio nodes")?;
     if !output.status.success() {
         bail!(
@@ -2768,6 +3291,25 @@ fn audio_command(program: &str) -> Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn follow_wakes_only_for_routing_events() {
+        for line in [
+            "Event 'new' on source #91",
+            "Event 'remove' on sink #56",
+            "Event 'change' on card #58",
+            "Event 'change' on server #-1",
+        ] {
+            assert!(graph_event_relevant(line), "{line}");
+        }
+        for line in [
+            "Event 'change' on sink-input #142",
+            "Event 'new' on source-output #7",
+            "Event 'remove' on client #113",
+        ] {
+            assert!(!graph_event_relevant(line), "{line}");
+        }
+    }
 
     #[test]
     fn parses_pipewire_nodes() {
@@ -2928,7 +3470,7 @@ mod tests {
 
         assert_eq!(config.goxlr_serial.as_deref(), Some("S200805412CQK"));
         assert_eq!(config.output_sinks.len(), 2);
-        assert_eq!(config.obs.sources.len(), 4);
+        assert_eq!(config.obs.sources.len(), 3);
         assert_eq!(config.profile.capture_sample_rate, 48_000);
         assert_eq!(config.profile.capture_channels, 2);
     }
@@ -3043,12 +3585,49 @@ mod tests {
     fn builds_default_obs_source_plan() {
         let mut config = Config::default();
         config.obs.enable = true;
-        let plan = obs_source_plan_for_microphone(&config, GOXLR_CHAT_MIC);
-        assert_eq!(plan.len(), 4);
+        let plan = obs_source_plan(&config);
+        assert_eq!(plan.len(), 3);
         assert_eq!(plan[0].name, "GoXLR Mic");
         assert_eq!(plan[0].input_kind, OBS_INPUT_KIND);
-        assert_eq!(plan[0].device_id, GOXLR_CHAT_MIC);
-        assert_eq!(plan[3].device_id, GOXLR_STREAM_MIX);
+        assert_eq!(plan[0].device_id, OBS_DEFAULT_DEVICE);
+        assert_eq!(plan[1].device_id, GOXLR_STREAM_MIX);
+        assert!(obs_config_checks(&config, None).is_empty());
+        // During raw fallback `default` resolves to the raw mic node.
+        let raw_and_default = [
+            ("GoXLR Mic", OBS_DEFAULT_DEVICE),
+            ("Mic/Aux", GOXLR_CHAT_MIC),
+        ];
+        assert!(duplicate_device_checks(raw_and_default, None).is_empty());
+        assert_eq!(
+            duplicate_device_checks(raw_and_default, Some(GOXLR_CHAT_MIC)).len(),
+            1
+        );
+        assert_eq!(
+            retired_obs_sources(&config).collect::<Vec<_>>(),
+            ["GoXLR Desktop Mix"]
+        );
+        assert!(default_microphone_check("GoXLR Mic", Some("processed"), "processed").is_none());
+        assert!(default_microphone_check("GoXLR Mic", Some("webcam"), "processed").is_some());
+        let mix = [(
+            "GoXLR Stream Mix".to_string(),
+            config.profile.monitor_source.clone(),
+        )];
+        let desktop = [("Desktop Audio".to_string(), OBS_DEFAULT_DEVICE.to_string())];
+        let linked = ["jds".to_string()];
+        assert_eq!(
+            desktop_doubling_checks(&config, &desktop, &mix, Some("jds"), &linked).len(),
+            1
+        );
+        // A managed but unselected sink does not receive the mix.
+        assert!(desktop_doubling_checks(&config, &desktop, &mix, Some("dock"), &linked).is_empty());
+        config.obs.sources.push(ObsSourceConfig {
+            name: "GoXLR Desktop Mix".to_string(),
+            device_id: GOXLR_STREAM_MIX.to_string(),
+        });
+        assert!(
+            matches!(&obs_config_checks(&config, None)[..], [Check::Fail(message)] if message.contains("doubled"))
+        );
+        assert_eq!(retired_obs_sources(&config).count(), 0);
     }
 
     #[test]
