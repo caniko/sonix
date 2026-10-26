@@ -1220,7 +1220,14 @@ fn desktop_doubling_checks(
                 Some(resolved) if device == OBS_DEFAULT_DEVICE => resolved,
                 _ => device.as_str(),
             };
-            config.output_sinks.iter().any(|output| output == sink).then(|| {
+            // The managed outputs `follow` can route the mix to, as in `output_nodes`.
+            let managed = config
+                .output_sinks
+                .iter()
+                .map(String::as_str)
+                .chain(config.fallback_sink.as_deref())
+                .chain(config.jds_sink.as_deref());
+            managed.into_iter().any(|output| output == sink).then(|| {
                 Check::Fail(format!(
                     "OBS {name} records {sink}, which plays the Stream Mix {mix} already captures; the audio is doubled"
                 ))
@@ -3436,6 +3443,12 @@ mod tests {
         );
         assert!(desktop_doubling_checks(&config, &desktop, &mix, Some("other")).is_empty());
         config.output_sinks.clear();
+        config.jds_sink = Some("jds".to_string());
+        assert_eq!(
+            desktop_doubling_checks(&config, &desktop, &mix, Some("jds")).len(),
+            1
+        );
+        config.jds_sink = None;
         config.obs.sources.push(ObsSourceConfig {
             name: "GoXLR Desktop Mix".to_string(),
             device_id: GOXLR_STREAM_MIX.to_string(),
