@@ -1183,6 +1183,52 @@ fn duplicate_device_checks<'a>(
     checks
 }
 
+/// A `default` OBS input must land on the microphone `follow` selected
+/// (processed when healthy, raw otherwise), not whatever the system default is.
+fn default_microphone_check(
+    input: &str,
+    default_source: Option<&str>,
+    effective: &str,
+) -> Option<Check> {
+    match default_source {
+        Some(current) if current == effective => None,
+        Some(current) => Some(Check::Fail(format!(
+            "OBS source {input} follows the default source {current}, but the selected microphone is {effective}; is `goxlr-nexus follow` running?"
+        ))),
+        None => Some(Check::Fail(format!(
+            "OBS source {input} follows the default source, which cannot be read"
+        ))),
+    }
+}
+
+fn desktop_doubling_checks(
+    config: &Config,
+    desktops: &[(String, String)],
+    inputs: &[(String, String)],
+    default_sink: Option<&str>,
+) -> Vec<Check> {
+    let Some((mix, _)) = inputs
+        .iter()
+        .find(|(_, device)| *device == config.profile.monitor_source)
+    else {
+        return Vec::new();
+    };
+    desktops
+        .iter()
+        .filter_map(|(name, device)| {
+            let sink = match default_sink {
+                Some(resolved) if device == OBS_DEFAULT_DEVICE => resolved,
+                _ => device.as_str(),
+            };
+            config.output_sinks.iter().any(|output| output == sink).then(|| {
+                Check::Fail(format!(
+                    "OBS {name} records {sink}, which plays the Stream Mix {mix} already captures; the audio is doubled"
+                ))
+            })
+        })
+        .collect()
+}
+
 fn obs_config_checks(config: &Config, default_source: Option<&str>) -> Vec<Check> {
     duplicate_device_checks(
         config
@@ -1198,7 +1244,9 @@ fn obs_config_checks(config: &Config, default_source: Option<&str>) -> Vec<Check
 /// input's actual device exists in PipeWire (a missing device is an errored,
 /// silent OBS source). OBS not running is only a warning.
 fn obs_health(config: &Config, snapshot: &Snapshot) -> Vec<Check> {
-    let default_source = current_defaults().ok().map(|(_, source)| source);
+    let defaults = current_defaults().ok();
+    let default_sink = defaults.as_ref().map(|(sink, _)| sink.clone());
+    let default_source = defaults.map(|(_, source)| source);
     let mut checks = obs_config_checks(config, default_source.as_deref());
     if let Err(err) = obs_ready(config) {
         checks.push(Check::Warn(format!("OBS is not running: {err:#}")));
@@ -1221,6 +1269,7 @@ fn obs_health(config: &Config, snapshot: &Snapshot) -> Vec<Check> {
         let scene = client.target_scene()?;
         let inputs = client.input_names()?;
         let scene_items = client.scene_source_names(&scene)?;
+        let effective = effective_microphone_name(config);
         // Every live PulseAudio input counts, including ones no longer
         // configured (e.g. a Desktop Mix left by an older default).
         let mut live = Vec::new();
@@ -1228,10 +1277,34 @@ fn obs_health(config: &Config, snapshot: &Snapshot) -> Vec<Check> {
             let device = client.input_device(&name)?;
             live.push((name, device));
         }
+        // OBS's global Mic/Aux channels capture sources too. Its global
+        // Desktop Audio captures a sink; on a sink `follow` feeds from the
+        // Stream Mix it records that mix a second time.
+        let mut microphones = live.clone();
+        let mut desktops = Vec::new();
+        let specials = client.request("GetSpecialInputs", json!({}))?;
+        for (channel, name) in specials.as_object().into_iter().flatten() {
+            let Some(name) = name.as_str() else {
+                continue;
+            };
+            let device = client.input_device(name)?;
+            if channel.starts_with("desktop") {
+                desktops.push((name.to_string(), device));
+            } else {
+                microphones.push((name.to_string(), device));
+            }
+        }
         checks.extend(duplicate_device_checks(
-            live.iter()
+            microphones
+                .iter()
                 .map(|(name, device)| (name.as_str(), device.as_str())),
             default_source.as_deref(),
+        ));
+        checks.extend(desktop_doubling_checks(
+            config,
+            &desktops,
+            &live,
+            default_sink.as_deref(),
         ));
         for source in obs_source_plan(config) {
             let Some((_, device)) = live.iter().find(|(name, _)| *name == source.name) else {
@@ -1254,6 +1327,11 @@ fn obs_health(config: &Config, snapshot: &Snapshot) -> Vec<Check> {
                     "OBS source {} captures {device}, expected {}; run `goxlr-nexus obs sync`",
                     source.name, source.device_id
                 )));
+            } else if device == OBS_DEFAULT_DEVICE
+                && let Some(check) =
+                    default_microphone_check(&source.name, default_source.as_deref(), &effective)
+            {
+                checks.push(check);
             } else if device != OBS_DEFAULT_DEVICE
                 && !snapshot.nodes.iter().any(|node| node.name == device)
             {
@@ -3344,6 +3422,20 @@ mod tests {
             retired_obs_sources(&config).collect::<Vec<_>>(),
             ["GoXLR Desktop Mix"]
         );
+        assert!(default_microphone_check("GoXLR Mic", Some("processed"), "processed").is_none());
+        assert!(default_microphone_check("GoXLR Mic", Some("webcam"), "processed").is_some());
+        config.output_sinks = vec!["jds".to_string()];
+        let mix = [(
+            "GoXLR Stream Mix".to_string(),
+            config.profile.monitor_source.clone(),
+        )];
+        let desktop = [("Desktop Audio".to_string(), OBS_DEFAULT_DEVICE.to_string())];
+        assert_eq!(
+            desktop_doubling_checks(&config, &desktop, &mix, Some("jds")).len(),
+            1
+        );
+        assert!(desktop_doubling_checks(&config, &desktop, &mix, Some("other")).is_empty());
+        config.output_sinks.clear();
         config.obs.sources.push(ObsSourceConfig {
             name: "GoXLR Desktop Mix".to_string(),
             device_id: GOXLR_STREAM_MIX.to_string(),
