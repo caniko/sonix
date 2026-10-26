@@ -2317,6 +2317,7 @@ async fn telemetry_sample(config: &Config, collector: &mut TelemetryCollector) {
         ),
         None => (None, None, Value::Null),
     };
+    let fx_baseline = collector.fx_baseline();
     let changed = collector.fx_changed(fx_enabled, fx_button);
     let (processing_summary, retry_delta, dropped_delta) = match &probe.processing {
         Some(status) => {
@@ -2358,6 +2359,7 @@ async fn telemetry_sample(config: &Config, collector: &mut TelemetryCollector) {
         && let Err(error) = collector.record("sample", detail.clone())
     {
         tracing::warn!(error = %format!("{error:#}"), "goxlr telemetry write failed");
+        collector.write_failed(fx_baseline);
         return;
     }
     if changed
@@ -2365,6 +2367,7 @@ async fn telemetry_sample(config: &Config, collector: &mut TelemetryCollector) {
         && let Err(error) = collector.record("fxTransition", detail)
     {
         tracing::warn!(error = %format!("{error:#}"), "goxlr telemetry transition write failed");
+        collector.write_failed(fx_baseline);
     }
     // Defaults and topology are probed every 5th tick; keep them out of
     // `sample` so unchanged samples deduplicate, and log them on change.

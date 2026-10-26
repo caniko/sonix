@@ -132,6 +132,18 @@ impl TelemetryCollector {
         due
     }
 
+    /// FX baseline to restore when the writes for this tick fail.
+    pub(crate) fn fx_baseline(&self) -> (Option<bool>, Option<bool>) {
+        (self.last_fx, self.last_button)
+    }
+
+    /// Undo this tick's baselines after a failed write so the next tick
+    /// retries the sample and any FX transition instead of losing them.
+    pub(crate) fn write_failed(&mut self, fx_baseline: (Option<bool>, Option<bool>)) {
+        (self.last_fx, self.last_button) = fx_baseline;
+        self.last_sample = None;
+    }
+
     /// Whether the periodic defaults/PipeWire summary changed since the last
     /// `topology` event; records it when true.
     pub(crate) fn topology_changed(&mut self, topology: &Value) -> bool {
@@ -417,6 +429,12 @@ mod tests {
             collector.next_tick();
         }
         assert!(collector.sample_due(&json!({"fx": true})));
+        assert!(!collector.fx_changed(Some(true), None));
+        let baseline = collector.fx_baseline();
+        assert!(collector.fx_changed(Some(false), None));
+        collector.write_failed(baseline);
+        assert!(collector.sample_due(&json!({"fx": true})));
+        assert!(collector.fx_changed(Some(false), None));
         assert!(collector.topology_changed(&json!({"nodes": 3})));
         assert!(!collector.topology_changed(&json!({"nodes": 3})));
     }
