@@ -2096,6 +2096,7 @@ async fn follow(config: &Config, observe_only: bool) -> Result<()> {
     let mut dirty = true;
     let mut last_sync = Instant::now();
     let mut retry_at: Option<Instant> = None;
+    let mut last_processing_health = None;
 
     if !observe_only && let Err(error) = restore_raw_microphone(config) {
         tracing::warn!(error = %error, "cannot restore raw microphone before startup");
@@ -2126,6 +2127,23 @@ async fn follow(config: &Config, observe_only: bool) -> Result<()> {
                 }
             }
             _ = tick.tick() => {
+                // Processor health flips without a PipeWire event; re-route
+                // promptly so a failed DSP falls back to the raw mic.
+                if processing.is_some() {
+                    let health = tokio::task::spawn_blocking(|| {
+                        default_control_socket()
+                            .ok()
+                            .and_then(|path| ControlClient::new(path).status().ok())
+                            .map(|status| (status.healthy, status.active))
+                    })
+                    .await
+                    .ok()
+                    .flatten();
+                    if health != last_processing_health {
+                        last_processing_health = health;
+                        dirty = true;
+                    }
+                }
                 if !observe_only && let Some(task) = processing.as_mut() {
                     match task.poll() {
                         Ok(Some(result)) => {

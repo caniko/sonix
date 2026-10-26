@@ -221,7 +221,11 @@ impl ProcessingRuntime {
         let render_params = audio_params(render_format)?;
 
         let group = source.source_name();
-        let mut render_properties = input_stream_properties(source.render_target(), group);
+        // The output buffers and queues are sized for this cycle; ask PipeWire
+        // never to schedule a larger quantum while these streams are linked.
+        let max_latency = format!("{MAX_QUANTUM_FRAMES}/{}", capture_format.sample_rate_hz());
+        let mut render_properties =
+            input_stream_properties(source.render_target(), group, &max_latency);
         render_properties.insert(*pw::keys::STREAM_CAPTURE_SINK, "true");
         let render = make_input_stream(
             &core,
@@ -238,7 +242,7 @@ impl ProcessingRuntime {
             &core,
             InputStreamSpec {
                 name: "nexus-audio-capture".into(),
-                properties: input_stream_properties(source.capture_source(), group),
+                properties: input_stream_properties(source.capture_source(), group, &max_latency),
                 format: capture_format,
                 shared: Arc::clone(&shared),
                 role: StreamRole::Capture,
@@ -257,6 +261,7 @@ impl ProcessingRuntime {
                 *pw::keys::NODE_DESCRIPTION => source.source_description(),
                 "node.group" => group,
                 "node.link-group" => group,
+                "node.max-latency" => max_latency.as_str(),
             },
             capture_format,
             Arc::clone(&shared),
@@ -413,10 +418,15 @@ struct InputStreamSpec {
 
 /// Every runtime stream shares `group` so PipeWire schedules capture, render
 /// and the processed source from one driver; follower devices rate-match.
-fn input_stream_properties(target: &str, group: &str) -> pw::properties::PropertiesBox {
+fn input_stream_properties(
+    target: &str,
+    group: &str,
+    max_latency: &str,
+) -> pw::properties::PropertiesBox {
     properties! {
         "node.group" => group,
         "node.link-group" => group,
+        "node.max-latency" => max_latency,
         *pw::keys::MEDIA_TYPE => "Audio",
         *pw::keys::MEDIA_CATEGORY => "Capture",
         *pw::keys::MEDIA_ROLE => "Communication",
@@ -1152,12 +1162,13 @@ mod tests {
 
     #[test]
     fn input_streams_wait_for_their_configured_target() {
-        let properties = input_stream_properties("configured-node", "nexus-group");
+        let properties = input_stream_properties("configured-node", "nexus-group", "8192/48000");
 
         assert_eq!(properties.get("target.object"), Some("configured-node"));
         assert_eq!(properties.get("node.dont-fallback"), Some("true"));
         assert_eq!(properties.get("node.linger"), Some("true"));
         assert_eq!(properties.get("node.group"), Some("nexus-group"));
+        assert_eq!(properties.get("node.max-latency"), Some("8192/48000"));
     }
 
     #[test]
