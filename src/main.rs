@@ -1204,11 +1204,35 @@ fn default_microphone_check(
     }
 }
 
+/// Sinks the Stream Mix is linked into right now (only the selected output).
+fn stream_mix_sinks(config: &Config, snapshot: &Snapshot) -> Vec<String> {
+    let Some(mix) = snapshot
+        .nodes
+        .iter()
+        .find(|node| node.name == config.profile.monitor_source)
+    else {
+        return Vec::new();
+    };
+    snapshot
+        .links
+        .iter()
+        .filter(|link| link.output_node_id == mix.id)
+        .filter_map(|link| {
+            snapshot
+                .nodes
+                .iter()
+                .find(|node| node.id == link.input_node_id)
+        })
+        .map(|node| node.name.clone())
+        .collect()
+}
+
 fn desktop_doubling_checks(
     config: &Config,
     desktops: &[(String, String)],
     inputs: &[(String, String)],
     default_sink: Option<&str>,
+    mix_sinks: &[String],
 ) -> Vec<Check> {
     let Some((mix, _)) = inputs
         .iter()
@@ -1223,14 +1247,7 @@ fn desktop_doubling_checks(
                 Some(resolved) if device == OBS_DEFAULT_DEVICE => resolved,
                 _ => device.as_str(),
             };
-            // The managed outputs `follow` can route the mix to, as in `output_nodes`.
-            let managed = config
-                .output_sinks
-                .iter()
-                .map(String::as_str)
-                .chain(config.fallback_sink.as_deref())
-                .chain(config.jds_sink.as_deref());
-            managed.into_iter().any(|output| output == sink).then(|| {
+            mix_sinks.iter().any(|output| output == sink).then(|| {
                 Check::Fail(format!(
                     "OBS {name} records {sink}, which plays the Stream Mix {mix} already captures; the audio is doubled"
                 ))
@@ -1315,6 +1332,7 @@ fn obs_health(config: &Config, snapshot: &Snapshot) -> Vec<Check> {
             &desktops,
             &live,
             default_sink.as_deref(),
+            &stream_mix_sinks(config, snapshot),
         ));
         for source in obs_source_plan(config) {
             let Some((_, device)) = live.iter().find(|(name, _)| *name == source.name) else {
@@ -2077,6 +2095,7 @@ async fn follow(config: &Config, observe_only: bool) -> Result<()> {
     let mut last_watch_attempt = Instant::now();
     let mut dirty = true;
     let mut last_sync = Instant::now();
+    let mut retry_at: Option<Instant> = None;
 
     if !observe_only && let Err(error) = restore_raw_microphone(config) {
         tracing::warn!(error = %error, "cannot restore raw microphone before startup");
@@ -2136,7 +2155,8 @@ async fn follow(config: &Config, observe_only: bool) -> Result<()> {
                     last_watch_attempt = Instant::now();
                     events = spawn_graph_events();
                 }
-                let resync = last_sync.elapsed() >= FOLLOW_RESYNC;
+                let resync = last_sync.elapsed() >= FOLLOW_RESYNC
+                    || retry_at.is_some_and(|at| Instant::now() >= at);
                 if !(dirty || resync || events.is_none()) {
                     continue;
                 }
@@ -2144,6 +2164,7 @@ async fn follow(config: &Config, observe_only: bool) -> Result<()> {
                     goxlr_cache = None;
                 }
                 dirty = false;
+                retry_at = None;
                 last_sync = Instant::now();
 
                 let (targets_present, diagnostics, result) =
@@ -2157,7 +2178,7 @@ async fn follow(config: &Config, observe_only: bool) -> Result<()> {
                 if let Err(error) = result {
                     tracing::warn!(error = %error, "GoXLR Nexus sync failed during periodic reconciliation");
                     // Retry soon instead of waiting for the next full resync.
-                    last_sync = Instant::now() - FOLLOW_RESYNC + FOLLOW_RETRY;
+                    retry_at = Some(Instant::now() + FOLLOW_RETRY);
                 }
 
                 if !observe_only && let Some(targets_present) = targets_present {
@@ -2377,6 +2398,7 @@ async fn telemetry_sample(config: &Config, collector: &mut TelemetryCollector) {
             && let Err(error) = collector.record("topology", topology)
         {
             tracing::warn!(error = %format!("{error:#}"), "goxlr telemetry topology write failed");
+            collector.topology_write_failed();
         }
     }
 }
@@ -3586,24 +3608,18 @@ mod tests {
         );
         assert!(default_microphone_check("GoXLR Mic", Some("processed"), "processed").is_none());
         assert!(default_microphone_check("GoXLR Mic", Some("webcam"), "processed").is_some());
-        config.output_sinks = vec!["jds".to_string()];
         let mix = [(
             "GoXLR Stream Mix".to_string(),
             config.profile.monitor_source.clone(),
         )];
         let desktop = [("Desktop Audio".to_string(), OBS_DEFAULT_DEVICE.to_string())];
+        let linked = ["jds".to_string()];
         assert_eq!(
-            desktop_doubling_checks(&config, &desktop, &mix, Some("jds")).len(),
+            desktop_doubling_checks(&config, &desktop, &mix, Some("jds"), &linked).len(),
             1
         );
-        assert!(desktop_doubling_checks(&config, &desktop, &mix, Some("other")).is_empty());
-        config.output_sinks.clear();
-        config.jds_sink = Some("jds".to_string());
-        assert_eq!(
-            desktop_doubling_checks(&config, &desktop, &mix, Some("jds")).len(),
-            1
-        );
-        config.jds_sink = None;
+        // A managed but unselected sink does not receive the mix.
+        assert!(desktop_doubling_checks(&config, &desktop, &mix, Some("dock"), &linked).is_empty());
         config.obs.sources.push(ObsSourceConfig {
             name: "GoXLR Desktop Mix".to_string(),
             device_id: GOXLR_STREAM_MIX.to_string(),

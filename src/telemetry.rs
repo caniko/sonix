@@ -154,6 +154,11 @@ impl TelemetryCollector {
         changed
     }
 
+    /// Forget the topology baseline after a failed write so it is retried.
+    pub(crate) fn topology_write_failed(&mut self) {
+        self.last_topology = None;
+    }
+
     /// Counter deltas; `None` on first sample or reset (new < old).
     pub(crate) fn counter_deltas(
         &mut self,
@@ -437,6 +442,8 @@ mod tests {
         assert!(collector.fx_changed(Some(false), None));
         assert!(collector.topology_changed(&json!({"nodes": 3})));
         assert!(!collector.topology_changed(&json!({"nodes": 3})));
+        collector.topology_write_failed();
+        assert!(collector.topology_changed(&json!({"nodes": 3})));
     }
 
     #[test]
