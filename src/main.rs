@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::time::Instant;
 use tungstenite::stream::MaybeTlsStream;
-use tungstenite::{Message, WebSocket, connect};
+use tungstenite::{Message, WebSocket};
 use zeroize::Zeroizing;
 
 mod observation;
@@ -45,6 +45,9 @@ const GOXLR_STREAM_MIX: &str = "alsa_input.usb-TC-Helicon_GoXLR-00.HiFi__Line4__
 const GOXLR_SAMPLER: &str = "alsa_input.usb-TC-Helicon_GoXLR-00.HiFi__Line5__source";
 /// OBS PulseAudio device id that follows the server's default source.
 const OBS_DEFAULT_DEVICE: &str = "default";
+/// Sources earlier defaults created that `obs sync` now removes.
+const RETIRED_OBS_SOURCES: &[&str] = &["GoXLR Desktop Mix"];
+const OBS_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const OBS_INPUT_KIND: &str = "pulse_input_capture";
 const PLAN_SCHEMA: &str = "sonix.goxlr.plan/v2";
 const ADOPT_SCHEMA: &str = "sonix.goxlr.adopt/v1";
@@ -1158,26 +1161,45 @@ impl Check {
     }
 }
 
-/// Configuration-only OBS checks: two sources on one device double its audio.
-fn obs_config_checks(config: &Config) -> Vec<Check> {
+/// Two sources capturing one device double its audio. `default` is resolved
+/// to the live default source when known, so it collides with that node too.
+fn duplicate_device_checks<'a>(
+    sources: impl IntoIterator<Item = (&'a str, &'a str)>,
+    default_source: Option<&'a str>,
+) -> Vec<Check> {
     let mut seen = BTreeMap::new();
     let mut checks = Vec::new();
-    for source in &config.obs.sources {
-        if let Some(previous) = seen.insert(source.device_id.as_str(), source.name.as_str()) {
+    for (name, device) in sources {
+        let device = match default_source {
+            Some(resolved) if device == OBS_DEFAULT_DEVICE => resolved,
+            _ => device,
+        };
+        if let Some(previous) = seen.insert(device, name) {
             checks.push(Check::Fail(format!(
-                "OBS sources {previous} and {} both capture {}; the audio is doubled",
-                source.name, source.device_id
+                "OBS sources {previous} and {name} both capture {device}; the audio is doubled"
             )));
         }
     }
     checks
 }
 
+fn obs_config_checks(config: &Config, default_source: Option<&str>) -> Vec<Check> {
+    duplicate_device_checks(
+        config
+            .obs
+            .sources
+            .iter()
+            .map(|source| (source.name.as_str(), source.device_id.as_str())),
+        default_source,
+    )
+}
+
 /// Live OBS checks: websocket handshake, configured inputs, and that every
 /// input's actual device exists in PipeWire (a missing device is an errored,
 /// silent OBS source). OBS not running is only a warning.
 fn obs_health(config: &Config, snapshot: &Snapshot) -> Vec<Check> {
-    let mut checks = obs_config_checks(config);
+    let default_source = current_defaults().ok().map(|(_, source)| source);
+    let mut checks = obs_config_checks(config, default_source.as_deref());
     if let Err(err) = obs_ready(config) {
         checks.push(Check::Warn(format!("OBS is not running: {err:#}")));
         return checks;
@@ -1199,6 +1221,18 @@ fn obs_health(config: &Config, snapshot: &Snapshot) -> Vec<Check> {
         let scene = client.target_scene()?;
         let inputs = client.input_names()?;
         let scene_items = client.scene_source_names(&scene)?;
+        // Every live PulseAudio input counts, including ones no longer
+        // configured (e.g. a Desktop Mix left by an older default).
+        let mut live = Vec::new();
+        for name in client.input_names_of_kind(OBS_INPUT_KIND)? {
+            let device = client.input_device(&name)?;
+            live.push((name, device));
+        }
+        checks.extend(duplicate_device_checks(
+            live.iter()
+                .map(|(name, device)| (name.as_str(), device.as_str())),
+            default_source.as_deref(),
+        ));
         for source in obs_source_plan(config) {
             if !inputs.contains(&source.name) {
                 checks.push(Check::Fail(format!(
@@ -1923,6 +1957,7 @@ async fn follow(config: &Config, observe_only: bool) -> Result<()> {
     let mut last_targets_present = None;
     let mut last_diagnostics = Vec::new();
     let mut events = spawn_graph_events();
+    let mut last_watch_attempt = Instant::now();
     let mut dirty = true;
     let mut last_sync = Instant::now();
 
@@ -1978,15 +2013,18 @@ async fn follow(config: &Config, observe_only: bool) -> Result<()> {
                     }
                 }
 
+                // A dead watcher degrades to per-tick polling; retry it on its
+                // own clock because polling keeps resetting `last_sync`.
+                if events.is_none() && last_watch_attempt.elapsed() >= FOLLOW_RESYNC {
+                    last_watch_attempt = Instant::now();
+                    events = spawn_graph_events();
+                }
                 let resync = last_sync.elapsed() >= FOLLOW_RESYNC;
                 if !(dirty || resync || events.is_none()) {
                     continue;
                 }
                 if resync {
                     goxlr_cache = None;
-                    if events.is_none() {
-                        events = spawn_graph_events();
-                    }
                 }
                 dirty = false;
                 last_sync = Instant::now();
@@ -2241,6 +2279,9 @@ fn obs_sync(config: &Config, dry_run: bool) -> Result<()> {
         for source in sources {
             println!("  {}: {}", source.name, source.device_id);
         }
+        for name in retired_obs_sources(config) {
+            println!("  remove retired {name} if present");
+        }
         return Ok(());
     }
 
@@ -2262,7 +2303,20 @@ fn obs_sync(config: &Config, dry_run: bool) -> Result<()> {
             }
         }
     }
+    for name in retired_obs_sources(config) {
+        if existing_inputs.iter().any(|input| input == name) {
+            client.remove_input(name)?;
+            println!("removed retired OBS source {name}");
+        }
+    }
     Ok(())
+}
+
+fn retired_obs_sources(config: &Config) -> impl Iterator<Item = &'static str> + '_ {
+    RETIRED_OBS_SOURCES
+        .iter()
+        .copied()
+        .filter(|name| !config.obs.sources.iter().any(|source| source.name == *name))
 }
 
 fn obs_ready(config: &Config) -> Result<()> {
@@ -2286,7 +2340,18 @@ struct ObsClient {
 impl ObsClient {
     fn connect(config: &Config) -> Result<Self> {
         let url = format!("ws://{}:{}", config.obs.host, config.obs.port);
-        let (mut socket, _) = connect(&url)
+        let addr = (config.obs.host.as_str(), config.obs.port)
+            .to_socket_addrs()
+            .context("failed to resolve OBS websocket address")?
+            .next()
+            .ok_or_else(|| anyhow!("OBS websocket address did not resolve"))?;
+        // Bound every read and write, including the HTTP upgrade, so a stalled
+        // OBS cannot hang doctor, status, or sync.
+        let stream = TcpStream::connect_timeout(&addr, OBS_IO_TIMEOUT)
+            .with_context(|| format!("failed to connect to OBS websocket at {url}"))?;
+        stream.set_read_timeout(Some(OBS_IO_TIMEOUT))?;
+        stream.set_write_timeout(Some(OBS_IO_TIMEOUT))?;
+        let (mut socket, _) = tungstenite::client(url.as_str(), MaybeTlsStream::Plain(stream))
             .with_context(|| format!("failed to connect to OBS websocket at {url}"))?;
         let hello = read_obs_message(&mut socket, 0).context("OBS did not send a Hello message")?;
         let hello_data: ObsHello = serde_json::from_value(
@@ -2369,7 +2434,15 @@ impl ObsClient {
     }
 
     fn input_names(&mut self) -> Result<Vec<String>> {
-        let response = self.request("GetInputList", json!({}))?;
+        self.input_names_filtered(json!({}))
+    }
+
+    fn input_names_of_kind(&mut self, kind: &str) -> Result<Vec<String>> {
+        self.input_names_filtered(json!({"inputKind": kind}))
+    }
+
+    fn input_names_filtered(&mut self, filter: Value) -> Result<Vec<String>> {
+        let response = self.request("GetInputList", filter)?;
         Ok(response
             .get("inputs")
             .and_then(Value::as_array)
@@ -2425,6 +2498,11 @@ impl ObsClient {
                 "overlay": true,
             }),
         )?;
+        Ok(())
+    }
+
+    fn remove_input(&mut self, input: &str) -> Result<()> {
+        self.request("RemoveInput", json!({"inputName": input}))?;
         Ok(())
     }
 
@@ -3236,14 +3314,29 @@ mod tests {
         assert_eq!(plan[0].input_kind, OBS_INPUT_KIND);
         assert_eq!(plan[0].device_id, OBS_DEFAULT_DEVICE);
         assert_eq!(plan[1].device_id, GOXLR_STREAM_MIX);
-        assert!(obs_config_checks(&config).is_empty());
+        assert!(obs_config_checks(&config, None).is_empty());
+        // During raw fallback `default` resolves to the raw mic node.
+        let raw_and_default = [
+            ("GoXLR Mic", OBS_DEFAULT_DEVICE),
+            ("Mic/Aux", GOXLR_CHAT_MIC),
+        ];
+        assert!(duplicate_device_checks(raw_and_default, None).is_empty());
+        assert_eq!(
+            duplicate_device_checks(raw_and_default, Some(GOXLR_CHAT_MIC)).len(),
+            1
+        );
+        assert_eq!(
+            retired_obs_sources(&config).collect::<Vec<_>>(),
+            ["GoXLR Desktop Mix"]
+        );
         config.obs.sources.push(ObsSourceConfig {
             name: "GoXLR Desktop Mix".to_string(),
             device_id: GOXLR_STREAM_MIX.to_string(),
         });
         assert!(
-            matches!(&obs_config_checks(&config)[..], [Check::Fail(message)] if message.contains("doubled"))
+            matches!(&obs_config_checks(&config, None)[..], [Check::Fail(message)] if message.contains("doubled"))
         );
+        assert_eq!(retired_obs_sources(&config).count(), 0);
     }
 
     #[test]

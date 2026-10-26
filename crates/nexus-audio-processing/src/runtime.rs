@@ -23,12 +23,16 @@ use crate::control::{
 use crate::dsp::{AudioFrame, DspError, DuplexProcessor};
 use crate::state::{StateStore, Toggle, default_control_socket, default_state_path};
 
-// 16 × 10 ms frames hold a full 2048-frame quantum plus jitter headroom.
-const QUEUE_CAPACITY: usize = 16;
 /// Frames buffered beyond one output cycle before the processed source plays.
 const PRIME_FRAMES: usize = 2;
 /// PipeWire's default `default.clock.quantum-limit`, bounding one output cycle.
 const MAX_QUANTUM_FRAMES: usize = 8192;
+
+/// Ten-millisecond frames covering the largest accepted cycle plus the jitter
+/// buffer and the output trim headroom, so a maximum quantum never overflows.
+fn queue_capacity(format: crate::StreamFormat) -> usize {
+    MAX_QUANTUM_FRAMES.div_ceil(format.frame_samples().max(1)) + PRIME_FRAMES + 2
+}
 
 /// Errors returned by the PipeWire runtime.
 #[derive(Debug, Error)]
@@ -181,9 +185,9 @@ impl ProcessingRuntime {
             config: Mutex::new(effective),
             defaults,
             state_store,
-            render: ArrayQueue::new(QUEUE_CAPACITY),
-            capture: ArrayQueue::new(QUEUE_CAPACITY),
-            output: ArrayQueue::new(QUEUE_CAPACITY),
+            render: ArrayQueue::new(queue_capacity(render_format)),
+            capture: ArrayQueue::new(queue_capacity(capture_format)),
+            output: ArrayQueue::new(queue_capacity(capture_format)),
             render_free: frame_pool(render_format)?,
             capture_free: frame_pool(capture_format)?,
             output_free: frame_pool(capture_format)?,
@@ -366,8 +370,9 @@ impl ProcessingRuntime {
 }
 
 fn frame_pool(format: crate::StreamFormat) -> Result<ArrayQueue<AudioFrame>, RuntimeError> {
-    let pool = ArrayQueue::new(QUEUE_CAPACITY);
-    for _ in 0..QUEUE_CAPACITY {
+    let capacity = queue_capacity(format);
+    let pool = ArrayQueue::new(capacity);
+    for _ in 0..capacity {
         pool.push(AudioFrame::silence(format))
             .map_err(|_| RuntimeError::FramePoolFull)?;
     }
