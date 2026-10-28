@@ -380,6 +380,23 @@ in {
         server_port = cfg.obs.port;
       };
     };
+    # WirePlumber 0.5.16+ deadlocks (and hangs every PipeWire client) when a
+    # UCM SplitPCM card activates: the split loopback module is loaded
+    # synchronously while the client-context lock is held.  Let alsa-lib split.
+    # ponytail: drop once WirePlumber stops loading SplitPCM loopbacks during device activation.
+    xdg.configFile."wireplumber/wireplumber.conf.d/60-sonix-goxlr.conf".text = "monitor.alsa.rules = ${builtins.toJSON ([
+        {
+          matches = [{"device.name" = "~alsa_card.usb-TC-Helicon_GoXLR.*";}];
+          actions.update-props."api.alsa.split-enable" = false;
+        }
+      ]
+      ++ lib.optional (cfg.goxlrCard != null) {
+        matches = [{"device.name" = cfg.goxlrCard;}];
+        actions.update-props = {
+          "api.acp.auto-profile" = false;
+          "device.profile" = cfg.goxlrProfile;
+        };
+      })}";
     systemd.user.services.goxlr-nexus = {
       Unit = {
         Description = "GoXLR Nexus routing with embedded Sonix processing";
@@ -397,8 +414,8 @@ in {
         # transition (off -> HiFi) makes ACP recreate the Pulse-visible
         # named source/sink nodes that desktop selectors consume.
         ExecStartPre = lib.optionals (cfg.goxlrCard != null) [
-          "-${pkgs.pulseaudio}/bin/pactl set-card-profile ${lib.escapeShellArg cfg.goxlrCard} off"
-          "-${pkgs.pulseaudio}/bin/pactl set-card-profile ${lib.escapeShellArg cfg.goxlrCard} ${lib.escapeShellArg cfg.goxlrProfile}"
+          "-${pkgs.coreutils}/bin/timeout 5 ${pkgs.pulseaudio}/bin/pactl set-card-profile ${lib.escapeShellArg cfg.goxlrCard} off"
+          "-${pkgs.coreutils}/bin/timeout 5 ${pkgs.pulseaudio}/bin/pactl set-card-profile ${lib.escapeShellArg cfg.goxlrCard} ${lib.escapeShellArg cfg.goxlrProfile}"
         ];
         ExecStart = "${package}/bin/goxlr-nexus --config ${configFile} follow";
         ExecStopPost = "-${package}/bin/goxlr-nexus --config ${configFile} processing fail-open";

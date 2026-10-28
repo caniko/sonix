@@ -89,7 +89,9 @@ status probe for every sink/source event.
 The Home Manager module can force a real ALSA profile transition before the
 controller starts (`goxlrCard` + `goxlrProfile`); this repairs WirePlumber
 restarts that leave only hidden raw nodes while still reporting the requested
-profile.
+profile. It also writes a WirePlumber rule that disables the UCM SplitPCM
+split for that card, because WirePlumber 0.5.16+ deadlocks loading split
+loopbacks during device activation.
 
 `obs sync` uses obs-websocket v5 to create or update dedicated GoXLR audio
 sources in the active OBS scene. It does not rewrite OBS global Desktop Audio or
