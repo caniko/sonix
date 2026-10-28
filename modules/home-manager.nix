@@ -384,18 +384,19 @@ in {
     # UCM SplitPCM card activates: the split loopback module is loaded
     # synchronously while the client-context lock is held.  Let alsa-lib split.
     # ponytail: drop once WirePlumber stops loading SplitPCM loopbacks during device activation.
-    xdg.configFile."wireplumber/wireplumber.conf.d/60-sonix-goxlr.conf" = mkIf (cfg.goxlrCard != null) {
-      text = "monitor.alsa.rules = ${builtins.toJSON [
+    xdg.configFile."wireplumber/wireplumber.conf.d/60-sonix-goxlr.conf".text = "monitor.alsa.rules = ${builtins.toJSON ([
         {
-          matches = [{"device.name" = cfg.goxlrCard;}];
-          actions.update-props = {
-            "api.alsa.split-enable" = false;
-            "api.acp.auto-profile" = false;
-            "device.profile" = cfg.goxlrProfile;
-          };
+          matches = [{"device.name" = "~alsa_card.usb-TC-Helicon_GoXLR.*";}];
+          actions.update-props."api.alsa.split-enable" = false;
         }
-      ]}";
-    };
+      ]
+      ++ lib.optional (cfg.goxlrCard != null) {
+        matches = [{"device.name" = cfg.goxlrCard;}];
+        actions.update-props = {
+          "api.acp.auto-profile" = false;
+          "device.profile" = cfg.goxlrProfile;
+        };
+      })}";
     systemd.user.services.goxlr-nexus = {
       Unit = {
         Description = "GoXLR Nexus routing with embedded Sonix processing";
