@@ -49,6 +49,7 @@ const GOXLR_SAMPLER: &str = "alsa_input.usb-TC-Helicon_GoXLR-00.HiFi__Line5__sou
 const OBS_DEFAULT_DEVICE: &str = "default";
 /// Sources earlier defaults created that `obs sync` now removes.
 const RETIRED_OBS_SOURCES: &[&str] = &["GoXLR Desktop Mix"];
+const GOXLR_ALSA_CARD_PREFIX: &str = "alsa_card.usb-TC-Helicon_GoXLR";
 const OBS_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const OBS_INPUT_KIND: &str = "pulse_input_capture";
 const PLAN_SCHEMA: &str = "sonix.goxlr.plan/v2";
@@ -317,6 +318,8 @@ struct PipewireGraph {
     nodes: Vec<Node>,
     ports: Vec<Port>,
     links: Vec<Link>,
+    /// `Some(enabled)` when a GoXLR ALSA card is present.
+    goxlr_split_pcm: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -324,6 +327,7 @@ struct Snapshot {
     nodes: Vec<Node>,
     ports: Vec<Port>,
     links: Vec<Link>,
+    goxlr_split_pcm: Option<bool>,
     goxlr_status: Result<Arc<Value>, String>,
 }
 
@@ -1103,6 +1107,9 @@ fn doctor(config: &Config) -> Result<()> {
         println!("fail: {err:#}");
         failed = true;
     }
+    if let Some(check) = split_pcm_check(snapshot.goxlr_split_pcm) {
+        println!("{check}");
+    }
     if config.obs.enable {
         for check in obs_health(config, &snapshot) {
             failed |= matches!(check, Check::Fail(_));
@@ -1162,6 +1169,14 @@ impl Check {
         };
         json!({"level": level, "message": message})
     }
+}
+
+fn split_pcm_check(split_enabled: Option<bool>) -> Option<Check> {
+    Some(if split_enabled? {
+        Check::Warn("GoXLR UCM SplitPCM is enabled; WirePlumber 0.5.16+ can deadlock creating split loopbacks; enable the sonix goxlr-nexus WirePlumber rule".into())
+    } else {
+        Check::Ok("GoXLR UCM SplitPCM is disabled".into())
+    })
 }
 
 /// Two sources capturing one device double its audio. `default` is resolved
@@ -2913,6 +2928,7 @@ fn snapshot_with_goxlr_status(
         nodes: graph.nodes,
         ports: graph.ports,
         links: graph.links,
+        goxlr_split_pcm: graph.goxlr_split_pcm,
         goxlr_status: cached_status.cloned().unwrap_or_else(|| {
             goxlr_status()
                 .map(Arc::new)
@@ -3104,6 +3120,19 @@ fn parse_pw_graph_with_properties(bytes: &[u8], include_properties: bool) -> Res
                         .map(ToOwned::to_owned),
                 });
             }
+            Some("PipeWire:Interface:Device") => {
+                let Some(props) = item.pointer("/info/props").and_then(Value::as_object) else {
+                    continue;
+                };
+                if props
+                    .get("device.name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| name.starts_with(GOXLR_ALSA_CARD_PREFIX))
+                {
+                    graph.goxlr_split_pcm =
+                        Some(props.get("api.alsa.split-enable") != Some(&Value::Bool(false)));
+                }
+            }
             _ => {}
         }
     }
@@ -3269,9 +3298,9 @@ fn current_defaults() -> Result<(String, String)> {
 }
 
 fn sink_volume_percent(name: &str) -> Result<Option<u32>> {
-    let output = audio_command("pactl")
-        .args(["get-sink-volume", name])
-        .output()
+    let mut command = audio_command("pactl");
+    command.args(["get-sink-volume", name]);
+    let output = command_output_with_timeout(command, Duration::from_secs(2))
         .context("failed to inspect sink volumes")?;
     if !output.status.success() {
         bail!(
@@ -3292,12 +3321,16 @@ fn run_or_print(dry_run: bool, program: &str, args: &[&str]) -> Result<()> {
         println!("would run: {} {}", program, args.join(" "));
         return Ok(());
     }
-    let status = audio_command(program)
-        .args(args)
-        .status()
+    let mut command = audio_command(program);
+    command.args(args);
+    let output = command_output_with_timeout(command, Duration::from_secs(2))
         .with_context(|| format!("failed to run {program}"))?;
-    if !status.success() {
-        bail!("{program} {} failed with status {status}", args.join(" "));
+    if !output.status.success() {
+        bail!(
+            "{program} {} failed with status {}",
+            args.join(" "),
+            output.status
+        );
     }
     Ok(())
 }
@@ -3309,6 +3342,26 @@ fn audio_command(program: &str) -> Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_pcm_check_reads_the_goxlr_device() {
+        let dump = |props: &str| {
+            let json = format!(
+                r#"[{{"id":1,"type":"PipeWire:Interface:Device","info":{{"props":{{"device.name":"alsa_card.usb-TC-Helicon_GoXLR-00"{props}}}}}}}]"#
+            );
+            split_pcm_check(parse_pw_graph(json.as_bytes()).unwrap().goxlr_split_pcm)
+        };
+        assert!(matches!(
+            dump(r#","api.alsa.split-enable":true"#),
+            Some(Check::Warn(_))
+        ));
+        assert!(matches!(dump(""), Some(Check::Warn(_))));
+        assert!(matches!(
+            dump(r#","api.alsa.split-enable":false"#),
+            Some(Check::Ok(_))
+        ));
+        assert!(split_pcm_check(parse_pw_graph(b"[]").unwrap().goxlr_split_pcm).is_none());
+    }
 
     #[test]
     fn follow_wakes_only_for_routing_events() {
@@ -3417,6 +3470,7 @@ mod tests {
             nodes: vec![],
             ports: vec![],
             links: vec![],
+            goxlr_split_pcm: None,
             goxlr_status: Err("goxlr-client --status-json failed".to_string()),
         };
         let err = usable_goxlr_status(&Config::default(), &snapshot).unwrap_err();
@@ -3552,6 +3606,7 @@ mod tests {
                     state: Some("active".to_string()),
                 },
             ],
+            goxlr_split_pcm: None,
             goxlr_status: Ok(Arc::new(Value::Null)),
         };
         let (connect, disconnect) = monitor_link_operations(&snapshot, &required, &output).unwrap();
@@ -3587,6 +3642,7 @@ mod tests {
                 input_port_id: 21,
                 state: Some("active".to_string()),
             }],
+            goxlr_split_pcm: None,
             goxlr_status: Ok(Arc::new(Value::Null)),
         };
         let (connect, disconnect) = monitor_link_operations(&snapshot, &required, &output).unwrap();
