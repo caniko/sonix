@@ -1173,9 +1173,12 @@ impl Check {
 
 fn split_pcm_check(split_enabled: Option<bool>) -> Option<Check> {
     Some(if split_enabled? {
-        Check::Warn("GoXLR UCM SplitPCM is enabled; WirePlumber 0.5.16+ can deadlock creating split loopbacks; enable the sonix goxlr-nexus WirePlumber rule".into())
+        Check::Ok("GoXLR UCM SplitPCM is enabled".into())
     } else {
-        Check::Ok("GoXLR UCM SplitPCM is disabled".into())
+        Check::Warn(
+            "GoXLR UCM SplitPCM is disabled; the HiFi profile and its HiFi__* node names do not exist without it, so the routing sources are missing; drop any api.alsa.split-enable=false WirePlumber rule for this card"
+                .into(),
+        )
     })
 }
 
@@ -3353,12 +3356,12 @@ mod tests {
         };
         assert!(matches!(
             dump(r#","api.alsa.split-enable":true"#),
-            Some(Check::Warn(_))
+            Some(Check::Ok(_))
         ));
-        assert!(matches!(dump(""), Some(Check::Warn(_))));
+        assert!(matches!(dump(""), Some(Check::Ok(_))));
         assert!(matches!(
             dump(r#","api.alsa.split-enable":false"#),
-            Some(Check::Ok(_))
+            Some(Check::Warn(_))
         ));
         assert!(split_pcm_check(parse_pw_graph(b"[]").unwrap().goxlr_split_pcm).is_none());
     }
