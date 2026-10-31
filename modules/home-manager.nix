@@ -380,23 +380,23 @@ in {
         server_port = cfg.obs.port;
       };
     };
-    # WirePlumber 0.5.16+ deadlocks (and hangs every PipeWire client) when a
-    # UCM SplitPCM card activates: the split loopback module is loaded
-    # synchronously while the client-context lock is held.  Let alsa-lib split.
-    # ponytail: drop once WirePlumber stops loading SplitPCM loopbacks during device activation.
-    xdg.configFile."wireplumber/wireplumber.conf.d/60-sonix-goxlr.conf".text = "monitor.alsa.rules = ${builtins.toJSON ([
+    # Pin the GoXLR card profile only.  The UCM SplitPCM split has to stay
+    # enabled: it is what exposes the HiFi verb, and every node name the
+    # routing, the monitors and the OBS sources address ("HiFi__Headset__source",
+    # "HiFi__Line4__source", "HiFi__Speaker__sink", ...) comes from it.  With the
+    # split disabled the card collapses to the single-PCM "Direct" profile, so
+    # pinning "HiFi" fails and the whole GoXLR graph is missing.
+    xdg.configFile."wireplumber/wireplumber.conf.d/60-sonix-goxlr.conf" = mkIf (cfg.goxlrCard != null) {
+      text = "monitor.alsa.rules = ${builtins.toJSON [
         {
-          matches = [{"device.name" = "~alsa_card.usb-TC-Helicon_GoXLR.*";}];
-          actions.update-props."api.alsa.split-enable" = false;
+          matches = [{"device.name" = cfg.goxlrCard;}];
+          actions.update-props = {
+            "api.acp.auto-profile" = false;
+            "device.profile" = cfg.goxlrProfile;
+          };
         }
-      ]
-      ++ lib.optional (cfg.goxlrCard != null) {
-        matches = [{"device.name" = cfg.goxlrCard;}];
-        actions.update-props = {
-          "api.acp.auto-profile" = false;
-          "device.profile" = cfg.goxlrProfile;
-        };
-      })}";
+      ]}";
+    };
     systemd.user.services.goxlr-nexus = {
       Unit = {
         Description = "GoXLR Nexus routing with embedded Sonix processing";
@@ -429,7 +429,11 @@ in {
         LogRateLimitIntervalSec = 30;
         LogRateLimitBurst = 100;
       };
-      Install.WantedBy = ["default.target"];
+      # PartOf alone only stops this unit when PipeWire goes away; a crash that
+      # PipeWire recovers from with its own restart job never pulls the
+      # controller back up, and the routed sources stay missing until someone
+      # starts it by hand.  Being wanted by PipeWire restarts it every time.
+      Install.WantedBy = ["default.target" "pipewire.service"];
     };
   };
 }

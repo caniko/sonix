@@ -273,20 +273,14 @@ in {
         message = "programs.sonix.goxlr.outputSinks must not contain duplicates.";
       }
     ];
-    # WirePlumber 0.5.16+ deadlocks (and hangs every PipeWire client) when a
-    # UCM SplitPCM card activates; see modules/home-manager.nix.
-    # ponytail: drop once WirePlumber stops loading SplitPCM loopbacks during device activation.
-    services.pipewire.wireplumber.extraConfig."60-sonix-goxlr"."monitor.alsa.rules" = [
-      {
-        matches = [{"device.name" = "~alsa_card.usb-TC-Helicon_GoXLR.*";}];
-        actions.update-props."api.alsa.split-enable" = false;
-      }
-    ];
+    # The UCM SplitPCM split stays enabled on purpose; see modules/home-manager.nix.
     systemd.user.services.goxlr-nexus = {
       description = "GoXLR Nexus routing with embedded Sonix processing";
       after = ["pipewire.service" "pipewire-pulse.service" "wireplumber.service" goxlrDaemonUnit];
       wants = ["pipewire.service" "pipewire-pulse.service" "wireplumber.service" goxlrDaemonUnit];
-      wantedBy = ["default.target"];
+      # Also wanted by PipeWire so a PipeWire crash restart brings the
+      # controller back instead of leaving it stopped by PartOf.
+      wantedBy = ["default.target" "pipewire.service"];
       serviceConfig = {
         Type = "simple";
         Environment = "PATH=${servicePath}";
