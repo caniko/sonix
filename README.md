@@ -86,13 +86,24 @@ observation, and accepts `--observe-only` for a non-mutating canary. Its
 watcher keeps stable GoXLR device status in an `Arc`-backed cache, refreshing
 it for mixer/card changes and the periodic resync instead of launching a
 status probe for every sink/source event.
-The Home Manager module can force a real ALSA profile transition before the
-controller starts (`goxlrCard` + `goxlrProfile`); this repairs WirePlumber
-restarts that leave only hidden raw nodes while still reporting the requested
-profile. It also pins that profile with a WirePlumber rule, and deliberately
-leaves the UCM SplitPCM split enabled: the GoXLR only exposes its `HiFi` verb,
-and therefore every `HiFi__*` node name the routing depends on, while the
-split is on. `doctor` warns when a rule has turned the split off.
+The Home Manager module owns the card profile and the GoXLR daemon. The UCM
+SplitPCM split stays enabled: the GoXLR only exposes its `HiFi` verb, and
+therefore every `HiFi__*` node name the routing depends on, while the split is
+on. The split also makes WirePlumber 0.5.16+ build split loopbacks inside device
+activation, which deadlocks the session manager, so the WirePlumber rule pins a
+single-PCM verb (`activationProfile`, default `Direct`) and the controller
+performs the real `off` -> `goxlrProfile` transition itself once the session
+manager is up. On stop it restores the activation verb, so the profile
+persisted for the next boot cannot deadlock anything either. `doctor` warns
+when a rule has turned the split off.
+
+The daemon is a long-lived USB session, so the module supervises it as
+`goxlr-daemon.service` and shadows the package's XDG autostart entry. Without
+that, a deploy leaves the previous daemon holding the IPC socket, the new
+instance dies with "already running", `goxlr-client` hangs against the stale
+process, and `follow` idles with no device status. `follow` now also exits
+non-zero after its retry budget instead of staying `active` with nothing
+routed, so systemd shows the failure.
 
 `obs sync` uses obs-websocket v5 to create or update dedicated GoXLR audio
 sources in the active OBS scene. It does not rewrite OBS global Desktop Audio or

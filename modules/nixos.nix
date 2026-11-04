@@ -89,7 +89,7 @@
   };
   pklString = value: builtins.toJSON value;
   outputSinksPkl = lib.concatMapStringsSep "\n" (sink: "    ${pklString sink}") effectiveOutputSinks;
-  goxlrDaemonUnit = "app-goxlr\\x2ddaemon@autostart.service";
+  goxlrDaemonUnit = "goxlr-daemon.service";
   servicePath = lib.makeBinPath [
     package
     pkgs.goxlr-utility
@@ -273,11 +273,30 @@ in {
         message = "programs.sonix.goxlr.outputSinks must not contain duplicates.";
       }
     ];
+    # The daemon is a long-lived USB session: own it so it restarts on failure
+    # and after activation moves the package.  Home Manager users also mask the
+    # package's XDG autostart entry; a NixOS-only user should do the same, or a
+    # stale daemon can keep the IPC socket bound and `goxlr-client` hangs.
+    systemd.user.services.goxlr-daemon = {
+      description = "GoXLR Utility daemon";
+      wantedBy = ["default.target"];
+      serviceConfig = {
+        ExecStart = "${pkgs.goxlr-utility}/bin/goxlr-daemon";
+        Restart = "always";
+        RestartSec = 2;
+        TimeoutStopSec = 10;
+      };
+      unitConfig = {
+        StartLimitIntervalSec = 60;
+        StartLimitBurst = 10;
+      };
+    };
     # The UCM SplitPCM split stays enabled on purpose; see modules/home-manager.nix.
     systemd.user.services.goxlr-nexus = {
       description = "GoXLR Nexus routing with embedded Sonix processing";
       after = ["pipewire.service" "pipewire-pulse.service" "wireplumber.service" goxlrDaemonUnit];
-      wants = ["pipewire.service" "pipewire-pulse.service" "wireplumber.service" goxlrDaemonUnit];
+      wants = ["pipewire.service" "pipewire-pulse.service" "wireplumber.service"];
+      requires = [goxlrDaemonUnit];
       # Also wanted by PipeWire so a PipeWire crash restart brings the
       # controller back instead of leaving it stopped by PartOf.
       wantedBy = ["default.target" "pipewire.service"];

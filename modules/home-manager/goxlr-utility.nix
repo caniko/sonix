@@ -14,7 +14,7 @@
     else self.packages.${system}.default;
   dataRoot = "${config.xdg.dataHome}/goxlr-utility";
   configRoot = "${config.xdg.configHome}/goxlr-utility";
-  daemonUnit = "app-goxlr\\x2ddaemon@autostart.service";
+  daemonUnit = "goxlr-daemon.service";
   servicePath = lib.makeBinPath [package pkgs.goxlr-utility];
 
   mkFile = kind: name: source: {
