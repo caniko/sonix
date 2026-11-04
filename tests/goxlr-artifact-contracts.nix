@@ -71,6 +71,8 @@
       "the GoXLR daemon must be supervised")
     (check (lib.hasInfix "goxlr-daemon" daemon.Service.ExecStart)
       "the daemon unit must run goxlr-daemon, got ${daemon.Service.ExecStart}")
+    (check (builtins.elem "app-goxlr\\x2ddaemon@autostart.service" daemon.Unit.Conflicts)
+      "the daemon unit must conflict with the desktop-session autostart daemon so the old process releases the IPC socket")
     (check (lib.hasInfix "Hidden=true" artifacts.autostartMask)
       "the package XDG autostart entry must be shadowed so only one process holds the IPC socket")
   ];

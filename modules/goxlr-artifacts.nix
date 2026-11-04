@@ -61,6 +61,11 @@ in {
   daemon = {
     Unit = {
       Description = "GoXLR Utility daemon";
+      # The desktop-session unit generated from the package's autostart entry
+      # (and any UI launch of `goxlr-daemon --start-ui`) competes for the same
+      # IPC socket.  Removing the entry does not unload an already-running
+      # generator unit, so the two are declared mutually exclusive.
+      Conflicts = ["app-goxlr\\x2ddaemon@autostart.service"];
       StartLimitIntervalSec = 60;
       StartLimitBurst = 10;
     };
