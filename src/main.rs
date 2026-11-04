@@ -2051,6 +2051,13 @@ impl ProcessingTask {
 const FOLLOW_RESYNC: Duration = Duration::from_secs(30);
 /// Delay before retrying a failed reconciliation pass.
 const FOLLOW_RETRY: Duration = Duration::from_secs(5);
+/// Consecutive failed passes before `follow` gives up and exits non-zero.
+///
+/// Retrying forever keeps the unit `active` while nothing is routed, which is
+/// indistinguishable from a healthy router until someone runs `doctor`. A
+/// budget long enough to ride out a PipeWire restart (12 * 5 s) followed by a
+/// hard exit lets systemd surface the failure instead.
+const FOLLOW_FAILURE_BUDGET: u32 = 12;
 
 /// Whether a `pactl subscribe` line can change routing: device, default or
 /// card changes. Stream (sink-input/source-output) and client churn cannot.
@@ -2114,6 +2121,7 @@ async fn follow(config: &Config, observe_only: bool) -> Result<()> {
     let mut dirty = true;
     let mut last_sync = Instant::now();
     let mut retry_at: Option<Instant> = None;
+    let mut consecutive_failures = 0u32;
     let mut last_processing_health = None;
 
     if !observe_only && let Err(error) = restore_raw_microphone(config) {
@@ -2213,8 +2221,16 @@ async fn follow(config: &Config, observe_only: bool) -> Result<()> {
                 }
                 if let Err(error) = result {
                     tracing::warn!(error = %error, "GoXLR Nexus sync failed during periodic reconciliation");
+                    consecutive_failures += 1;
+                    if consecutive_failures >= FOLLOW_FAILURE_BUDGET && !observe_only {
+                        return Err(anyhow!(
+                            "GoXLR Nexus gave up after {consecutive_failures} consecutive failed reconciliation passes: {error:#}"
+                        ));
+                    }
                     // Retry soon instead of waiting for the next full resync.
                     retry_at = Some(Instant::now() + FOLLOW_RETRY);
+                } else {
+                    consecutive_failures = 0;
                 }
 
                 if !observe_only && let Some(targets_present) = targets_present {

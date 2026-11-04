@@ -89,7 +89,9 @@
   };
   pklString = value: builtins.toJSON value;
   outputSinksPkl = lib.concatMapStringsSep "\n" (sink: "    ${pklString sink}") effectiveOutputSinks;
-  goxlrDaemonUnit = "app-goxlr\\x2ddaemon@autostart.service";
+  artifacts = import ./goxlr-artifacts.nix {inherit lib pkgs;} {
+    inherit cfg package configFile servicePath;
+  };
   servicePath = lib.makeBinPath [
     package
     pkgs.goxlr-utility
@@ -209,7 +211,19 @@ in {
     goxlrProfile = mkOption {
       type = types.str;
       default = "HiFi";
-      description = "GoXLR ALSA card profile to activate before starting the routing controller.";
+      description = "GoXLR ALSA card profile to activate after the session manager has finished activating the card.";
+    };
+    activationProfile = mkOption {
+      type = types.str;
+      default = "Direct";
+      description = ''
+        Card profile WirePlumber selects while it activates the GoXLR. It must
+        stay a single-PCM verb: selecting a UCM SplitPCM verb (the `HiFi` verb
+        that `goxlrProfile` needs) makes WirePlumber 0.5.16+ build the split
+        loopbacks inside device activation, which deadlocks the session manager
+        and hangs every PipeWire client. `goxlrProfile` is applied by the
+        routing controller afterwards, outside that window.
+      '';
     };
     maxMonitorSinkVolume = mkOption {
       type = types.nullOr types.float;
@@ -333,6 +347,14 @@ in {
         message = "programs.sonix.goxlr.enable cannot be combined with programs.sonix.laptop.enable.";
       }
       {
+        # WirePlumber 0.5.16+ deadlocks activating a card whose profile builds
+        # UCM SplitPCM loopbacks.  The activation profile must therefore differ
+        # from the SplitPCM verb the routing controller selects afterwards, or
+        # the session manager hangs on the next device activation.
+        assertion = cfg.goxlrCard == null || cfg.activationProfile != cfg.goxlrProfile;
+        message = "programs.sonix.goxlr.activationProfile must differ from goxlrProfile: selecting ${cfg.goxlrProfile} while WirePlumber activates the card deadlocks the session manager. Leave activationProfile on a single-PCM verb and let goxlr-nexus do the transition.";
+      }
+      {
         assertion = effectiveCaptureSource != "default" && effectiveRenderTarget != "default";
         message = "programs.sonix.goxlr requires concrete externalInput captureSource and renderTarget node names.";
       }
@@ -380,60 +402,15 @@ in {
         server_port = cfg.obs.port;
       };
     };
-    # Pin the GoXLR card profile only.  The UCM SplitPCM split has to stay
-    # enabled: it is what exposes the HiFi verb, and every node name the
-    # routing, the monitors and the OBS sources address ("HiFi__Headset__source",
-    # "HiFi__Line4__source", "HiFi__Speaker__sink", ...) comes from it.  With the
-    # split disabled the card collapses to the single-PCM "Direct" profile, so
-    # pinning "HiFi" fails and the whole GoXLR graph is missing.
+    # WirePlumber must never select a UCM SplitPCM verb while it activates the
+    # card, and the GoXLR daemon must be owned rather than left to the
+    # package's XDG autostart entry; modules/goxlr-artifacts.nix holds the
+    # reasoning and the values, and CI asserts them.
     xdg.configFile."wireplumber/wireplumber.conf.d/60-sonix-goxlr.conf" = mkIf (cfg.goxlrCard != null) {
-      text = "monitor.alsa.rules = ${builtins.toJSON [
-        {
-          matches = [{"device.name" = cfg.goxlrCard;}];
-          actions.update-props = {
-            "api.acp.auto-profile" = false;
-            "device.profile" = cfg.goxlrProfile;
-          };
-        }
-      ]}";
+      text = artifacts.wireplumberRule;
     };
-    systemd.user.services.goxlr-nexus = {
-      Unit = {
-        Description = "GoXLR Nexus routing with embedded Sonix processing";
-        After = ["pipewire.service" "pipewire-pulse.service" "wireplumber.service" goxlrDaemonUnit];
-        Wants = ["pipewire.service" "pipewire-pulse.service" "wireplumber.service" goxlrDaemonUnit];
-        PartOf = ["pipewire.service" "pipewire-pulse.service" "wireplumber.service"];
-        StartLimitIntervalSec = 300;
-        StartLimitBurst = 20;
-      };
-      Service = {
-        Type = "simple";
-        Environment = "PATH=${servicePath}";
-        # WirePlumber 0.5 can report the requested profile while retaining
-        # only the hidden raw ALSA nodes after a restart.  A real profile
-        # transition (off -> HiFi) makes ACP recreate the Pulse-visible
-        # named source/sink nodes that desktop selectors consume.
-        ExecStartPre = lib.optionals (cfg.goxlrCard != null) [
-          "-${pkgs.coreutils}/bin/timeout 5 ${pkgs.pulseaudio}/bin/pactl set-card-profile ${lib.escapeShellArg cfg.goxlrCard} off"
-          "-${pkgs.coreutils}/bin/timeout 5 ${pkgs.pulseaudio}/bin/pactl set-card-profile ${lib.escapeShellArg cfg.goxlrCard} ${lib.escapeShellArg cfg.goxlrProfile}"
-        ];
-        ExecStart = "${package}/bin/goxlr-nexus --config ${configFile} follow";
-        ExecStopPost = "-${package}/bin/goxlr-nexus --config ${configFile} processing fail-open";
-        Restart = "on-failure";
-        RestartSec = 5;
-        CPUQuota = "35%";
-        MemoryHigh = "128M";
-        MemoryMax = "256M";
-        TasksMax = 64;
-        TimeoutStopSec = 10;
-        LogRateLimitIntervalSec = 30;
-        LogRateLimitBurst = 100;
-      };
-      # PartOf alone only stops this unit when PipeWire goes away; a crash that
-      # PipeWire recovers from with its own restart job never pulls the
-      # controller back up, and the routed sources stay missing until someone
-      # starts it by hand.  Being wanted by PipeWire restarts it every time.
-      Install.WantedBy = ["default.target" "pipewire.service"];
-    };
+    xdg.configFile."autostart/goxlr-daemon.desktop".text = artifacts.autostartMask;
+    systemd.user.services.goxlr-daemon = artifacts.daemon;
+    systemd.user.services.goxlr-nexus = artifacts.nexus;
   };
 }

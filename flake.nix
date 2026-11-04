@@ -120,6 +120,19 @@
         BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.glibc.dev}/include -include ${spaBindgenHeader}";
       };
       checks.default = package;
+      # Artifact contracts for the GoXLR routing units and WirePlumber rule.
+      # Evaluation-only: these assert the invariants behind the SplitPCM
+      # deadlock and the unowned-daemon outages, which need real hardware to
+      # reproduce at runtime.
+      checks.module-contracts = let
+        contracts = import ./tests/goxlr-artifact-contracts.nix {
+          lib = pkgs.lib;
+          inherit pkgs;
+        };
+      in
+        builtins.deepSeq contracts (pkgs.runCommand "sonix-module-contracts" {} ''
+          touch "$out"
+        '');
       checks.processing = craneLib.cargoTest (commonArgs
         // {
           inherit cargoArtifacts;

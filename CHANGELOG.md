@@ -2,6 +2,15 @@
 
 ## 0.1.0 - Unreleased
 
+- Own the GoXLR daemon as a supervised unit and shadow its XDG autostart entry,
+  and keep the UCM SplitPCM `HiFi` verb out of WirePlumber device activation
+  (`activationProfile` + an `ExecStopPost` restore). Both outages on atlas came
+  from those two: a stale daemon hanging `goxlr-client`, and WirePlumber
+  deadlocking while it built SplitPCM loopbacks during activation. `follow` now
+  exits non-zero after its retry budget instead of idling `active`.
+- Added CI contracts for the generated routing artifacts and for `doctor`
+  against shimmed `pw-dump`/`goxlr-client` (hanging daemon, `Direct`-only card,
+  mismatched serial).
 - Hardened follow reconciliation, OBS password handling, and runtime error
   paths against blocking work, secret retention, and panic-prone failures.
 - Added the reusable `nexus-audio-processing` crate with Sonora noise
