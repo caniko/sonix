@@ -119,6 +119,4 @@
 in
   if failures != []
   then throw "GoXLR Home Manager contracts failed:\n${report}"
-  else {
-    inherit health healthTimer daemon nexus;
-  }
+  else true

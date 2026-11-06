@@ -83,6 +83,4 @@
 in
   if failures != []
   then throw "GoXLR NixOS module contracts failed:\n${report}"
-  else {
-    inherit health healthTimer daemon nexus;
-  }
+  else true
