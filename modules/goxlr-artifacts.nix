@@ -31,8 +31,33 @@
   # prefixed with `-`.
   optionalCommand = command: "-${command}";
   failOpenCommand = optionalCommand "${package}/bin/goxlr-nexus --config ${configFile} processing fail-open";
+
+  daemonHealthCheck = ''
+    if ! grep -qi 'GoXLR' /proc/asound/cards; then
+      exit 0
+    fi
+    if timeout 5 goxlr-client --status-json >/dev/null 2>&1; then
+      exit 0
+    fi
+    # At most one forced restart per interval, so a persistent failure backs
+    # off instead of cycling the daemon and the router every tick.
+    stamp="''${XDG_RUNTIME_DIR:-/tmp}/goxlr-daemon-health.stamp"
+    now="$(date +%s)"
+    last="$(cat "$stamp" 2>/dev/null || echo 0)"
+    if [ "$((now - last))" -lt 300 ]; then
+      exit 0
+    fi
+    echo "$now" > "$stamp"
+    echo "goxlr-daemon did not answer goxlr-client; restarting it" >&2
+    systemctl --user restart goxlr-daemon.service
+  '';
+  daemonHealthScript = pkgs.writeShellApplication {
+    name = "goxlr-daemon-health";
+    runtimeInputs = [pkgs.coreutils pkgs.goxlr-utility pkgs.systemd];
+    text = daemonHealthCheck;
+  };
 in {
-  inherit activationProfile routingProfile card;
+  inherit activationProfile routingProfile card daemonHealthCheck daemonHealthScript;
 
   daemonUnit = "goxlr-daemon.service";
 
@@ -78,6 +103,30 @@ in {
     Install.WantedBy = ["default.target"];
   };
 
+  # A daemon that lost the device does not exit: it stays `active`, keeps the
+  # IPC socket bound, and `goxlr-client` hangs against it, so `Restart=` never
+  # fires and routing silently loses device status (observed after USB drops).
+  # Poll the client and restart a wedged daemon, but only while a GoXLR is
+  # actually present, so an unplugged device does not cause churn.
+  daemonHealth = {
+    service = {
+      Unit.Description = "Restart a wedged GoXLR daemon";
+      Service = {
+        Type = "oneshot";
+        ExecStart = "${daemonHealthScript}/bin/goxlr-daemon-health";
+      };
+    };
+    timer = {
+      Unit.Description = "Watch the GoXLR daemon IPC";
+      Timer = {
+        OnBootSec = "2min";
+        OnUnitActiveSec = "30s";
+        Unit = "goxlr-daemon-health.service";
+      };
+      Install.WantedBy = ["timers.target"];
+    };
+  };
+
   nexus = {
     Unit = {
       Description = "GoXLR Nexus routing with embedded Sonix processing";
@@ -121,9 +170,10 @@ in {
       LogRateLimitIntervalSec = 30;
       LogRateLimitBurst = 100;
     };
-    # PartOf only stops this unit when PipeWire goes away; a crash that
-    # PipeWire recovers from with its own restart job never pulls the
-    # controller back up.  Being wanted by PipeWire restarts it every time.
-    Install.WantedBy = ["default.target" "pipewire.service"];
+    # PartOf/Requires only stop this unit when PipeWire or the daemon goes
+    # away; their own restart jobs never pull the controller back up.  Being
+    # wanted by both restarts it every time, including after the watchdog
+    # restarts a wedged daemon.
+    Install.WantedBy = ["default.target" "pipewire.service" "goxlr-daemon.service"];
   };
 }

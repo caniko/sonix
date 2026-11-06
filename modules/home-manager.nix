@@ -411,6 +411,8 @@ in {
     };
     xdg.configFile."autostart/goxlr-daemon.desktop".text = artifacts.autostartMask;
     systemd.user.services.goxlr-daemon = artifacts.daemon;
+    systemd.user.services.goxlr-daemon-health = artifacts.daemonHealth.service;
+    systemd.user.timers.goxlr-daemon-health = artifacts.daemonHealth.timer;
     systemd.user.services.goxlr-nexus = artifacts.nexus;
   };
 }

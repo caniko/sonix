@@ -2,6 +2,10 @@
 
 ## 0.1.0 - Unreleased
 
+- Watch the GoXLR daemon IPC with a 30 s timer (`goxlr-daemon-health`) and
+  restart a daemon that lost the device without exiting, which `Restart=` cannot
+  see. The controller is now `WantedBy=` the daemon so a watchdog restart brings
+  routing back instead of stopping it.
 - Own the GoXLR daemon as a supervised unit and shadow its XDG autostart entry,
   and keep the UCM SplitPCM `HiFi` verb out of WirePlumber device activation
   (`activationProfile` + an `ExecStopPost` restore). Both outages on atlas came
