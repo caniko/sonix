@@ -77,6 +77,8 @@ enum CommandKind {
         json: bool,
     },
     Doctor,
+    /// Read-only check that the daemon can report a full GoXLR.
+    DaemonCheck,
     /// Compute a read-only reconciliation plan from the live graph.
     Plan {
         #[arg(long)]
@@ -497,6 +499,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
                     unreachable!("handled before configuration loading")
                 }
                 CommandKind::Doctor => doctor(&config)?,
+                CommandKind::DaemonCheck => daemon_check(&config)?,
                 CommandKind::Plan { json } => plan(&config, json)?,
                 CommandKind::Status { json } => status(&config, json)?,
                 CommandKind::Apply(args) => apply(&config, args.dry_run)?,
@@ -1138,6 +1141,20 @@ fn doctor_goxlr(config: &Config, snapshot: &Snapshot) -> Result<()> {
     println!(
         "ok: GoXLR serial {}",
         config.goxlr_serial.as_deref().unwrap_or("not configured")
+    );
+    Ok(())
+}
+
+/// Read-only daemon health for supervisors: no PipeWire, OBS or audio probes.
+fn daemon_check(config: &Config) -> Result<()> {
+    let status = goxlr_status()?;
+    validate_goxlr_status(config, &status)?;
+    println!(
+        "ok: GoXLR daemon reports {} as a full device",
+        config
+            .goxlr_serial
+            .as_deref()
+            .unwrap_or("the configured serial")
     );
     Ok(())
 }
@@ -2059,6 +2076,24 @@ const FOLLOW_RETRY: Duration = Duration::from_secs(5);
 /// hard exit lets systemd surface the failure instead.
 const FOLLOW_FAILURE_BUDGET: u32 = 12;
 
+/// Consecutive follow passes that failed, reset by any successful pass.
+#[derive(Debug, Default)]
+struct FollowFailureBudget {
+    consecutive: u32,
+}
+
+impl FollowFailureBudget {
+    /// Record a failed pass; true when `follow` must give up.
+    fn record_failure(&mut self, observe_only: bool) -> bool {
+        self.consecutive = self.consecutive.saturating_add(1);
+        !observe_only && self.consecutive >= FOLLOW_FAILURE_BUDGET
+    }
+
+    fn record_success(&mut self) {
+        self.consecutive = 0;
+    }
+}
+
 /// Whether a `pactl subscribe` line can change routing: device, default or
 /// card changes. Stream (sink-input/source-output) and client churn cannot.
 fn graph_event_relevant(line: &str) -> bool {
@@ -2121,7 +2156,7 @@ async fn follow(config: &Config, observe_only: bool) -> Result<()> {
     let mut dirty = true;
     let mut last_sync = Instant::now();
     let mut retry_at: Option<Instant> = None;
-    let mut consecutive_failures = 0u32;
+    let mut failures = FollowFailureBudget::default();
     let mut last_processing_health = None;
 
     if !observe_only && let Err(error) = restore_raw_microphone(config) {
@@ -2221,16 +2256,16 @@ async fn follow(config: &Config, observe_only: bool) -> Result<()> {
                 }
                 if let Err(error) = result {
                     tracing::warn!(error = %error, "GoXLR Nexus sync failed during periodic reconciliation");
-                    consecutive_failures += 1;
-                    if consecutive_failures >= FOLLOW_FAILURE_BUDGET && !observe_only {
+                    if failures.record_failure(observe_only) {
                         return Err(anyhow!(
-                            "GoXLR Nexus gave up after {consecutive_failures} consecutive failed reconciliation passes: {error:#}"
+                            "GoXLR Nexus gave up after {} consecutive failed reconciliation passes: {error:#}",
+                            failures.consecutive
                         ));
                     }
                     // Retry soon instead of waiting for the next full resync.
                     retry_at = Some(Instant::now() + FOLLOW_RETRY);
                 } else {
-                    consecutive_failures = 0;
+                    failures.record_success();
                 }
 
                 if !observe_only && let Some(targets_present) = targets_present {
@@ -2339,9 +2374,14 @@ fn reconcile_for_follow(
         ));
     }
     let snapshot = snapshot_with_goxlr_status(goxlr_cache.as_ref().map(|(_, status)| status))?;
-    let has_node = |name: &str| snapshot.nodes.iter().any(|node| node.name == name);
-    *targets_present =
-        Some(has_node(&config.profile.default_source) && has_node(&config.profile.default_sink));
+    let configured_endpoints_present = follow_targets_present(config, &snapshot);
+    *targets_present = Some(configured_endpoints_present);
+    let daemon_failure = follow_daemon_failure(
+        config,
+        &snapshot,
+        configured_endpoints_present,
+        observe_only,
+    );
     let (current_sink, current_source) = current_defaults()?;
     let (operations, status, diagnostics) =
         reconcile_operations(config, &snapshot, &current_sink, &current_source)?;
@@ -2368,7 +2408,48 @@ fn reconcile_for_follow(
         }
         return Ok(());
     }
-    execute_audio_operations(&operations, false)
+    execute_audio_operations(&operations, false)?;
+    match daemon_failure {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+/// Whether the configured default source and sink are both present.
+fn follow_targets_present(config: &Config, snapshot: &Snapshot) -> bool {
+    let has_node = |name: &str| snapshot.nodes.iter().any(|node| node.name == name);
+    has_node(&config.profile.default_source) && has_node(&config.profile.default_sink)
+}
+
+/// A wedged daemon is only a fallback while the GoXLR endpoints are absent.
+///
+/// `reconcile_operations` deliberately succeeds with a fallback so `apply`
+/// and `plan` fail open. In `follow` that same fallback with the endpoints
+/// still present would hide the wedged daemon until an operator runs
+/// `doctor`, so it must count toward the failure budget instead.
+fn follow_daemon_failure(
+    config: &Config,
+    snapshot: &Snapshot,
+    targets_present: bool,
+    observe_only: bool,
+) -> Option<anyhow::Error> {
+    if observe_only || !targets_present {
+        return None;
+    }
+    // Without a configured serial there is nothing to validate. Treat it as a
+    // deliberate raw fallback, matching the watchdog's no-op for a null serial.
+    if config
+        .goxlr_serial
+        .as_deref()
+        .is_none_or(|serial| serial.trim().is_empty())
+    {
+        return None;
+    }
+    usable_goxlr_status(config, snapshot).err().map(|error| {
+        error.context(
+            "configured GoXLR endpoints are present but the GoXLR daemon status is unusable",
+        )
+    })
 }
 
 async fn telemetry_sample(config: &Config, collector: &mut TelemetryCollector) {
@@ -3494,6 +3575,389 @@ mod tests {
         };
         let err = usable_goxlr_status(&Config::default(), &snapshot).unwrap_err();
         assert!(err.to_string().contains("goxlr-client"));
+    }
+
+    const FOLLOW_SERIAL: &str = "S200805412CQK";
+    const FOLLOW_FALLBACK: &str = "alsa_output.example_jds";
+
+    fn follow_config() -> Config {
+        Config {
+            fallback_sink: Some(FOLLOW_FALLBACK.to_string()),
+            output_sinks: vec![FOLLOW_FALLBACK.to_string()],
+            goxlr_serial: Some(FOLLOW_SERIAL.to_string()),
+            ..Config::default()
+        }
+    }
+
+    fn full_mixer_status() -> Value {
+        serde_json::json!({
+            "mixers": {
+                FOLLOW_SERIAL: {"hardware": {"device_type": "Full"}}
+            }
+        })
+    }
+
+    fn follow_snapshot(
+        goxlr_status: Result<Value, String>,
+        with_goxlr_endpoints: bool,
+    ) -> Snapshot {
+        let mut nodes = vec![test_node_with_id(1, FOLLOW_FALLBACK, "Audio/Sink")];
+        if with_goxlr_endpoints {
+            nodes.push(test_node_with_id(2, GOXLR_SYSTEM, "Audio/Sink"));
+            nodes.push(test_node_with_id(3, GOXLR_CHAT_MIC, "Audio/Source"));
+        }
+        Snapshot {
+            nodes,
+            ports: Vec::new(),
+            links: Vec::new(),
+            goxlr_split_pcm: None,
+            goxlr_status: goxlr_status.map(Arc::new),
+        }
+    }
+
+    #[test]
+    fn follow_counts_a_wedged_daemon_while_the_goxlr_endpoints_are_present() {
+        let config = follow_config();
+        let snapshot = follow_snapshot(
+            Err("goxlr-client --status-json failed: command timed out after 5s".to_string()),
+            true,
+        );
+        // `reconcile_operations` intentionally fails open for apply/plan.
+        let (operations, status, diagnostics) =
+            reconcile_operations(&config, &snapshot, GOXLR_SYSTEM, GOXLR_SYSTEM).unwrap();
+        assert_eq!(status, "fallback");
+        assert_eq!(
+            operations,
+            vec![AudioOperation::SetDefaultSink(FOLLOW_FALLBACK.to_string())]
+        );
+        assert!(
+            diagnostics[0].contains("GoXLR profile unavailable"),
+            "fallback must stay visible: {diagnostics:?}"
+        );
+
+        // Follow must also count it as a failure, or the budget never trips.
+        let error = follow_daemon_failure(
+            &config,
+            &snapshot,
+            follow_targets_present(&config, &snapshot),
+            false,
+        )
+        .expect("a wedged daemon with live endpoints is a follow failure");
+        assert!(
+            format!("{error:#}").contains("configured GoXLR endpoints"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn follow_keeps_the_unplugged_device_fallback_failure_free() {
+        let config = follow_config();
+        let snapshot = follow_snapshot(Err("goxlr-client --status-json failed".to_string()), false);
+        assert!(!follow_targets_present(&config, &snapshot));
+        // The raw fallback still routes to the configured desktop sink.
+        let (operations, status, _) =
+            reconcile_operations(&config, &snapshot, GOXLR_SYSTEM, GOXLR_SYSTEM).unwrap();
+        assert_eq!(status, "fallback");
+        assert_eq!(
+            operations,
+            vec![AudioOperation::SetDefaultSink(FOLLOW_FALLBACK.to_string())]
+        );
+        assert!(
+            follow_daemon_failure(&config, &snapshot, false, false).is_none(),
+            "an absent device is a deliberate fallback, not a daemon failure"
+        );
+    }
+
+    #[test]
+    fn follow_daemon_failures_never_trip_the_budget_in_observe_only() {
+        let config = follow_config();
+        let snapshot = follow_snapshot(Err("goxlr-client --status-json hung".to_string()), true);
+        let targets_present = follow_targets_present(&config, &snapshot);
+        assert!(
+            follow_daemon_failure(&config, &snapshot, targets_present, true).is_none(),
+            "observe-only must keep reporting drift without failing"
+        );
+        let mut budget = FollowFailureBudget::default();
+        for _ in 0..FOLLOW_FAILURE_BUDGET * 2 {
+            assert!(!budget.record_failure(true));
+        }
+    }
+
+    #[test]
+    fn follow_failure_budget_exhausts_after_consecutive_wedged_passes() {
+        let config = follow_config();
+        let snapshot = follow_snapshot(Err("goxlr-client --status-json hung".to_string()), true);
+        let targets_present = follow_targets_present(&config, &snapshot);
+        let mut budget = FollowFailureBudget::default();
+        for pass in 1..=FOLLOW_FAILURE_BUDGET {
+            let (_, status, _) =
+                reconcile_operations(&config, &snapshot, GOXLR_SYSTEM, GOXLR_SYSTEM).unwrap();
+            assert_eq!(status, "fallback", "pass {pass}");
+            assert!(follow_daemon_failure(&config, &snapshot, targets_present, false).is_some());
+            assert_eq!(
+                budget.record_failure(false),
+                pass == FOLLOW_FAILURE_BUDGET,
+                "pass {pass}"
+            );
+        }
+    }
+
+    #[test]
+    fn follow_failure_budget_resets_after_a_recovered_daemon() {
+        let config = follow_config();
+        let wedged = follow_snapshot(Err("goxlr-client --status-json hung".to_string()), true);
+        let healthy = follow_snapshot(Ok(full_mixer_status()), true);
+        let targets_present = follow_targets_present(&config, &healthy);
+        assert!(follow_daemon_failure(&config, &healthy, targets_present, false).is_none());
+
+        let mut budget = FollowFailureBudget::default();
+        for _ in 0..FOLLOW_FAILURE_BUDGET - 1 {
+            assert!(follow_daemon_failure(&config, &wedged, targets_present, false).is_some());
+            assert!(!budget.record_failure(false));
+        }
+        budget.record_success();
+        for _ in 0..FOLLOW_FAILURE_BUDGET - 1 {
+            assert!(!budget.record_failure(false));
+        }
+        assert!(
+            budget.record_failure(false),
+            "a recovered pass must restore the full budget"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconcile_for_follow_counts_the_daemon_failure_after_running_fallback() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "sonix-follow-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("bin")).expect("create shim dir");
+        fs::create_dir_all(root.join("runtime")).expect("create runtime dir");
+        fs::create_dir_all(root.join("state")).expect("create state dir");
+        fs::create_dir_all(root.join("home")).expect("create home dir");
+
+        let shim = |name: &str, body: String| {
+            let path = root.join("bin").join(name);
+            fs::write(&path, format!("#!/bin/sh\n{body}")).expect("write shim");
+            let mut permissions = fs::metadata(&path).expect("shim metadata").permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&path, permissions).expect("chmod shim");
+        };
+
+        shim(
+            "pw-dump",
+            format!("cat '{}'\n", root.join("pw-dump.json").display()),
+        );
+        shim(
+            "goxlr-client",
+            format!("cat '{}'\n", root.join("goxlr-status.json").display()),
+        );
+        shim(
+            "pactl",
+            format!(
+                r#"if [ "$1" = "--format=json" ] && [ "$2" = "info" ]; then
+  cat '{}'
+  exit 0
+fi
+printf '%s\n' "$*" >> '{}'
+exit 0
+"#,
+                root.join("pactl.json").display(),
+                root.join("audio.log").display(),
+            ),
+        );
+        shim(
+            "pw-link",
+            format!(
+                "printf '%s\\n' \"$*\" >> '{}'\nexit 0\n",
+                root.join("audio.log").display()
+            ),
+        );
+
+        let path = match std::env::var_os("PATH") {
+            Some(existing) => std::env::join_paths(
+                std::iter::once(root.join("bin")).chain(std::env::split_paths(&existing)),
+            )
+            .expect("join PATH"),
+            None => root.join("bin").into_os_string(),
+        };
+        let mut command = Command::new(std::env::current_exe().expect("current test executable"));
+        command
+            .args([
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "tests::reconcile_for_follow_contract_subprocess",
+            ])
+            .env("PATH", path)
+            .env("SONIX_TEST_ROOT", &root)
+            .env("HOME", root.join("home"))
+            .env("XDG_CONFIG_HOME", root.join("home"))
+            .env("XDG_STATE_HOME", root.join("state"))
+            .env("XDG_RUNTIME_DIR", root.join("runtime"));
+        let output = command_output_with_timeout(command, Duration::from_secs(10))
+            .expect("run reconcile_for_follow subprocess");
+        let completed = root.join("completed").exists();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            output.status.success() && completed,
+            "reconcile_for_follow subprocess must run and pass: {text}"
+        );
+    }
+
+    /// Runs in a child test binary so the shimmed PATH and XDG directories
+    /// stay scoped to that process.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "driven by reconcile_for_follow_counts_the_daemon_failure_after_running_fallback"]
+    fn reconcile_for_follow_contract_subprocess() {
+        let Some(root) = std::env::var_os("SONIX_TEST_ROOT") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let config = Config {
+            fallback_sink: Some(FOLLOW_FALLBACK.to_string()),
+            output_sinks: vec![FOLLOW_FALLBACK.to_string()],
+            goxlr_serial: Some(FOLLOW_SERIAL.to_string()),
+            ..Config::default()
+        };
+        let no_serial_config = Config {
+            goxlr_serial: None,
+            ..config.clone()
+        };
+        let log_path = root.join("audio.log");
+        let status_path = root.join("goxlr-status.json");
+        let node = |id: u64, name: &str, media_class: &str| {
+            serde_json::json!({
+                "id": id,
+                "type": "PipeWire:Interface:Node",
+                "info": {
+                    "state": "idle",
+                    "props": {"node.name": name, "media.class": media_class},
+                },
+            })
+        };
+        let present = serde_json::json!([
+            node(1, FOLLOW_FALLBACK, "Audio/Sink"),
+            node(2, GOXLR_SYSTEM, "Audio/Sink"),
+            node(3, GOXLR_CHAT_MIC, "Audio/Source"),
+        ]);
+        let unplugged = serde_json::json!([node(1, FOLLOW_FALLBACK, "Audio/Sink")]);
+
+        fs::write(
+            root.join("pactl.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "default_sink_name": GOXLR_SYSTEM,
+                "default_source_name": GOXLR_CHAT_MIC,
+            }))
+            .expect("serialize pactl info"),
+        )
+        .expect("write pactl info");
+        fs::write(&status_path, "not json").expect("write malformed status");
+
+        // Endpoints present: fall back first, then report the daemon failure.
+        fs::write(
+            root.join("pw-dump.json"),
+            serde_json::to_vec(&present).expect("serialize graph"),
+        )
+        .expect("write graph");
+        fs::write(&log_path, "").expect("clear audio log");
+        let mut cache = None;
+        let mut targets = None;
+        let mut diagnostics = Vec::new();
+        let result =
+            reconcile_for_follow(&config, false, &mut cache, &mut targets, &mut diagnostics);
+        let error = match result {
+            Ok(()) => panic!("a wedged daemon with live endpoints must fail the pass"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(error.contains("configured GoXLR endpoints"), "{error}");
+        assert_eq!(targets, Some(true));
+        assert!(!diagnostics.is_empty(), "fallback diagnostics must survive");
+        let log = fs::read_to_string(&log_path).expect("read audio log");
+        assert!(log.contains("set-default-sink"), "{log}");
+        assert!(log.contains(FOLLOW_FALLBACK), "{log}");
+
+        // Unplugged: the raw fallback is deliberate and the pass succeeds.
+        fs::write(
+            root.join("pw-dump.json"),
+            serde_json::to_vec(&unplugged).expect("serialize graph"),
+        )
+        .expect("write graph");
+        fs::write(&log_path, "").expect("clear audio log");
+        let mut cache = None;
+        let mut targets = None;
+        let mut diagnostics = Vec::new();
+        let result =
+            reconcile_for_follow(&config, false, &mut cache, &mut targets, &mut diagnostics);
+        assert!(
+            result.is_ok(),
+            "an unplugged device must fall back successfully: {result:?}"
+        );
+        assert_eq!(targets, Some(false));
+        let log = fs::read_to_string(&log_path).expect("read audio log");
+        assert!(log.contains("set-default-sink"), "{log}");
+
+        // No serial configured: deliberate raw fallback, not a daemon failure.
+        fs::write(
+            root.join("pw-dump.json"),
+            serde_json::to_vec(&present).expect("serialize graph"),
+        )
+        .expect("write graph");
+        fs::write(&log_path, "").expect("clear audio log");
+        let mut cache = None;
+        let mut targets = None;
+        let mut diagnostics = Vec::new();
+        let result = reconcile_for_follow(
+            &no_serial_config,
+            false,
+            &mut cache,
+            &mut targets,
+            &mut diagnostics,
+        );
+        assert!(
+            result.is_ok(),
+            "a deliberately unconfigured serial must fall back successfully: {result:?}"
+        );
+        assert_eq!(targets, Some(true));
+        let log = fs::read_to_string(&log_path).expect("read audio log");
+        assert!(log.contains("set-default-sink"), "{log}");
+
+        // Observe-only: report the drift, never execute the fallback.
+        fs::write(
+            root.join("pw-dump.json"),
+            serde_json::to_vec(&present).expect("serialize graph"),
+        )
+        .expect("write graph");
+        fs::write(&log_path, "").expect("clear audio log");
+        let mut cache = None;
+        let mut targets = None;
+        let mut diagnostics = Vec::new();
+        let result =
+            reconcile_for_follow(&config, true, &mut cache, &mut targets, &mut diagnostics);
+        assert!(result.is_ok(), "observe-only must not fail: {result:?}");
+        assert_eq!(targets, Some(true));
+        assert!(
+            fs::read_to_string(&log_path)
+                .expect("read audio log")
+                .is_empty(),
+            "observe-only must not mutate audio"
+        );
+
+        fs::write(root.join("completed"), "ok").expect("write completion marker");
     }
 
     #[test]

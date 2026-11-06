@@ -2,7 +2,7 @@
 
 <!-- simit:badges:start -->
 
-![CI](https://img.shields.io/badge/CI-managed-2088ff) [![crates.io](https://img.shields.io/badge/crates.io-ready-f46623)](https://crates.io/crates/nexus-audio-processing)
+![CI](https://img.shields.io/badge/CI-managed-2088ff) [![crates.io](https://img.shields.io/badge/crates.io-publishable-f46623)](https://crates.io/crates/nexus-audio-processing) ![artifacts](https://img.shields.io/badge/artifacts-configured-2ea44f)
 
 <!-- simit:badges:end -->
 
@@ -102,14 +102,24 @@ The daemon is a long-lived USB session, so the module supervises it as
 that, a deploy leaves the previous daemon holding the IPC socket, the new
 instance dies with "already running", `goxlr-client` hangs against the stale
 process, and `follow` idles with no device status. `follow` now also exits
-non-zero after its retry budget instead of staying `active` with nothing
-routed, so systemd shows the failure.
+non-zero after its retry budget when the GoXLR endpoints are present but the
+daemon remains unhealthy. An unplugged device still uses the normal fallback;
+observe-only mode does not restart routing.
 
 A daemon that loses the device does not exit: it stays `active`, keeps the IPC
 socket and hangs `goxlr-client`, so `Restart=` never fires. A 30 s health timer
-probes the client while a GoXLR is present and restarts a wedged daemon, at most
-once per five minutes. The controller is `WantedBy=` that daemon unit, so it
-comes back with it.
+probes the configured device while a GoXLR is present and restarts a wedged
+daemon, at most once per five minutes. `daemon-check` validates the configured
+serial and device type, not just whether the client exits successfully. The
+probe is hard-bounded, including clients that ignore SIGTERM. The controller
+is `WantedBy=` that daemon unit, so it comes back with it.
+
+GoXLR regression coverage lives in `cargo test -p sonix` and `nix flake check`:
+the daemon-check status cases, follow failure accounting, actual module
+evaluation and the packaged watchdog run without audio hardware. The separate
+`goxlr-systemd-vm` package runs the service-recovery scenarios under real systemd
+in a KVM-enabled CI job. Its GoXLR is mocked; it does not certify USB hardware
+stability or Chromium microphone permissions.
 
 `obs sync` uses obs-websocket v5 to create or update dedicated GoXLR audio
 sources in the active OBS scene. It does not rewrite OBS global Desktop Audio or

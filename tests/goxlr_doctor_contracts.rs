@@ -44,6 +44,8 @@ impl Fixture {
         ));
         fs::create_dir_all(dir.join("bin")).expect("create shim dir");
         fs::create_dir_all(dir.join("config")).expect("create config dir");
+        fs::create_dir_all(dir.join("runtime")).expect("create runtime dir");
+        fs::create_dir_all(dir.join("state")).expect("create state dir");
 
         write_shim(
             &dir.join("bin/pw-dump"),
@@ -56,7 +58,7 @@ impl Fixture {
         Self { dir, config }
     }
 
-    fn doctor(&self) -> std::process::Output {
+    fn run(&self, subcommand: &str) -> std::process::Output {
         // Shim directory first, real PATH after it: the tools under test are
         // replaced, but the shims themselves still need basic utilities.
         let path = match std::env::var_os("PATH") {
@@ -69,12 +71,24 @@ impl Fixture {
         Command::new(env!("CARGO_BIN_EXE_goxlr-nexus"))
             .arg("--config")
             .arg(&self.config)
-            .arg("doctor")
+            .arg(subcommand)
             .env("PATH", path)
             .env("HOME", self.dir.join("config"))
             .env("XDG_CONFIG_HOME", self.dir.join("config"))
+            // Never inherit the live session's socket directory: these shims
+            // must not be able to reach a real processor.
+            .env("XDG_RUNTIME_DIR", self.dir.join("runtime"))
+            .env("XDG_STATE_HOME", self.dir.join("state"))
             .output()
-            .expect("run goxlr-nexus doctor")
+            .unwrap_or_else(|error| panic!("run goxlr-nexus {subcommand}: {error}"))
+    }
+
+    fn doctor(&self) -> std::process::Output {
+        self.run("doctor")
+    }
+
+    fn daemon_check(&self) -> std::process::Output {
+        self.run("daemon-check")
     }
 }
 
@@ -265,5 +279,129 @@ fn doctor_fails_when_the_configured_serial_is_absent() {
     assert!(
         text.contains(SERIAL),
         "the failure must name the serial: {text}"
+    );
+}
+
+fn status_for(device_type: &str) -> String {
+    format!(
+        "cat <<'JSON'\n{}\nJSON\n",
+        json!({"mixers": {SERIAL: {"hardware": {"device_type": device_type}}}, "config": {}, "files": {}})
+    )
+}
+
+#[test]
+fn daemon_check_succeeds_for_a_full_device_on_the_configured_serial() {
+    let fixture = Fixture::new("daemon-check-ok", hifi_graph(), &status_for("Full"));
+    let output = fixture.daemon_check();
+    let text = output_text(&output);
+
+    assert!(output.status.success(), "healthy daemon must pass: {text}");
+    assert!(
+        text.contains(SERIAL),
+        "the check must report the configured serial: {text}"
+    );
+}
+
+#[test]
+fn daemon_check_does_not_probe_pipewire_or_touch_audio() {
+    let fixture = Fixture::new("daemon-check-read-only", hifi_graph(), &status_for("Full"));
+    // Any PipeWire probe would fail here; the check must only read the daemon.
+    write_shim(&fixture.dir.join("bin/pw-dump"), "exit 1\n");
+    let output = fixture.daemon_check();
+    let text = output_text(&output);
+
+    assert!(
+        output.status.success(),
+        "daemon-check must not depend on PipeWire: {text}"
+    );
+}
+
+#[test]
+fn daemon_check_fails_when_the_daemon_returns_malformed_json() {
+    let fixture = Fixture::new(
+        "daemon-check-malformed",
+        hifi_graph(),
+        "printf 'not json'\n",
+    );
+    let output = fixture.daemon_check();
+    let text = output_text(&output);
+
+    assert!(!output.status.success(), "malformed JSON must fail: {text}");
+    assert!(
+        text.contains("JSON"),
+        "the failure must name the unparseable status: {text}"
+    );
+}
+
+#[test]
+fn daemon_check_fails_when_no_mixer_is_reported() {
+    let empty = json!({"mixers": {}, "config": {}, "files": {}});
+    let fixture = Fixture::new(
+        "daemon-check-empty",
+        hifi_graph(),
+        &format!("cat <<'JSON'\n{empty}\nJSON\n"),
+    );
+    let output = fixture.daemon_check();
+    let text = output_text(&output);
+
+    assert!(
+        !output.status.success(),
+        "an empty mixer list must fail: {text}"
+    );
+    assert!(
+        text.contains(SERIAL),
+        "the failure must name the serial: {text}"
+    );
+}
+
+#[test]
+fn daemon_check_fails_when_the_configured_serial_is_wrong() {
+    let other_serial = json!({"mixers": {"OTHER": {"hardware": {"device_type": "Full"}}}});
+    let fixture = Fixture::new(
+        "daemon-check-wrong-serial",
+        hifi_graph(),
+        &format!("cat <<'JSON'\n{other_serial}\nJSON\n"),
+    );
+    let output = fixture.daemon_check();
+    let text = output_text(&output);
+
+    assert!(
+        !output.status.success(),
+        "a mismatched serial must fail: {text}"
+    );
+    assert!(
+        text.contains(SERIAL),
+        "the failure must name the serial: {text}"
+    );
+}
+
+#[test]
+fn daemon_check_fails_when_the_configured_device_is_not_full() {
+    let fixture = Fixture::new("daemon-check-lite", hifi_graph(), &status_for("Lite"));
+    let output = fixture.daemon_check();
+    let text = output_text(&output);
+
+    assert!(!output.status.success(), "a Lite device must fail: {text}");
+    assert!(
+        text.contains("device_type"),
+        "the failure must name the device type: {text}"
+    );
+}
+
+#[test]
+fn daemon_check_fails_when_the_daemon_does_not_answer() {
+    // A stale daemon holds the IPC socket and never replies. `goxlr-client` is
+    // bounded by a 5 s timeout, so this hangs long past it.
+    let fixture = Fixture::new("daemon-check-hung", hifi_graph(), "exec sleep 6\n");
+    let output = fixture.daemon_check();
+    let text = output_text(&output);
+
+    assert!(
+        !output.status.success(),
+        "a hanging goxlr-client must fail the check: {text}"
+    );
+    assert!(
+        text.contains("timed out") && text.contains("goxlr-client"),
+        "the failure must name the timeout and the client: {text}"
     );
 }
