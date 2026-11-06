@@ -213,11 +213,11 @@ in
       # is one level below /run/user/1000/goxlr-daemon-health.
       machine.succeed("echo ' 0 [PCH              ]: HDA-Intel - HDA Intel PCH' > ${stateDir}/cards")
       machine.succeed("rm -f /run/user/1000/goxlr-daemon-health/goxlr-daemon-health.stamp")
-       before_timer = count("${stateDir}/daemon.log", "started")
-       before_probes = count("${stateDir}/card-probes.log", "probed")
+      before_timer = count("${stateDir}/daemon.log", "started")
+      before_probes = count("${stateDir}/card-probes.log", "probed")
       machine.succeed(user_systemctl("start", "goxlr-daemon-health.timer"))
       machine.wait_until_succeeds(user_systemctl("is-active", "goxlr-daemon-health.timer"))
-       wait_count("${stateDir}/card-probes.log", "probed", before_probes + 1)
+      wait_count("${stateDir}/card-probes.log", "probed", before_probes + 1)
       assert count("${stateDir}/daemon.log", "started") == before_timer, "timer restarted the daemon without a GoXLR card"
 
       machine.succeed("echo ' 0 [GoXLR          ]: USB-Audio - GoXLR' > ${stateDir}/cards")
