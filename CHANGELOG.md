@@ -2,6 +2,11 @@
 
 ## 0.1.0 - Unreleased
 
+- Harden GoXLR recovery against successful-but-unusable daemon replies,
+  missing runtime tools and probes that ignore SIGTERM. Count unhealthy
+  daemon reconciliations toward the follow failure budget without treating
+  an unplugged device as a failure. Correct the NixOS watchdog unit format
+  and daemon-to-router restart wiring.
 - Watch the GoXLR daemon IPC with a 30 s timer (`goxlr-daemon-health`) and
   restart a daemon that lost the device without exiting, which `Restart=` cannot
   see. The controller is now `WantedBy=` the daemon so a watchdog restart brings

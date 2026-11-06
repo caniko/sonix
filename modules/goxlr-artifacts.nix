@@ -23,41 +23,88 @@
 }: let
   # A stale profile pin here is the deadlock trigger, so the activation verb is
   # separate from the SplitPCM verb the router selects afterwards.
-  activationProfile = cfg.activationProfile;
+  inherit (cfg) activationProfile;
   routingProfile = cfg.goxlrProfile;
   card = cfg.goxlrCard;
+  serial = cfg.goxlrSerial or null;
+  # daemon-check validates the configured serial against the daemon's Full
+  # mixer list.  A null serial means there is nothing to validate, so the
+  # watchdog stays a no-op instead of restarting the daemon every tick.  An
+  # empty string is a misconfiguration and is delegated to daemon-check so it
+  # becomes visible instead of being silently ignored.
+  serialConfigured = serial != null;
   pactlProfile = profile: "${pkgs.coreutils}/bin/timeout 5 ${pkgs.pulseaudio}/bin/pactl set-card-profile ${lib.escapeShellArg card} ${lib.escapeShellArg profile}";
   # systemd ignores a failing ExecStartPre/ExecStopPost command when it is
   # prefixed with `-`.
   optionalCommand = command: "-${command}";
   failOpenCommand = optionalCommand "${package}/bin/goxlr-nexus --config ${configFile} processing fail-open";
+  daemonHealthRuntimeInputs = [
+    pkgs.coreutils
+    pkgs.goxlr-utility
+    pkgs.gnugrep
+    pkgs.systemd
+  ];
 
   daemonHealthCheck = ''
     if ! grep -qi 'GoXLR' /proc/asound/cards; then
       exit 0
     fi
-    if timeout 5 goxlr-client --status-json >/dev/null 2>&1; then
+    # The probe is the same read-only validation the router uses: the configured
+    # serial must still be present and report a Full mixer.  It never touches
+    # PipeWire or OBS, and the timeout bounds a client that hangs on the IPC
+    # socket; --kill-after covers a client that ignores SIGTERM.
+    if timeout --kill-after=5s 20s ${package}/bin/goxlr-nexus --config ${lib.escapeShellArg configFile} daemon-check; then
       exit 0
     fi
     # At most one forced restart per interval, so a persistent failure backs
     # off instead of cycling the daemon and the router every tick.
-    stamp="''${XDG_RUNTIME_DIR:-/tmp}/goxlr-daemon-health.stamp"
+    state_dir="''${RUNTIME_DIRECTORY:-}"
+    if [ -z "$state_dir" ]; then
+      echo "goxlr-daemon-health: RUNTIME_DIRECTORY is unset; refusing to guess a stamp path" >&2
+      exit 1
+    fi
+    stamp="$state_dir/goxlr-daemon-health.stamp"
     now="$(date +%s)"
-    last="$(cat "$stamp" 2>/dev/null || echo 0)"
+    last=0
+    if [ -r "$stamp" ]; then
+      last="$(cat "$stamp" 2>/dev/null || true)"
+    fi
+    case "$last" in
+      "" | *[!0-9]*) last=0 ;;
+    esac
+    # Reject oversized stamps, then force base 10 so a leading-zero stamp such
+    # as "08" is not interpreted as invalid octal by the arithmetic expansion.
+    if [ "''${#last}" -gt 10 ]; then
+      last=0
+    else
+      last=$((10#$last))
+    fi
+    # A wall-clock jump backwards must not disable recovery until the clock
+    # catches up with a stale future stamp.
+    if [ "$last" -gt "$now" ]; then
+      last=0
+    fi
     if [ "$((now - last))" -lt 300 ]; then
       exit 0
     fi
-    echo "$now" > "$stamp"
-    echo "goxlr-daemon did not answer goxlr-client; restarting it" >&2
+    printf '%s\n' "$now" > "$stamp"
+    echo "goxlr-daemon did not answer goxlr-nexus daemon-check; restarting it" >&2
     systemctl --user restart goxlr-daemon.service
   '';
+  daemonHealthScriptText =
+    if serialConfigured
+    then daemonHealthCheck
+    else ''
+      # No goxlrSerial is configured; there is nothing to validate.
+      exit 0
+    '';
   daemonHealthScript = pkgs.writeShellApplication {
     name = "goxlr-daemon-health";
-    runtimeInputs = [pkgs.coreutils pkgs.goxlr-utility pkgs.systemd];
-    text = daemonHealthCheck;
+    runtimeInputs = daemonHealthRuntimeInputs;
+    text = daemonHealthScriptText;
   };
 in {
-  inherit activationProfile routingProfile card daemonHealthCheck daemonHealthScript;
+  inherit activationProfile routingProfile card daemonHealthCheck daemonHealthScript daemonHealthScriptText daemonHealthRuntimeInputs serialConfigured;
 
   daemonUnit = "goxlr-daemon.service";
 
@@ -106,24 +153,32 @@ in {
   # A daemon that lost the device does not exit: it stays `active`, keeps the
   # IPC socket bound, and `goxlr-client` hangs against it, so `Restart=` never
   # fires and routing silently loses device status (observed after USB drops).
-  # Poll the client and restart a wedged daemon, but only while a GoXLR is
-  # actually present, so an unplugged device does not cause churn.
+  # Poll the validated daemon-check and restart a wedged daemon, but only while
+  # a GoXLR is actually present, so an unplugged device does not cause churn.
+  # The fields are deliberately Module-system-neutral: Home Manager renders
+  # Unit/Service/Timer/Install, NixOS renders description/serviceConfig.
   daemonHealth = {
-    service = {
-      Unit.Description = "Restart a wedged GoXLR daemon";
-      Service = {
-        Type = "oneshot";
-        ExecStart = "${daemonHealthScript}/bin/goxlr-daemon-health";
-      };
+    description = "Restart a wedged GoXLR daemon";
+    serviceConfig = {
+      Type = "oneshot";
+      ExecStart = "${daemonHealthScript}/bin/goxlr-daemon-health";
+      # RuntimeDirectory gives the cooldown stamp a per-user, non-guessable
+      # home and exports RUNTIME_DIRECTORY to the script.  Preserve it across
+      # oneshot stops, or every tick would forget the cooldown.
+      RuntimeDirectory = "goxlr-daemon-health";
+      RuntimeDirectoryPreserve = "yes";
+      # Allow the bounded probe plus the router and daemon stop timeouts;
+      # the whole recovery transaction must still have a deadline.
+      TimeoutStartSec = 60;
     };
     timer = {
-      Unit.Description = "Watch the GoXLR daemon IPC";
-      Timer = {
+      description = "Watch the GoXLR daemon IPC";
+      timerConfig = {
         OnBootSec = "2min";
         OnUnitActiveSec = "30s";
         Unit = "goxlr-daemon-health.service";
       };
-      Install.WantedBy = ["timers.target"];
+      wantedBy = ["timers.target"];
     };
   };
 

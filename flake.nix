@@ -7,6 +7,11 @@
     rust-overlay.follows = "harbor-rs/rust-overlay";
     crane.follows = "harbor-rs/crane";
     flake-utils.url = "github:numtide/flake-utils";
+    # Test the actual Home Manager module, not a parallel set of artifact values.
+    home-manager = {
+      url = "github:caniko/home-manager/e1bb806f34a39483ca5f4b153aef6652e4a6adf3";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs = {
@@ -14,8 +19,8 @@
     harbor-rs,
     nixpkgs,
     flake-utils,
-    crane,
     rust-overlay,
+    home-manager,
     ...
   }:
     flake-utils.lib.eachDefaultSystem (system: let
@@ -27,7 +32,7 @@
         inherit pkgs;
         toolchainProfile = "nightly";
       };
-      craneLib = toolchain.craneLib;
+      inherit (toolchain) craneLib;
       src = pkgs.lib.cleanSourceWith {
         src = pkgs.lib.cleanSource ./.;
         filter = path: type:
@@ -74,12 +79,20 @@
         '';
       };
     in {
-      packages = {
-        default = package;
-        sonix = package;
-        goxlr-nexus = package;
-        goxlr-config = package;
-      };
+      packages =
+        {
+          default = package;
+          sonix = package;
+          goxlr-nexus = package;
+          goxlr-config = package;
+        }
+        // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
+          # Kept separate from flake checks: this gate needs a KVM-enabled runner.
+          goxlr-systemd-vm = import ./tests/goxlr-systemd-recovery.nix {
+            inherit (pkgs) lib;
+            inherit pkgs;
+          };
+        };
       apps =
         {
           default = flake-utils.lib.mkApp {drv = package;};
@@ -119,37 +132,65 @@
         LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
         BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.glibc.dev}/include -include ${spaBindgenHeader}";
       };
-      checks.default = package;
-      # Artifact contracts for the GoXLR routing units and WirePlumber rule.
-      # Evaluation-only: these assert the invariants behind the SplitPCM
-      # deadlock and the unowned-daemon outages, which need real hardware to
-      # reproduce at runtime.
-      checks.module-contracts = let
-        contracts = import ./tests/goxlr-artifact-contracts.nix {
-          lib = pkgs.lib;
-          inherit pkgs;
+      checks =
+        {
+          default = package;
+          # Artifact contracts for the GoXLR routing units and WirePlumber rule.
+          # Evaluation-only: these assert the invariants behind the SplitPCM
+          # deadlock and the unowned-daemon outages, which need real hardware to
+          # reproduce at runtime.
+          module-contracts = let
+            contracts = import ./tests/goxlr-artifact-contracts.nix {
+              inherit (pkgs) lib;
+              inherit pkgs;
+            };
+          in
+            builtins.deepSeq contracts (pkgs.runCommand "sonix-module-contracts" {} ''
+              touch "$out"
+            '');
+          processing = craneLib.cargoTest (commonArgs
+            // {
+              inherit cargoArtifacts;
+              cargoExtraArgs = "--locked -p nexus-audio-processing --lib";
+            });
+          formatter =
+            pkgs.runCommand "sonix-formatter-check" {
+              nativeBuildInputs = [pkgs.python3];
+            } ''
+              python ${./tests/check_formatter.py} ${formatter}/bin/treefmt
+              touch "$out"
+            '';
+        }
+        // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+          goxlr-watchdog-contracts = import ./tests/goxlr-watchdog.nix {
+            inherit (pkgs) lib;
+            inherit pkgs;
+          };
+          goxlr-nixos-module-contracts = let
+            contracts = import ./tests/goxlr-nixos-module-contracts.nix {
+              inherit (pkgs) lib;
+              inherit pkgs self;
+            };
+          in
+            builtins.deepSeq contracts (pkgs.runCommand "sonix-goxlr-nixos-module-contracts" {} ''
+              touch "$out"
+            '');
+          goxlr-home-manager-module-contracts = let
+            contracts = import ./tests/goxlr-home-manager-contracts.nix {
+              inherit (pkgs) lib;
+              inherit pkgs self;
+              homeManager = home-manager;
+            };
+          in
+            builtins.deepSeq contracts (pkgs.runCommand "sonix-goxlr-home-manager-contracts" {} ''
+              touch "$out"
+            '');
         };
-      in
-        builtins.deepSeq contracts (pkgs.runCommand "sonix-module-contracts" {} ''
-          touch "$out"
-        '');
-      checks.processing = craneLib.cargoTest (commonArgs
-        // {
-          inherit cargoArtifacts;
-          cargoExtraArgs = "--locked -p nexus-audio-processing --lib";
-        });
-      checks.formatter =
-        pkgs.runCommand "sonix-formatter-check" {
-          nativeBuildInputs = [pkgs.python3];
-        } ''
-          python ${./tests/check_formatter.py} ${formatter}/bin/treefmt
-          touch "$out"
-        '';
       inherit formatter;
     })
     // {
       goxlr-nexus = {
-        packages = self.packages;
+        inherit (self) packages;
         homeModules.default = self.homeModules.goxlr-nexus;
       };
       nixosModules.default = {
