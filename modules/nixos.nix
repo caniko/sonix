@@ -90,6 +90,16 @@
   pklString = value: builtins.toJSON value;
   outputSinksPkl = lib.concatMapStringsSep "\n" (sink: "    ${pklString sink}") effectiveOutputSinks;
   goxlrDaemonUnit = "goxlr-daemon.service";
+  # Only the daemon health artifacts are consumed here; the profile options are
+  # Home Manager-only, so they default for the shared artifact builder.
+  artifacts = import ./goxlr-artifacts.nix {inherit lib pkgs;} {
+    cfg = {
+      goxlrCard = cfg.goxlrCard or null;
+      activationProfile = cfg.activationProfile or "Direct";
+      goxlrProfile = cfg.goxlrProfile or "HiFi";
+    };
+    inherit package configFile servicePath;
+  };
   servicePath = lib.makeBinPath [
     package
     pkgs.goxlr-utility
@@ -291,6 +301,8 @@ in {
         StartLimitBurst = 10;
       };
     };
+    systemd.user.services.goxlr-daemon-health = artifacts.daemonHealth.service;
+    systemd.user.timers.goxlr-daemon-health = artifacts.daemonHealth.timer;
     # The UCM SplitPCM split stays enabled on purpose; see modules/home-manager.nix.
     systemd.user.services.goxlr-nexus = {
       description = "GoXLR Nexus routing with embedded Sonix processing";

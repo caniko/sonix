@@ -105,6 +105,12 @@ process, and `follow` idles with no device status. `follow` now also exits
 non-zero after its retry budget instead of staying `active` with nothing
 routed, so systemd shows the failure.
 
+A daemon that loses the device does not exit: it stays `active`, keeps the IPC
+socket and hangs `goxlr-client`, so `Restart=` never fires. A 30 s health timer
+probes the client while a GoXLR is present and restarts a wedged daemon, at most
+once per five minutes. The controller is `WantedBy=` that daemon unit, so it
+comes back with it.
+
 `obs sync` uses obs-websocket v5 to create or update dedicated GoXLR audio
 sources in the active OBS scene. It does not rewrite OBS global Desktop Audio or
 Mic/Aux devices. "GoXLR Mic" uses the `default` device, so OBS follows the
