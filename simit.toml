@@ -5,6 +5,20 @@ runtime = "nix"
 runner = "ubuntu-24.04"
 workspace = true
 all_features = false
+nix_builds = [".#packages.x86_64-linux.goxlr-systemd-vm"]
+
+# The systemd recovery test needs KVM; keep it out of the broad flake checks
+# that run in the ordinary Rust job.
+[ci.nix_build]
+push_branches = ["trunk"]
+timeout_minutes = 60
+max_parallel = 1
+max_jobs = 1
+cores = 2
+kvm = true
+capture_results = true
+artifact_retention_days = 14
+system_runners = { x86_64-linux = "ubuntu-24.04" }
 
 # Linux closure consumed by canix, published to the public canix cache on
 # trunk pushes only (secret ATTIC_TOKEN). Pull requests build but never push.

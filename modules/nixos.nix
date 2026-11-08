@@ -97,6 +97,7 @@
       goxlrCard = cfg.goxlrCard or null;
       activationProfile = cfg.activationProfile or "Direct";
       goxlrProfile = cfg.goxlrProfile or "HiFi";
+      goxlrSerial = cfg.goxlrSerial or null;
     };
     inherit package configFile servicePath;
   };
@@ -284,9 +285,9 @@ in {
       }
     ];
     # The daemon is a long-lived USB session: own it so it restarts on failure
-    # and after activation moves the package.  Home Manager users also mask the
-    # package's XDG autostart entry; a NixOS-only user should do the same, or a
-    # stale daemon can keep the IPC socket bound and `goxlr-client` hangs.
+    # and after activation moves the package.  The desktop-session autostart
+    # entry races us for the IPC socket; both modules declare it conflicting,
+    # and Home Manager additionally shadows the entry.
     systemd.user.services.goxlr-daemon = {
       description = "GoXLR Utility daemon";
       wantedBy = ["default.target"];
@@ -297,21 +298,36 @@ in {
         TimeoutStopSec = 10;
       };
       unitConfig = {
+        # The desktop-session unit generated from the package's autostart entry
+        # competes for the same IPC socket; the NixOS unit is mutually
+        # exclusive with it like the Home Manager one.
+        Conflicts = ["app-goxlr\\x2ddaemon@autostart.service"];
         StartLimitIntervalSec = 60;
         StartLimitBurst = 10;
       };
     };
-    systemd.user.services.goxlr-daemon-health = artifacts.daemonHealth.service;
-    systemd.user.timers.goxlr-daemon-health = artifacts.daemonHealth.timer;
+    # systemd.user.* on NixOS takes description/serviceConfig/timerConfig; the
+    # shared artifact exposes the neutral values so Home Manager can render its
+    # Unit/Service/Timer shape from the same source.
+    systemd.user.services.goxlr-daemon-health = {
+      description = artifacts.daemonHealth.description;
+      serviceConfig = artifacts.daemonHealth.serviceConfig;
+    };
+    systemd.user.timers.goxlr-daemon-health = {
+      description = artifacts.daemonHealth.timer.description;
+      timerConfig = artifacts.daemonHealth.timer.timerConfig;
+      wantedBy = artifacts.daemonHealth.timer.wantedBy;
+    };
     # The UCM SplitPCM split stays enabled on purpose; see modules/home-manager.nix.
     systemd.user.services.goxlr-nexus = {
       description = "GoXLR Nexus routing with embedded Sonix processing";
       after = ["pipewire.service" "pipewire-pulse.service" "wireplumber.service" goxlrDaemonUnit];
       wants = ["pipewire.service" "pipewire-pulse.service" "wireplumber.service"];
       requires = [goxlrDaemonUnit];
-      # Also wanted by PipeWire so a PipeWire crash restart brings the
-      # controller back instead of leaving it stopped by PartOf.
-      wantedBy = ["default.target" "pipewire.service"];
+      # Also wanted by PipeWire and the daemon so a crash restart or a watchdog
+      # restart pulls the controller back instead of leaving it stopped by
+      # Requires/PartOf.
+      wantedBy = ["default.target" "pipewire.service" goxlrDaemonUnit];
       serviceConfig = {
         Type = "simple";
         Environment = "PATH=${servicePath}";
