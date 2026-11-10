@@ -74,6 +74,8 @@
       "a PipeWire crash restart must pull the NixOS router back up")
     (check (builtins.elem "goxlr-daemon.service" nexus.requires)
       "the NixOS router must not silently no-op without the daemon")
+    (check (!(nexus.serviceConfig ? CPUQuota))
+      "the NixOS router must not carry CPUQuota: a CPU quota freezes the PipeWire and DSP threads for longer than the processed source buffers, which is heard as stutter")
     (check (lib.hasInfix "follow" nexus.serviceConfig.ExecStart)
       "the NixOS router must run goxlr-nexus follow")
   ];

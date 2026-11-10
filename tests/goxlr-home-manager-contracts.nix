@@ -58,6 +58,9 @@
     goxlrProfile = "HiFi";
   };
 
+  # Without the GoXLR router the processing runtime runs as its own unit.
+  standalone = mkConfiguration {enable = false;};
+
   services = valid.config.systemd.user.services;
   timers = valid.config.systemd.user.timers;
   health = services.goxlr-daemon-health;
@@ -107,6 +110,11 @@
       "a watchdog daemon restart must pull the Home Manager router back up")
     (check (builtins.elem "pipewire.service" nexus.Install.WantedBy)
       "a PipeWire crash restart must pull the Home Manager router back up")
+
+    (check (!(nexus.Service ? CPUQuota))
+      "the Home Manager router must not carry CPUQuota: a CPU quota freezes the PipeWire and DSP threads for longer than the processed source buffers, which is heard as stutter")
+    (check (!(standalone.config.systemd.user.services.sonix-noise-echo.Service ? CPUQuota))
+      "the standalone Home Manager processor must not carry CPUQuota either")
 
     (check validAssertionsHold
       "the valid Home Manager configuration must satisfy every assertion")

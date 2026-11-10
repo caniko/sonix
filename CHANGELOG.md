@@ -2,6 +2,12 @@
 
 ## 0.1.0 - Unreleased
 
+- Dropped `CPUQuota=35%` from the processing service units. CFS throttling
+  froze the PipeWire and DSP threads for about 30 ms whenever a reconcile
+  burst spent the period's budget, longer than the 20 ms the processed source
+  buffers. On atlas every dropped frame and stream error in an A/B run
+  coincided with a throttle, and none occurred with the quota lifted. Memory
+  and task limits stay.
 - Harden GoXLR recovery against successful-but-unusable daemon replies,
   missing runtime tools and probes that ignore SIGTERM. Count unhealthy
   daemon reconciliations toward the follow failure budget without treating

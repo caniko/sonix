@@ -176,7 +176,6 @@ in {
         ExecStopPost = "-${package}/bin/sonix --config ${jsonConfig} fail-open";
         Restart = "on-failure";
         RestartSec = 2;
-        CPUQuota = "35%";
         MemoryHigh = "128M";
         MemoryMax = "256M";
         TasksMax = 64;
