@@ -24,9 +24,9 @@ that mutates blindly can leave a machine with no working audio path.
 - Observe before mutating. `discover`, `adopt`, and `plan` are read-only;
   `apply` is the only command that executes proposed mutations, and
   `apply --dry-run` is explicit.
-- Observations are versioned contracts. `--json` emits `goxlr-nexus.observation/v1`,
-  `adopt/v1`, and `plan/v2` documents whose schemas are checked in under
-  `schemas/`.
+- Observations are versioned contracts. `--json` emits `sonix.goxlr.observation/v1`,
+  `sonix.goxlr.adopt/v1`, and `sonix.goxlr.plan/v2` documents whose schemas are
+  checked in under `schemas/`.
 - Convergence is checked, not assumed. `follow` applies only observed deltas,
   verifies the graph through the next observation, and supports
   `--observe-only` as a non-mutating canary.
