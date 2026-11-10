@@ -174,6 +174,11 @@ in
       machine.wait_until_succeeds(user_systemctl("is-active", "goxlr-nexus.service"))
       wait_count("${stateDir}/router.log", "router-started", 1)
 
+      # CFS throttling freezes the audio threads for longer than the processed
+      # source buffers; the running unit must be unthrottled whatever set it.
+      quota = machine.succeed(user_systemctl("show", "goxlr-nexus.service", "-p", "CPUQuotaPerSecUSec", "--value")).strip()
+      assert quota == "infinity", "goxlr-nexus runs under a CPU quota: %s" % quota
+
       # A healthy daemon is not restarted by the watchdog.
       machine.succeed(user_systemctl("start goxlr-daemon-health.service"))
       healthy_starts = count("${stateDir}/daemon.log", "started")

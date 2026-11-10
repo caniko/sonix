@@ -335,7 +335,6 @@ in {
         ExecStopPost = "-${package}/bin/goxlr-nexus --config ${configFile} processing fail-open";
         Restart = "on-failure";
         RestartSec = 5;
-        CPUQuota = "35%";
         MemoryHigh = "128M";
         MemoryMax = "256M";
         TasksMax = 64;

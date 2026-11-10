@@ -217,7 +217,6 @@ in {
         ++ lib.optionals (card != null) [(optionalCommand (pactlProfile activationProfile))];
       Restart = "on-failure";
       RestartSec = 5;
-      CPUQuota = "35%";
       MemoryHigh = "128M";
       MemoryMax = "256M";
       TasksMax = 64;

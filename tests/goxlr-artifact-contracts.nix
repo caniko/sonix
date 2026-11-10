@@ -69,6 +69,8 @@
       "stopping the router must fail open to the raw microphone")
     (check (anyInfix "set-card-profile" nexus.Service.ExecStopPost && anyInfix "Direct" nexus.Service.ExecStopPost)
       "stopping the router must restore the activation verb so the next boot cannot deadlock")
+    (check (!(nexus.Service ? CPUQuota))
+      "goxlr-nexus must not carry CPUQuota: a CPU quota freezes the PipeWire and DSP threads for longer than the processed source buffers, which is heard as stutter")
     (check (builtins.elem "wireplumber.service" nexus.Unit.After)
       "the profile transition must run after the session manager finished activating the card")
     (check (builtins.elem "pipewire.service" nexus.Install.WantedBy)
