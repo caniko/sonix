@@ -2,6 +2,12 @@
 
 ## 0.1.0 - Unreleased
 
+- Run `goxlr-client --status-json` with one Tokio worker. Its default runtime
+  starts a thread per CPU, so on a 32-core host a telemetry probe overlapping
+  a reconcile probe pushed the router past `TasksMax=64` and the forks failed.
+- Log follow warnings by default. The `EnvFilter` default of ERROR silently
+  dropped every reconciliation diagnostic, sync failure and processing start
+  error from the journal; `RUST_LOG` still overrides.
 - Dropped `CPUQuota=35%` from the processing service units. CFS throttling
   froze the PipeWire and DSP threads for about 30 ms whenever a reconcile
   burst spent the period's budget, longer than the 20 ms the processed source
