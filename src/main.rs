@@ -466,7 +466,12 @@ struct AdoptObsSource {
 
 fn main() -> Result<()> {
     let _ = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        // from_default_env() defaults to ERROR, which hid every follow warning.
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::builder()
+                .with_default_directive(tracing_subscriber::filter::LevelFilter::WARN.into())
+                .from_env_lossy(),
+        )
         .with_target(false)
         .try_init();
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -3247,10 +3252,19 @@ fn checked_pipewire_id(value: Option<&Value>, field: &str) -> Result<u32> {
         .with_context(|| format!("PipeWire {field} {value} exceeds the supported u32 range"))
 }
 
-fn goxlr_status() -> Result<Value> {
+fn goxlr_status_command() -> Command {
     let mut command = audio_command("goxlr-client");
-    command.args(["--status-json"]);
-    let output = command_output_with_timeout(command, Duration::from_secs(5))
+    // goxlr-client's default Tokio runtime starts one worker per CPU (33 tasks
+    // on a 32-core host); a telemetry probe overlapping a reconcile probe then
+    // exceeds the unit's TasksMax=64 and the forks fail.
+    command
+        .args(["--status-json"])
+        .env("TOKIO_WORKER_THREADS", "1");
+    command
+}
+
+fn goxlr_status() -> Result<Value> {
+    let output = command_output_with_timeout(goxlr_status_command(), Duration::from_secs(5))
         .context("failed to run goxlr-client --status-json")?;
     if !output.status.success() {
         bail!(
@@ -3562,6 +3576,14 @@ mod tests {
         };
         let err = validate_goxlr_status(&config, &status).unwrap_err();
         assert!(err.to_string().contains("S200805412CQK"));
+    }
+
+    #[test]
+    fn goxlr_status_command_caps_client_runtime_threads() {
+        let command = goxlr_status_command();
+        assert!(command.get_envs().any(|(key, value)| {
+            key == "TOKIO_WORKER_THREADS" && value == Some(std::ffi::OsStr::new("1"))
+        }));
     }
 
     #[test]
