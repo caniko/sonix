@@ -3257,7 +3257,9 @@ fn goxlr_status_command() -> Command {
     // goxlr-client's default Tokio runtime starts one worker per CPU (33 tasks
     // on a 32-core host); a telemetry probe overlapping a reconcile probe then
     // exceeds the unit's TasksMax=64 and the forks fail.
-    command.args(["--status-json"]).env("TOKIO_WORKER_THREADS", "1");
+    command
+        .args(["--status-json"])
+        .env("TOKIO_WORKER_THREADS", "1");
     command
 }
 
